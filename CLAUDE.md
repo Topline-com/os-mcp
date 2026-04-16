@@ -27,7 +27,7 @@ You **must** follow these. They override your defaults. These rules are not a li
 
 4. **No alternate install methods.** Do not suggest pinning to a commit SHA (`#<sha>`). Do not suggest `git clone`. Do not suggest forking. Do not generate "config snippets to paste into Cowork/Connectors/Settings" — this MCP installs via `claude_desktop_config.json` (Desktop) or `claude mcp add` (Code) and nothing else.
 
-5. **Two install targets only.** The only valid answers to "which Claude?" are **Desktop** and **Code**. Do not offer, invent, or ask about: Cowork, claude.ai web, Claude mobile, Claude API, "this app", or any other environment. If you yourself are running in Cowork or a cloud sandbox, that is irrelevant — the user's MCP installs on their **local** Claude Desktop or Claude Code.
+5. **Do not ask "which Claude?".** Configure both Claude Desktop and Claude Code at Step 3. Users don't know the difference and shouldn't have to pick. Whichever they use will connect; the other is harmless. Do not offer, invent, or ask about Cowork, claude.ai web, Claude mobile, Claude API, "this app", or any other environment — if you yourself are running in one of those, that is irrelevant; the user's MCP installs on their local Claude Desktop and/or Claude Code.
 
 6. **Five steps, in order.** Do not renumber, skip, combine, split, or insert steps. Do not label any step as "optional".
 
@@ -59,43 +59,45 @@ Tell the user:
 
 ### Step 3 — Add the MCP to Claude
 
-Ask: **"Claude Desktop or Claude Code?"**
+Do not ask the user which Claude they have. Give them both setups — whichever Claude they actually use will pick it up; the other is harmless.
 
-**Desktop** — tell the user:
+Tell the user, verbatim:
 
-> Open this file in a text editor:
+> Do both of the following. Whichever Claude you use will connect automatically.
+>
+> **A. Claude Desktop** — Open this file in any text editor (create it if it doesn't exist):
 > - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 > - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 >
-> If the file doesn't exist, create it. Paste this block. If the file already has an `mcpServers` key, add `"topline": {...}` inside the existing one — do not create a second `mcpServers` key.
+> Paste the block below. If the file already has an `mcpServers` key, add `"topline": {...}` inside it — don't create a second `mcpServers` key. Save.
+>
+> ```json
+> {
+>   "mcpServers": {
+>     "topline": {
+>       "command": "npx",
+>       "args": ["-y", "github:topline-com/os-mcp"],
+>       "env": {
+>         "TOPLINE_PIT": "<<PIT>>",
+>         "TOPLINE_LOCATION_ID": "<<LocationId>>",
+>         "TOPLINE_BRAND_NAME": "Topline OS"
+>       }
+>     }
+>   }
+> }
+> ```
+>
+> **B. Claude Code** — If you have a terminal, also run this. If you don't know what a terminal is, skip it.
+>
+> ```bash
+> claude mcp add topline -s user \
+>   -e TOPLINE_PIT=<<PIT>> \
+>   -e TOPLINE_LOCATION_ID=<<LocationId>> \
+>   -e TOPLINE_BRAND_NAME="Topline OS" \
+>   -- npx -y github:topline-com/os-mcp
+> ```
 
-```json
-{
-  "mcpServers": {
-    "topline": {
-      "command": "npx",
-      "args": ["-y", "github:topline-com/os-mcp"],
-      "env": {
-        "TOPLINE_PIT": "<<PIT from Step 1>>",
-        "TOPLINE_LOCATION_ID": "<<Location ID from Step 2>>",
-        "TOPLINE_BRAND_NAME": "Topline OS"
-      }
-    }
-  }
-}
-```
-
-Substitute the actual PIT and Location ID into the block you paste — do not leave `<<...>>` placeholders.
-
-**Code** — tell the user to run:
-
-```bash
-claude mcp add topline -s user \
-  -e TOPLINE_PIT=<<PIT>> \
-  -e TOPLINE_LOCATION_ID=<<LocationId>> \
-  -e TOPLINE_BRAND_NAME="Topline OS" \
-  -- npx -y github:topline-com/os-mcp
-```
+Substitute the actual PIT and Location ID into **both** blocks before showing them — do not leave `<<...>>` placeholders in what the user sees.
 
 ### Step 4 — Restart
 

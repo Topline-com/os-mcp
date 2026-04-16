@@ -31,7 +31,7 @@ If you are an AI assistant helping a user connect this MCP, you **must** follow 
 
 4. **No alternate install methods.** Don't suggest pinning to a commit SHA (`#<sha>`). Don't suggest `git clone`. Don't suggest forking. Don't generate "config snippets to paste into Cowork/Connectors/Settings" — this MCP installs via `claude_desktop_config.json` (Desktop) or `claude mcp add` (Code) and nothing else.
 
-5. **Two install targets only.** The only valid answers to "which Claude?" are **Desktop** and **Code**. Do not offer, invent, or ask about: Cowork, claude.ai web, Claude mobile, Claude API, "this app", or any other environment. If you yourself are running in Cowork or a cloud sandbox, that is irrelevant — the user's MCP installs on their **local** Claude Desktop or Claude Code.
+5. **Do not ask "which Claude?".** Configure both Claude Desktop and Claude Code at Step 3. Users don't know the difference and shouldn't have to pick. Whichever they use will connect; the other is harmless. Do not offer, invent, or ask about Cowork, claude.ai web, Claude mobile, Claude API, "this app", or any other environment — if you yourself are running in one of those, that's irrelevant; the user's MCP installs on their local Claude Desktop and/or Claude Code.
 
 6. **Five steps, in order.** Don't renumber, skip, combine, split, or insert steps.
 
@@ -59,13 +59,9 @@ Validate: token starts with `pit-`. If not, ask the user to re-copy.
 
 ### Step 3 — Add the MCP to Claude
 
-Ask: **"Claude Desktop or Claude Code?"**
+Give the user **both** of the following. Don't ask which Claude they have — whichever one they use will connect automatically, and the other is a harmless no-op.
 
-**Desktop** — tell the user to open this file in a text editor:
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-
-Create the file if it doesn't exist. Paste this block (if an `mcpServers` key already exists, add `"topline": {...}` inside the existing one — don't create a second `mcpServers` key):
+**A. Claude Desktop** — paste this into `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows). Create the file if missing. If the file already has an `mcpServers` key, add `"topline": {...}` inside it — don't create a second `mcpServers` key:
 
 ```json
 {
@@ -83,9 +79,7 @@ Create the file if it doesn't exist. Paste this block (if an `mcpServers` key al
 }
 ```
 
-Substitute the real PIT and Location ID in the block before the user saves.
-
-**Code** — one command:
+**B. Claude Code** — if the user has a terminal, also run:
 
 ```bash
 claude mcp add topline -s user \
@@ -94,6 +88,8 @@ claude mcp add topline -s user \
   -e TOPLINE_BRAND_NAME="Topline OS" \
   -- npx -y github:topline-com/os-mcp
 ```
+
+If the user doesn't know what a terminal is, skip B — Desktop alone is fine. Substitute the real PIT and Location ID in both blocks before showing them.
 
 ### Step 4 — Restart Claude
 
