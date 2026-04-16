@@ -7,7 +7,7 @@ Two ways to use this:
 | You use Claude on... | Install path |
 |---|---|
 | **Desktop or Code** (local app) | Step 3 below adds a local MCP via `npx`. Free, no hosting needed. |
-| **claude.ai web / Team / Enterprise** | Admin deploys the remote Worker ([docs/deploy-cloudflare-worker.md](./docs/deploy-cloudflare-worker.md)) once; users add a custom connector ([docs/setup-claude-web.md](./docs/setup-claude-web.md)). |
+| **claude.ai web / Team / Enterprise** | Add a custom connector pointing at `https://os-mcp.topline.com/mcp` ([docs/setup-claude-web.md](./docs/setup-claude-web.md)). |
 
 > **For Desktop / Code:** paste into Claude:
 > *"Set up this MCP for me: https://github.com/topline-com/os-mcp"*

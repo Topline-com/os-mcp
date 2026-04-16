@@ -3,8 +3,8 @@
 Use this path if you're connecting Claude on **claude.ai** (web or via Team/Enterprise workspaces). Desktop and Code users see [setup-claude-desktop.md](./setup-claude-desktop.md) / [setup-claude-code.md](./setup-claude-code.md).
 
 Prerequisites:
-- Your Topline OS admin has deployed the remote MCP Worker somewhere (e.g. `https://os-mcp.topline.com/mcp`). If not, see [deploy-cloudflare-worker.md](./deploy-cloudflare-worker.md).
 - A Topline OS sub-account with admin access.
+- The hosted MCP server URL: `https://os-mcp.topline.com/mcp` (already deployed and ready to use).
 
 ## 1. Create a Private Integration
 
