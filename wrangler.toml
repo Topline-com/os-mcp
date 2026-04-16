@@ -2,6 +2,7 @@ name = "topline-os-mcp"
 main = "src/remote.ts"
 compatibility_date = "2025-04-01"
 compatibility_flags = ["nodejs_compat"]
+account_id = "9013139d3c5200efb4c73c5ecb36d8be"
 
 # Brand name baked into this deployment. Override per-env with `[env.<name>.vars]`
 # if you're reselling under a different label.
