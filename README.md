@@ -2,16 +2,32 @@
 
 Drive your Topline OS sub-account from Claude. Search contacts, send SMS and email, book appointments, create opportunities, enroll workflows — all under your sub-account's permissions.
 
-Two ways to use this:
+Pick the path that matches where you use Claude. Both take ~2 minutes.
 
-| You use Claude on... | Install path |
-|---|---|
-| **Desktop or Code** (local app) | Step 3 below adds a local MCP via `npx`. Free, no hosting needed. |
-| **claude.ai web / Team / Enterprise** | Add a custom connector pointing at `https://os-mcp.topline.com/mcp` ([docs/setup-claude-web.md](./docs/setup-claude-web.md)). |
+---
 
-> **For Desktop / Code:** paste into Claude:
+## Quick start — Claude.ai web (or Team / Enterprise)
+
+1. In Topline OS → **Settings → Private Integrations → Create new integration**. Name it `Claude`. On the scopes screen click **Select All**. Click Create. Copy the `pit-…` token.
+2. In Topline OS → **Settings → Business Info**. Copy the **Location ID**.
+3. In Claude → **Settings → Connectors → Add custom connector**.
+   - Name: `Topline OS`
+   - Remote MCP server URL: `https://os-mcp.topline.com/mcp`
+   - Click **Add**.
+4. Click **Connect**. A popup opens. Paste your PIT and Location ID. Click Connect — popup closes.
+5. In a new chat, send: *"Run topline_setup_check"*. All scope areas should be green.
+
+Detailed walkthrough + troubleshooting: [docs/setup-claude-web.md](./docs/setup-claude-web.md).
+
+---
+
+## Quick start — Claude Desktop or Claude Code
+
+Paste this into Claude:
+
 > *"Set up this MCP for me: https://github.com/topline-com/os-mcp"*
-> Claude reads [CLAUDE.md](./CLAUDE.md) and walks you through it.
+
+Claude reads [CLAUDE.md](./CLAUDE.md) and walks you through the 5 steps below. The agent protocol covers creating the PIT, editing the local config, restarting Claude, and verifying with `topline_setup_check`.
 
 ---
 
