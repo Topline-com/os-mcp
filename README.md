@@ -2,9 +2,16 @@
 
 Drive your Topline OS sub-account from Claude. Search contacts, send SMS and email, book appointments, create opportunities, enroll workflows — all under your sub-account's permissions.
 
-> **Setup is under 2 minutes.** Paste this into Claude:
+Two ways to use this:
+
+| You use Claude on... | Install path |
+|---|---|
+| **Desktop or Code** (local app) | Step 3 below adds a local MCP via `npx`. Free, no hosting needed. |
+| **claude.ai web / Team / Enterprise** | Admin deploys the remote Worker ([docs/deploy-cloudflare-worker.md](./docs/deploy-cloudflare-worker.md)) once; users add a custom connector ([docs/setup-claude-web.md](./docs/setup-claude-web.md)). |
+
+> **For Desktop / Code:** paste into Claude:
 > *"Set up this MCP for me: https://github.com/topline-com/os-mcp"*
-> Claude will read [CLAUDE.md](./CLAUDE.md) and walk you through the rest.
+> Claude reads [CLAUDE.md](./CLAUDE.md) and walks you through it.
 
 ---
 

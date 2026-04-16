@@ -1,0 +1,16 @@
+name = "topline-os-mcp"
+main = "src/remote.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Brand name baked into this deployment. Override per-env with `[env.<name>.vars]`
+# if you're reselling under a different label.
+[vars]
+TOPLINE_BRAND_NAME = "Topline OS"
+
+# TOKEN_SIGNING_SECRET is set out-of-band — NEVER commit it:
+#   wrangler secret put TOKEN_SIGNING_SECRET
+# Generate with: openssl rand -hex 32
+
+[observability]
+enabled = true

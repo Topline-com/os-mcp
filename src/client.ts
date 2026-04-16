@@ -1,7 +1,21 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { BRAND_NAME } from "./branding.js";
 
 const BASE_URL = "https://services.leadconnectorhq.com";
 const API_VERSION = "2021-07-28";
+
+export interface RequestCredentials {
+  pit: string;
+  locationId?: string;
+}
+
+/**
+ * Per-request credentials store. The stdio entry point never sets this —
+ * credentials flow from process.env. The remote (Worker) entry point sets
+ * this once per incoming HTTP request so tool handlers read the right user's
+ * PIT / Location ID without any changes to the handlers themselves.
+ */
+export const credentialsContext = new AsyncLocalStorage<RequestCredentials>();
 
 export class ToplineApiError extends Error {
   statusCode: number;
@@ -18,26 +32,43 @@ export interface FetchOptions {
   body?: unknown;
 }
 
+/** Returns the current PIT (from per-request context OR env), or null if absent. */
+export function peekPit(): string | null {
+  const ctxPit = credentialsContext.getStore()?.pit?.trim();
+  if (ctxPit) return ctxPit;
+  const envPit = process.env.TOPLINE_PIT?.trim();
+  return envPit || null;
+}
+
+/** Returns the current Location ID (from per-request context OR env), or null if absent. */
+export function peekLocationId(): string | null {
+  const ctxLoc = credentialsContext.getStore()?.locationId?.trim();
+  if (ctxLoc) return ctxLoc;
+  const envLoc = process.env.TOPLINE_LOCATION_ID?.trim();
+  return envLoc || null;
+}
+
 function requirePit(): string {
-  const pit = process.env.TOPLINE_PIT?.trim();
-  if (!pit) {
-    throw new Error(
-      `${BRAND_NAME} MCP is missing the TOPLINE_PIT environment variable. ` +
-        `Add your Private Integration Token to your Claude config.`
-    );
-  }
-  return pit;
+  const pit = peekPit();
+  if (pit) return pit;
+  throw new Error(
+    `${BRAND_NAME} MCP is missing the Private Integration Token. ` +
+      `For local setup add TOPLINE_PIT to your Claude config env block. ` +
+      `For remote setup send it as an Authorization: Bearer header.`,
+  );
 }
 
 export function getLocationId(override?: string): string {
-  const id = override?.trim() || process.env.TOPLINE_LOCATION_ID?.trim();
-  if (!id) {
-    throw new Error(
-      `${BRAND_NAME} MCP is missing the TOPLINE_LOCATION_ID environment variable. ` +
-        `Add your sub-account Location ID to your Claude config, or pass locationId as a tool argument.`
-    );
-  }
-  return id;
+  const overrideId = override?.trim();
+  if (overrideId) return overrideId;
+  const id = peekLocationId();
+  if (id) return id;
+  throw new Error(
+    `${BRAND_NAME} MCP is missing the Location ID. ` +
+      `For local setup add TOPLINE_LOCATION_ID to your Claude config env block. ` +
+      `For remote setup send it as an X-Topline-Location-Id header. ` +
+      `Or pass locationId as a tool argument.`,
+  );
 }
 
 function buildUrl(path: string, query?: FetchOptions["query"]): string {

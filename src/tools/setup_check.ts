@@ -1,4 +1,4 @@
-import { toplineFetch, getLocationId, ToplineApiError } from "../client.js";
+import { toplineFetch, getLocationId, peekPit, peekLocationId, ToplineApiError } from "../client.js";
 import { BRAND_NAME } from "../branding.js";
 import type { ToolDef } from "./types.js";
 
@@ -134,8 +134,8 @@ export const tools: ToolDef[] = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
       const brand = BRAND_NAME;
-      const pit = process.env.TOPLINE_PIT?.trim();
-      const locEnv = process.env.TOPLINE_LOCATION_ID?.trim();
+      const pit = peekPit();
+      const locEnv = peekLocationId();
 
       // Auth presence check (before any network call).
       if (!pit) {
@@ -143,11 +143,11 @@ export const tools: ToolDef[] = [
           brand,
           auth: {
             ok: false,
-            detail: `TOPLINE_PIT env var is missing. Add your Private Integration Token (starts with pit-) to the Claude config's env block.`,
+            detail: `Private Integration Token is missing. Local setup: add TOPLINE_PIT to your Claude config env block. Remote setup: reconnect the custom connector in Claude and paste a valid pit- token.`,
           },
           location: { ok: false, detail: "Not checked — auth missing." },
           scopes: [],
-          summary: `Setup incomplete: TOPLINE_PIT is not set. Restart Claude after editing your config.`,
+          summary: `Setup incomplete: no Private Integration Token found.`,
         };
       }
       if (!locEnv) {
@@ -156,10 +156,10 @@ export const tools: ToolDef[] = [
           auth: { ok: true, tokenPrefix: maskToken(pit) },
           location: {
             ok: false,
-            detail: `TOPLINE_LOCATION_ID env var is missing. Find it in ${brand} → Settings → Business Info and add it to the Claude config's env block.`,
+            detail: `Location ID is missing. Find it in ${brand} → Settings → Business Info. Local setup: add TOPLINE_LOCATION_ID to your Claude config env block. Remote setup: reconnect the custom connector and enter the Location ID in the popup form.`,
           },
           scopes: [],
-          summary: `Setup incomplete: TOPLINE_LOCATION_ID is not set. Restart Claude after editing your config.`,
+          summary: `Setup incomplete: Location ID is not set.`,
         };
       }
 
