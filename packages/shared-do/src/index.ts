@@ -1,4 +1,4 @@
-export { LocationDO } from "./location-do.js";
+export { LocationDO, LocationDOMigrationError } from "./location-do.js";
 export type {
   LocationDOEnv,
   QueryResult,

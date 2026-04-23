@@ -202,7 +202,29 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     }
   }
 
-  /** Bring one entity's table into alignment with its manifest. */
+  /**
+   * Bring one entity's table into alignment with its manifest.
+   *
+   * Two-phase reconciliation:
+   *
+   *   Phase 1 — detect unsupported drift. For every live column, look up
+   *     the manifest column by name. Any mismatch (column dropped from
+   *     the manifest, type changed, nullability changed) throws
+   *     LocationDOMigrationError at init. This prevents a DO from ever
+   *     being used in a state where the SQLite table disagrees with
+   *     what describeSchema / explainTables claim.
+   *
+   *   Phase 2 — apply additive changes. For every manifest column
+   *     missing from the live table, ALTER TABLE ADD COLUMN. NOT NULL
+   *     additions on an existing table throw (SQLite requires DEFAULT,
+   *     which the manifest doesn't model yet).
+   *
+   * What's explicitly out of scope and therefore blocked: column
+   * renames, drops, type changes, nullability flips, PK changes. Each
+   * requires a hand-written migration. Failing loudly at init is the
+   * safer failure mode — the alternative is silent drift where queries
+   * return stale shapes and upserts succeed against the wrong types.
+   */
   private reconcileTable(entity: EntityManifest): void {
     const sql = this.ctx.storage.sql;
     const live = sql
@@ -224,18 +246,45 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       return;
     }
 
-    // Existing table — apply additive column changes.
+    const manifestByName = new Map<string, ColumnDef>(
+      entity.columns.map((c) => [c.name, c]),
+    );
+
+    // Phase 1: detect unsupported drift in every live column.
+    for (const liveCol of live) {
+      const manifestCol = manifestByName.get(liveCol.name);
+      if (!manifestCol) {
+        throw new LocationDOMigrationError(
+          `Column ${entity.table}.${liveCol.name} exists in SQLite but not in the manifest. ` +
+            `Dropping or renaming columns requires an explicit migration; this DO is out of sync with the current schema.`,
+        );
+      }
+      if (liveCol.type.toUpperCase() !== manifestCol.sqlite_type) {
+        throw new LocationDOMigrationError(
+          `Column ${entity.table}.${liveCol.name} type mismatch: ` +
+            `live=${liveCol.type}, manifest=${manifestCol.sqlite_type}. ` +
+            `SQLite column types cannot be changed in place; this requires an explicit migration.`,
+        );
+      }
+      const liveNullable = liveCol.notnull === 0;
+      if (liveNullable !== manifestCol.nullable) {
+        throw new LocationDOMigrationError(
+          `Column ${entity.table}.${liveCol.name} nullability mismatch: ` +
+            `live=${liveNullable ? "nullable" : "NOT NULL"}, manifest=${manifestCol.nullable ? "nullable" : "NOT NULL"}. ` +
+            `Nullability changes require an explicit migration.`,
+        );
+      }
+    }
+
+    // Phase 2: add missing columns (additive, nullable-only).
     const liveNames = new Set(live.map((r) => r.name));
     for (const col of entity.columns) {
       if (liveNames.has(col.name)) continue;
 
-      // SQLite ALTER TABLE ADD COLUMN rules: a NOT NULL column added to
-      // an existing table must have a DEFAULT. We don't model defaults
-      // in the manifest yet, so reject this case loudly. Maintainer
-      // options: make the column nullable, or hand-write a migration.
       if (!col.nullable) {
         throw new LocationDOMigrationError(
-          `Cannot auto-add NOT NULL column ${entity.table}.${col.name} to an existing table without a DEFAULT. Either make it nullable in the manifest or write a dedicated migration.`,
+          `Cannot auto-add NOT NULL column ${entity.table}.${col.name} to an existing table without a DEFAULT. ` +
+            `Either make it nullable in the manifest or write a dedicated migration.`,
         );
       }
 
@@ -243,15 +292,6 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       sql.exec(stmt);
       this.logMigration("ADD COLUMN", `${entity.table}.${col.name}`, stmt);
     }
-
-    // Columns the live table has but the manifest doesn't mention: left in
-    // place. Drops require a dedicated migration (SQLite 3.35+ supports
-    // ALTER TABLE DROP COLUMN but we keep this conservative for v1 —
-    // orphan columns don't break anything).
-    //
-    // Type changes: not detected. A manifest change from TEXT→INTEGER on
-    // an existing column would be silently ignored at the DDL level. When
-    // we need this we'll add explicit migration files.
   }
 
   private logMigration(operation: string, target: string, statement: string): void {
