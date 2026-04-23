@@ -122,8 +122,9 @@ export interface WebhookEvent {
 // ---------------------------------------------------------------------------
 
 /**
- * Six-check audit per entity. Until all applicable checks pass, the entity
- * stays behind `exposed: false` and the SQL tools hide it from LLMs.
+ * Six-check audit per entity. Which checks are required depends on the
+ * entity — see `requiredAuditChecks()` below. An entity passes audit when
+ * every required check is true.
  */
 export interface AuditReport {
   /** Has the audit been run end-to-end against a live Topline sub-account? */
@@ -134,27 +135,54 @@ export interface AuditReport {
   backfill_path: boolean;
   /** updated_after filter OR webhook-based incremental confirmed. */
   incremental_path: boolean;
-  /** We know which timestamp field advances on every mutation. */
+  /**
+   * We know which timestamp field advances on every mutation.
+   * N/A for `incremental.type === "poll_full"` tables — the gate skips
+   * this check for those.
+   */
   update_cursor: boolean;
-  /** Webhooks confirmed firing within ~10s (hot tables only — optional). */
+  /**
+   * Webhooks confirmed firing within ~10s.
+   * Required for phase-1 hot tables. Optional (undefined = N/A) for warm/cool.
+   */
   webhook_coverage?: boolean;
   /** Free-form notes: known issues, GHL quirks, caveats. */
   notes?: string;
 }
 
-/** An entity passes audit when every applicable check is true. */
-export function auditPasses(audit: AuditReport): boolean {
-  const required = [
-    audit.live_tested,
-    audit.stable_pk,
-    audit.backfill_path,
-    audit.incremental_path,
-    audit.update_cursor,
+/**
+ * Which AuditReport fields must be true for this entity to pass the gate.
+ * Keyed so failures can report which check blocked exposure.
+ */
+export function requiredAuditChecks(
+  entity: EntityManifest,
+): readonly (keyof AuditReport)[] {
+  const checks: (keyof AuditReport)[] = [
+    "live_tested",
+    "stable_pk",
+    "backfill_path",
+    "incremental_path",
   ];
-  // webhook_coverage is optional: undefined means "not claimed", false
-  // would mean "claimed but failed". Only fail the audit if explicitly false.
-  if (audit.webhook_coverage === false) return false;
-  return required.every((v) => v === true);
+  // poll_full tables re-fetch everything every interval. No cursor exists
+  // to validate, so skip that check.
+  if (entity.incremental.type !== "poll_full") {
+    checks.push("update_cursor");
+  }
+  // Phase-1 tables depend on webhooks for near-real-time freshness. Warm
+  // and cool tables poll only — webhook_coverage is N/A.
+  if (entity.phase === 1) {
+    checks.push("webhook_coverage");
+  }
+  return checks;
+}
+
+/** An entity passes audit when every required check is explicitly true. */
+export function auditPasses(entity: EntityManifest): boolean {
+  const report = entity.audit;
+  for (const check of requiredAuditChecks(entity)) {
+    if (report[check] !== true) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------

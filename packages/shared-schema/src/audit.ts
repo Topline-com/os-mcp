@@ -9,8 +9,8 @@
 // have nothing to check.
 
 import type { AuditReport, EntityManifest } from "./types.js";
+import { auditPasses, requiredAuditChecks } from "./types.js";
 import { ALL_ENTITIES, ENTITY_BY_TABLE } from "./entities.js";
-import { auditPasses } from "./types.js";
 
 export type AuditStatus = "not_run" | "passed" | "failed";
 
@@ -20,36 +20,32 @@ export interface AuditSummary {
   exposed: boolean;
   status: AuditStatus;
   report: AuditReport;
+  /** Required checks (varies by entity) that are not yet true. */
   failing_checks: string[];
 }
 
 /** Classify the current audit state for an entity without running anything. */
 export function summarizeAudit(entity: EntityManifest): AuditSummary {
   const r = entity.audit;
-  const noneRun =
-    !r.live_tested &&
-    !r.stable_pk &&
-    !r.backfill_path &&
-    !r.incremental_path &&
-    !r.update_cursor &&
-    r.webhook_coverage === undefined;
-  const status: AuditStatus = noneRun
+  const required = requiredAuditChecks(entity);
+  const failing = required.filter((k) => r[k] !== true).map(String);
+  const anyClaimed =
+    r.live_tested ||
+    r.stable_pk ||
+    r.backfill_path ||
+    r.incremental_path ||
+    r.update_cursor ||
+    r.webhook_coverage !== undefined;
+  const status: AuditStatus = !anyClaimed
     ? "not_run"
-    : auditPasses(r)
+    : auditPasses(entity)
     ? "passed"
     : "failed";
-  const failing: string[] = [];
-  if (!r.stable_pk) failing.push("stable_pk");
-  if (!r.backfill_path) failing.push("backfill_path");
-  if (!r.incremental_path) failing.push("incremental_path");
-  if (!r.update_cursor) failing.push("update_cursor");
-  if (r.webhook_coverage === false) failing.push("webhook_coverage");
-  if (!r.live_tested) failing.push("live_tested");
   return {
     table: entity.table,
     phase: entity.phase,
     exposed: entity.exposed,
-    status: noneRun ? "not_run" : status,
+    status,
     report: r,
     failing_checks: status === "passed" ? [] : failing,
   };

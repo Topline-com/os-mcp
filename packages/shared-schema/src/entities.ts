@@ -9,6 +9,7 @@
 // descriptors, then flip `exposed` to true once audit.ts reports passed.
 
 import type { EntityManifest, ColumnDef } from "./types.js";
+import { auditPasses } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Shared columns — every row carries these so sync can pin by tenant and
@@ -83,13 +84,15 @@ export const CONTACTS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    endpoint: "/contacts/",
-    method: "GET",
+    // Matches apps/edge/src/tools/contacts.ts `topline_search_contacts`:
+    // POST /contacts/search with body.searchAfter = [lastId], body.pageLimit.
+    endpoint: "/contacts/search",
+    method: "POST",
     pagination: "cursor",
     items_field: "contacts",
-    cursor_response_field: "meta.startAfterId",
-    cursor_request_param: "startAfterId",
-    query_extras: { limit: 100 },
+    cursor_response_field: "meta.searchAfter",
+    cursor_request_param: "searchAfter",
+    query_extras: { pageLimit: 100 },
   },
   incremental: {
     type: "updated_after",
@@ -135,12 +138,14 @@ export const OPPORTUNITIES: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
+    // Matches apps/edge/src/tools/opportunities.ts `topline_search_opportunities`:
+    // GET /opportunities/search with query startAfterId (not POST, not `page`).
     endpoint: "/opportunities/search",
-    method: "POST",
+    method: "GET",
     pagination: "cursor",
     items_field: "opportunities",
-    cursor_response_field: "meta.nextPageUrl",
-    cursor_request_param: "page",
+    cursor_response_field: "meta.startAfterId",
+    cursor_request_param: "startAfterId",
     query_extras: { limit: 100 },
   },
   incremental: {
@@ -186,12 +191,14 @@ export const CONVERSATIONS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
+    // Matches apps/edge/src/tools/conversations.ts `topline_search_conversations`:
+    // GET /conversations/search with query startAfterId.
     endpoint: "/conversations/search",
     method: "GET",
     pagination: "cursor",
     items_field: "conversations",
-    cursor_response_field: "meta.startAfter",
-    cursor_request_param: "startAfter",
+    cursor_response_field: "meta.startAfterId",
+    cursor_request_param: "startAfterId",
     query_extras: { limit: 100 },
   },
   incremental: {
@@ -282,12 +289,18 @@ export const APPOINTMENTS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    endpoint: "/calendars/events/appointments",
+    // PLACEHOLDER. The current edge tools (apps/edge/src/tools/calendars.ts)
+    // expose only per-ID CRUD for appointments — no list/search endpoint.
+    // GHL's API appears to support listing via `/calendars/events` with
+    // startTime/endTime window filters rather than a cursor, but this needs
+    // live verification before the sync worker ships. Audit `backfill_path`
+    // must stay false until then. See audit.notes.
+    endpoint: "/calendars/events",
     method: "GET",
     pagination: "cursor",
     items_field: "events",
-    cursor_response_field: "meta.nextPageUrl",
-    cursor_request_param: "startAfter",
+    cursor_response_field: "meta.startAfterId",
+    cursor_request_param: "startAfterId",
     query_extras: {},
   },
   incremental: {
@@ -307,6 +320,7 @@ export const APPOINTMENTS: EntityManifest = {
     backfill_path: false,
     incremental_path: false,
     update_cursor: false,
+    notes: "Backfill endpoint unverified — edge tools only expose per-ID CRUD. Need to probe GHL's /calendars/events list semantics (time-window vs cursor) before shipping the sync worker.",
   },
   exposed: false,
 };
@@ -404,7 +418,11 @@ export const ENTITY_BY_TABLE: ReadonlyMap<string, EntityManifest> = new Map(
   ALL_ENTITIES.map((e) => [e.table, e]),
 );
 
-/** Entities currently exposed to SQL queries (audit passed + exposed flag). */
+/**
+ * Entities currently exposed to SQL queries. Requires BOTH the manual
+ * `exposed` flag AND a passing audit — so flipping `exposed: true` on an
+ * unaudited entity does not leak it into describe_schema / execute_query.
+ */
 export function getExposedEntities(): readonly EntityManifest[] {
-  return ALL_ENTITIES.filter((e) => e.exposed);
+  return ALL_ENTITIES.filter((e) => e.exposed && auditPasses(e));
 }
