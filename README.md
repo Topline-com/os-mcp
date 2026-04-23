@@ -2,32 +2,63 @@
 
 Drive your Topline OS sub-account from Claude. Search contacts, send SMS and email, book appointments, create opportunities, enroll workflows — all under your sub-account's permissions.
 
-Pick the path that matches where you use Claude. Both take ~2 minutes.
+Pick the client you use. Every path ends with `topline_setup_check` returning all-green.
+
+| Client | Auth | Time | Details |
+|---|---|---|---|
+| Claude.ai web / Team / Enterprise | OAuth (built in) | ~2 min | [docs/setup-claude-web.md](./docs/setup-claude-web.md) |
+| Claude Desktop / Code | local env vars | ~2 min | agent-driven below |
+| ChatGPT (Apps) | OAuth (select in dropdown) | ~2 min | [docs/setup-chatgpt.md](./docs/setup-chatgpt.md) |
+| Zapier / n8n / mcp-inspector / curl | Bearer token from `/connect` | ~2 min | [docs/setup-mcp-clients.md](./docs/setup-mcp-clients.md) |
 
 ---
 
-## Quick start — Claude.ai web (or Team / Enterprise)
+## Quick start — Claude.ai web
 
-1. In Topline OS → **Settings → Private Integrations → Create new integration**. Name it `Claude`. On the scopes screen click **Select All**. Click Create. Copy the `pit-…` token.
+1. In Topline OS → **Settings → Private Integrations → Create new integration**. Click **Select All** scopes. Copy the `pit-…` token.
 2. In Topline OS → **Settings → Business Info**. Copy the **Location ID**.
 3. In Claude → **Settings → Connectors → Add custom connector**.
    - Name: `Topline OS`
    - Remote MCP server URL: `https://os-mcp.topline.com/mcp`
    - Click **Add**.
-4. Click **Connect**. A popup opens. Paste your PIT and Location ID. Click Connect — popup closes.
-5. In a new chat, send: *"Run topline_setup_check"*. All scope areas should be green.
-
-Detailed walkthrough + troubleshooting: [docs/setup-claude-web.md](./docs/setup-claude-web.md).
+4. Click **Connect**. Paste your PIT and Location ID in the popup. Done.
+5. New chat → *"Run topline_setup_check"*.
 
 ---
 
-## Quick start — Claude Desktop or Claude Code
+## Quick start — Claude Desktop / Code
 
 Paste this into Claude:
 
 > *"Set up this MCP for me: https://github.com/topline-com/os-mcp"*
 
-Claude reads [CLAUDE.md](./CLAUDE.md) and walks you through the 5 steps below. The agent protocol covers creating the PIT, editing the local config, restarting Claude, and verifying with `topline_setup_check`.
+Claude reads [CLAUDE.md](./CLAUDE.md) and walks you through creating the PIT, editing your local config, restarting Claude, and verifying with `topline_setup_check`.
+
+---
+
+## Quick start — ChatGPT (Apps)
+
+1. In Topline OS, create a Private Integration (click **Select All** scopes) and copy both the `pit-…` token and your **Location ID** from Business Info.
+2. In ChatGPT → **Apps → New App**:
+   - Name: `Topline OS`
+   - MCP Server URL: `https://os-mcp.topline.com/mcp`
+   - **Authentication: `OAuth`** *(not "Access token")*
+   - Leave Client ID / Client Secret blank — the server supports Dynamic Client Registration.
+   - Check "I understand and want to continue" → Create.
+3. ChatGPT shows **Connect**. Click it. A popup opens to our domain. Paste your PIT and Location ID. Done.
+4. In a new chat with the app enabled → *"Run topline_setup_check"*.
+
+---
+
+## Quick start — Zapier / n8n / mcp-inspector / curl / anything Bearer-only
+
+Clients that only support a single Bearer token (no OAuth dance) use `/connect` to mint a token.
+
+1. Visit **https://os-mcp.topline.com/connect** in a browser.
+2. Paste your PIT + Location ID. Click Generate token. Copy the token.
+3. In your MCP client, point at `https://os-mcp.topline.com/mcp` and send `Authorization: Bearer <token>` on every request.
+
+Tokens are valid for 1 year. Revoke by rotating the underlying PIT in Topline OS.
 
 ---
 
