@@ -74,8 +74,17 @@ export interface BackfillDescriptor {
   /** API path relative to services.leadconnectorhq.com. */
   endpoint: string;
   method: "GET" | "POST";
-  /** Pagination strategy. */
-  pagination: "cursor" | "page" | "none";
+  /**
+   * Pagination strategy.
+   *   cursor   — keyset pagination via a cursor field
+   *   page     — numeric page number (rare in GHL)
+   *   none     — single-response endpoint, no pagination needed
+   *   unknown  — contract not yet probed against live GHL. Consumers
+   *              (sync worker, audit runner) MUST refuse to operate on
+   *              entities in this state. Used for entities we've declared
+   *              but haven't verified a real list endpoint for.
+   */
+  pagination: "cursor" | "page" | "none" | "unknown";
   /** Response field holding the array of records. Defaults vary per endpoint. */
   items_field?: string;
   /**
@@ -163,9 +172,15 @@ export function requiredAuditChecks(
     "backfill_path",
     "incremental_path",
   ];
-  // poll_full tables re-fetch everything every interval. No cursor exists
-  // to validate, so skip that check.
-  if (entity.incremental.type !== "poll_full") {
+  // update_cursor is only meaningful when this entity has its own
+  // updated_after-style cursor. Two incremental modes explicitly don't:
+  //   poll_full  — re-fetches everything every interval; no cursor at all
+  //   per_parent — inherits freshness from its parent's refresh cadence,
+  //                doesn't track its own cursor
+  const ownsCursor =
+    entity.incremental.type !== "poll_full" &&
+    entity.incremental.type !== "per_parent";
+  if (ownsCursor) {
     checks.push("update_cursor");
   }
   // Phase-1 tables depend on webhooks for near-real-time freshness. Warm

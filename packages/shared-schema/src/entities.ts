@@ -289,19 +289,19 @@ export const APPOINTMENTS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    // PLACEHOLDER. The current edge tools (apps/edge/src/tools/calendars.ts)
+    // UNKNOWN. The current edge tools (apps/edge/src/tools/calendars.ts)
     // expose only per-ID CRUD for appointments — no list/search endpoint.
-    // GHL's API appears to support listing via `/calendars/events` with
-    // startTime/endTime window filters rather than a cursor, but this needs
-    // live verification before the sync worker ships. Audit `backfill_path`
-    // must stay false until then. See audit.notes.
+    // GHL may support listing via `/calendars/events` with time-window
+    // filters, but that contract has not been probed against a live
+    // sub-account. Pagination is intentionally "unknown" so the sync
+    // worker and audit runner refuse to operate on this entity until
+    // the contract is verified and this descriptor is updated with real
+    // pagination fields. Do not add cursor_* or items_field here as a
+    // placeholder — fabricated values would mislead any consumer that
+    // trusts this descriptor.
     endpoint: "/calendars/events",
     method: "GET",
-    pagination: "cursor",
-    items_field: "events",
-    cursor_response_field: "meta.startAfterId",
-    cursor_request_param: "startAfterId",
-    query_extras: {},
+    pagination: "unknown",
   },
   incremental: {
     type: "updated_after",
