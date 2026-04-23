@@ -1,0 +1,28 @@
+{
+  "name": "@topline-ai/sync",
+  "version": "0.1.0",
+  "description": "Topline OS sync worker — backfill + incremental sync from GHL into per-tenant LocationDO databases.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "worker:dev": "wrangler dev",
+    "worker:deploy": "wrangler deploy",
+    "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json"
+  },
+  "dependencies": {
+    "@topline/shared": "*",
+    "@topline/shared-auth": "*",
+    "@topline/shared-do": "*",
+    "@topline/shared-schema": "*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240405.0",
+    "@types/node": "^20.12.0",
+    "typescript": "^5.4.0",
+    "wrangler": "^3.60.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

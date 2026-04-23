@@ -1,0 +1,30 @@
+name = "topline-os-sync"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+compatibility_flags = ["nodejs_compat"]
+account_id = "9013139d3c5200efb4c73c5ecb36d8be"
+
+# Brand name, same as edge.
+[vars]
+TOPLINE_BRAND_NAME = "Topline OS"
+
+# ConnectionDirectory — shared with the edge worker. Sync reads encrypted PITs
+# here when it needs to call GHL on a customer's behalf. Same KV namespace id.
+[[kv_namespaces]]
+binding = "CONNECTIONS"
+id = "f88571c17a4c47d4bf0a174d4c7dcb53"
+
+# LocationDO — the class lives on topline-os-mcp (the edge worker). Sync is
+# a cross-worker consumer that opens the same DO instances to write rows.
+[[durable_objects.bindings]]
+name = "LOCATION_DO"
+class_name = "LocationDO"
+script_name = "topline-os-mcp"
+
+# Secrets required out-of-band:
+#   wrangler secret put TOKEN_SIGNING_SECRET   # same value as edge
+#   wrangler secret put ADMIN_TOKEN            # gates the manual trigger
+#                                              # endpoints in this worker
+
+[observability]
+enabled = true
