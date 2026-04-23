@@ -207,23 +207,26 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    *
    * Two-phase reconciliation:
    *
-   *   Phase 1 — detect unsupported drift. For every live column, look up
-   *     the manifest column by name. Any mismatch (column dropped from
-   *     the manifest, type changed, nullability changed) throws
-   *     LocationDOMigrationError at init. This prevents a DO from ever
-   *     being used in a state where the SQLite table disagrees with
-   *     what describeSchema / explainTables claim.
+   *   Phase 1 — detect unsupported drift. Throws LocationDOMigrationError
+   *     for any of:
+   *       1a. PRIMARY KEY mismatch (live PK column != manifest primary_key,
+   *           or composite live PK vs single-column manifest PK)
+   *       1b. A live column missing from the manifest (rename or drop)
+   *       1c. Type mismatch (manifest TEXT, live INTEGER, etc.)
+   *       1d. Nullability flip
    *
    *   Phase 2 — apply additive changes. For every manifest column
    *     missing from the live table, ALTER TABLE ADD COLUMN. NOT NULL
    *     additions on an existing table throw (SQLite requires DEFAULT,
    *     which the manifest doesn't model yet).
    *
-   * What's explicitly out of scope and therefore blocked: column
-   * renames, drops, type changes, nullability flips, PK changes. Each
-   * requires a hand-written migration. Failing loudly at init is the
-   * safer failure mode — the alternative is silent drift where queries
-   * return stale shapes and upserts succeed against the wrong types.
+   * What's explicitly out of scope and therefore blocked at init:
+   * column renames, drops, type changes, nullability flips, and PK
+   * changes. Each requires a hand-written migration. Failing loudly at
+   * init is strictly safer than silent drift — a DO that can't
+   * initialize also cannot serve queries that return the wrong shape,
+   * accept upserts against mismatched types, or fail runtime upserts
+   * because ON CONFLICT no longer matches a real PK.
    */
   private reconcileTable(entity: EntityManifest): void {
     const sql = this.ctx.storage.sql;
@@ -250,7 +253,30 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       entity.columns.map((c) => [c.name, c]),
     );
 
-    // Phase 1: detect unsupported drift in every live column.
+    // Phase 1a: detect PRIMARY KEY drift. PRAGMA table_info marks PK
+    // columns with pk > 0 (position within a composite PK). We only
+    // support single-column PKs in the manifest, so any composite live
+    // PK is also a mismatch.
+    //
+    // This matters because upsertRows builds `ON CONFLICT(<pk>) DO
+    // UPDATE` — if the manifest's primary_key no longer matches the
+    // live table's PK, upserts fail at runtime with "ON CONFLICT
+    // clause does not match any PRIMARY KEY or UNIQUE constraint".
+    // Detecting this at init means the DO refuses to serve rather
+    // than serving a broken write path.
+    const livePkCols = live
+      .filter((r) => r.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((r) => r.name);
+    if (livePkCols.length !== 1 || livePkCols[0] !== entity.primary_key) {
+      throw new LocationDOMigrationError(
+        `Primary key mismatch on ${entity.table}: ` +
+          `live=[${livePkCols.join(", ") || "<none>"}], manifest=${entity.primary_key}. ` +
+          `Primary key changes require an explicit migration.`,
+      );
+    }
+
+    // Phase 1b: detect unsupported drift in every live column.
     for (const liveCol of live) {
       const manifestCol = manifestByName.get(liveCol.name);
       if (!manifestCol) {
