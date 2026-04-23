@@ -93,6 +93,8 @@ export default {
         return cors(await handleMcp(request, env, ctx));
       case "/admin/do-info":
         return cors(await handleAdminDoInfo(request, env));
+      case "/admin/do-query":
+        return cors(await handleAdminDoQuery(request, env));
       default:
         return cors(plain(404, "Not found"));
     }
@@ -549,6 +551,50 @@ async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> 
     stub.getSyncState(),
   ]);
   return json(200, { location, ping, schema, sync_state: state });
+}
+
+// ---------------------------------------------------------------------------
+// /admin/do-query — run a raw SELECT against a tenant's DO. Gated by
+// ADMIN_TOKEN. Intended only for ops / verification while phase-1 step-4
+// (the real SELECT-only MCP tool) is being built. This endpoint trusts the
+// SQL — there is no parse guard here. It's an admin surface, not customer-
+// facing.
+//
+// Usage:
+//   curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+//        -H "Content-Type: application/json" \
+//        -d '{"sql":"SELECT COUNT(*) FROM contacts"}' \
+//        "https://os-mcp.topline.com/admin/do-query?location=X"
+// ---------------------------------------------------------------------------
+async function handleAdminDoQuery(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  if (!env.ADMIN_TOKEN) return plain(503, "ADMIN_TOKEN not configured");
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer || bearer !== env.ADMIN_TOKEN) {
+    return plain(401, "Invalid or missing Authorization: Bearer <ADMIN_TOKEN>");
+  }
+
+  const url = new URL(request.url);
+  const location = url.searchParams.get("location") ?? "";
+  if (!location) return plain(400, "Missing ?location=<location_id>");
+
+  let body: { sql?: string; params?: unknown[] } = {};
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json(400, { error: "Body must be JSON: { sql, params? }" });
+  }
+  if (!body.sql) return json(400, { error: "Missing sql" });
+
+  const id = env.LOCATION_DO.idFromName(location);
+  const stub = env.LOCATION_DO.get(id);
+  try {
+    const result = await stub.executeQuery(body.sql, (body.params as never[]) ?? []);
+    return json(200, result);
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 // ---------------------------------------------------------------------------

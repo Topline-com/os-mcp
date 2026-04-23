@@ -40,11 +40,41 @@ export default {
         return plain(200, `Topline OS sync worker. Admin-gated endpoints only.`);
       case "/sync/backfill":
         return handleBackfill(request, env);
+      case "/sync/clear-cursor":
+        return handleClearCursor(request, env);
       default:
         return plain(404, "Not found");
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// POST /sync/clear-cursor?connection_id=<uuid>&entity=contacts
+// Resets the resume pointer so the next backfill starts from page 0.
+// Leaves the DO's actual rows untouched — upserts will no-op on rows that
+// already match.
+// ---------------------------------------------------------------------------
+async function handleClearCursor(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  const url = new URL(request.url);
+  const connectionId = url.searchParams.get("connection_id") ?? "";
+  const entity = url.searchParams.get("entity") ?? "";
+  if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
+  if (!entity) return plain(400, "Missing ?entity=<table>");
+
+  const { loadAndDecryptConnection } = await import("@topline/shared-auth");
+  const connection = await loadAndDecryptConnection(
+    env.CONNECTIONS,
+    connectionId,
+    env.TOKEN_SIGNING_SECRET,
+  );
+  if (!connection) return json(404, { error: `Unknown connection: ${connectionId}` });
+
+  const doId = env.LOCATION_DO.idFromName(connection.location_id);
+  const stub = env.LOCATION_DO.get(doId);
+  await stub.clearSyncCursor(entity);
+  return json(200, { cleared: entity, location_id: connection.location_id });
+}
 
 // ---------------------------------------------------------------------------
 // POST /sync/backfill?connection_id=<uuid>&entity=contacts

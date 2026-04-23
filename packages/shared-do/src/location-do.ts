@@ -403,6 +403,19 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     );
   }
 
+  /**
+   * Clear the sync cursor for an entity so the next backfill starts
+   * from the beginning. Does not touch the table's data — only the
+   * resume pointer in _sync_state.
+   */
+  async clearSyncCursor(entity: string): Promise<void> {
+    this.ensureInitialized();
+    this.ctx.storage.sql.exec(
+      `UPDATE _sync_state SET cursor = NULL WHERE entity = ?`,
+      entity,
+    );
+  }
+
   /** Snapshot of per-entity sync state. */
   async getSyncState(): Promise<SyncState> {
     this.ensureInitialized();

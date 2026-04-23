@@ -67,9 +67,14 @@ export async function backfillContacts(
   const doId = env.LOCATION_DO.idFromName(connection.location_id);
   const stub = env.LOCATION_DO.get(doId);
 
-  // Resume from last recorded cursor if present.
+  // Resume from last recorded cursor if present. We store the cursor as
+  // a JSON-serialized string so any shape (string, array, object) that
+  // GHL hands us round-trips verbatim without our code flattening or
+  // reinterpreting it.
   const priorState = await stub.getSyncState();
-  let cursor: string | undefined = priorState.contacts?.cursor ?? undefined;
+  const priorCursor = priorState.contacts?.cursor ?? null;
+  let cursorValue: unknown = priorCursor ? parseCursor(priorCursor) : null;
+  let cursorSerialized: string | null = priorCursor;
 
   let pages = 0;
   let rowsUpserted = 0;
@@ -87,11 +92,13 @@ export async function backfillContacts(
           locationId: connection.location_id,
           pageLimit: PAGE_LIMIT,
         };
-        if (cursor) body.searchAfter = [cursor];
+        if (cursorValue !== null && cursorValue !== undefined) {
+          body.searchAfter = cursorValue;
+        }
 
         const response = await toplineFetch<{
           contacts?: Array<Record<string, unknown>>;
-          meta?: { searchAfter?: string | string[] };
+          meta?: { searchAfter?: unknown };
         }>("/contacts/search", { method: "POST", body });
 
         const items = response.contacts ?? [];
@@ -106,16 +113,25 @@ export async function backfillContacts(
         lastRowCount = result.row_count_after;
         pages += 1;
 
-        // Advance the cursor. GHL's /contacts/search returns searchAfter
-        // in meta; the shape can vary (string or array), defensively
-        // handle both. If the cursor doesn't advance, we're done.
-        const nextCursor = extractCursor(response.meta?.searchAfter, items);
-        if (!nextCursor || nextCursor === cursor) {
+        // Advance the cursor. Pass whatever GHL returned in meta.searchAfter
+        // through verbatim — for Elasticsearch-style keyset pagination this
+        // is usually an array like [sort_value, id], and flattening it
+        // breaks the next request. If meta.searchAfter is missing entirely,
+        // we're out of pages (no last-item-id fallback; inventing a cursor
+        // GHL never promised only makes things worse).
+        const nextCursor = response.meta?.searchAfter;
+        if (nextCursor === null || nextCursor === undefined) {
+          stoppedReason = "empty_page";
+          break;
+        }
+        const nextSerialized = serializeCursor(nextCursor);
+        if (nextSerialized === cursorSerialized) {
           stoppedReason = "cursor_stalled";
           break;
         }
-        cursor = nextCursor;
-        await stub.setSyncCursor("contacts", nextCursor);
+        cursorValue = nextCursor;
+        cursorSerialized = nextSerialized;
+        await stub.setSyncCursor("contacts", nextSerialized);
       }
     });
   } catch (err) {
@@ -134,7 +150,7 @@ export async function backfillContacts(
     pages,
     rows_upserted: rowsUpserted,
     row_count_after: lastRowCount,
-    final_cursor: cursor ?? null,
+    final_cursor: cursorSerialized,
     duration_ms: Date.now() - started,
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
@@ -152,22 +168,23 @@ function runInContext<T>(
 }
 
 /**
- * Extract the next searchAfter cursor. GHL returns either a single
- * string or an array depending on the endpoint version. Fall back to
- * the last item's `id` — /contacts/search pagination is keyset, and
- * searchAfter echoes the previous page's last row.
+ * Serialize whatever GHL returned (string | array | object) as JSON so
+ * the DO can store it in a TEXT column without losing shape.
  */
-function extractCursor(
-  metaCursor: string | string[] | undefined,
-  items: Array<Record<string, unknown>>,
-): string | null {
-  if (Array.isArray(metaCursor)) {
-    return metaCursor[0] ?? null;
+function serializeCursor(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+/**
+ * Restore a stored cursor back to its original JSON shape so we pass
+ * it to GHL's next request exactly as GHL gave it to us. If the stored
+ * string isn't valid JSON (shouldn't happen, but be defensive), treat
+ * it as a plain string.
+ */
+function parseCursor(stored: string): unknown {
+  try {
+    return JSON.parse(stored);
+  } catch {
+    return stored;
   }
-  if (typeof metaCursor === "string" && metaCursor.length > 0) {
-    return metaCursor;
-  }
-  const last = items[items.length - 1];
-  if (last && typeof last.id === "string") return last.id;
-  return null;
 }
