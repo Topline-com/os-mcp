@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "npm run build -w @topline/shared && npm run build -w @topline-ai/edge",
+    "build": "npm run build -w @topline/shared && npm run build -w @topline/shared-auth && npm run build -w @topline-ai/edge",
     "dev": "npm run dev -w @topline-ai/edge",
     "start": "npm run start -w @topline-ai/edge",
     "prepare": "npm run build",

@@ -6,9 +6,18 @@
 //  - Accepts raw Authorization: Bearer <PIT> as a fallback for direct clients
 //    (mcp-inspector, curl, etc.)
 //
-// No server-side storage — user credentials (PIT + Location ID) are encoded
-// into HMAC-signed tokens. The signing secret lives in the Worker env binding
-// TOKEN_SIGNING_SECRET (set with: wrangler secret put TOKEN_SIGNING_SECRET).
+// Auth backend:
+//  - Customer credentials (PIT + Location ID) are stored encrypted in the
+//    CONNECTIONS KV namespace, keyed by a UUID (connection_id / cid).
+//  - Access tokens issued by OAuth and /connect are HMAC-signed envelopes
+//    containing only { cid, exp } — no plaintext PIT leaves the worker.
+//  - Legacy tokens that embed { pit, locationId, exp } are still accepted
+//    so deploys don't break existing Claude / ChatGPT sessions. They keep
+//    working until they expire naturally.
+//
+// Secrets: TOKEN_SIGNING_SECRET doubles as the KEK for PIT encryption via
+// HKDF. Rotating it invalidates every token AND every encrypted PIT in one
+// step.
 
 import { ALL_TOOLS, toolsByName } from "./registry.js";
 import { credentialsContext, ToplineApiError } from "@topline/shared";
@@ -16,27 +25,39 @@ import {
   signToken,
   verifyToken,
   verifyPkce,
+  isCidAccess,
+  isLegacyAccess,
+  createConnection,
+  loadAndDecryptConnection,
+  touchConnection,
+  type AuthCodePayload,
+  type AccessTokenPayload,
+  type LegacyAccessTokenPayload,
+} from "@topline/shared-auth";
+import {
   authorizeFormHtml,
   connectFormHtml,
   connectResultHtml,
-  type AuthCodePayload,
-  type AccessTokenPayload,
 } from "./remote-oauth.js";
 
 interface Env {
   TOKEN_SIGNING_SECRET: string;
   TOPLINE_BRAND_NAME?: string;
+  CONNECTIONS: KVNamespace;
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days (OAuth flow)
-const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (self-serve /connect)
+const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (/connect)
 const AUTH_CODE_TTL_SECONDS = 60 * 10; // 10 minutes
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (!env.TOKEN_SIGNING_SECRET) {
       return plain(500, "Worker is missing TOKEN_SIGNING_SECRET. Run: wrangler secret put TOKEN_SIGNING_SECRET");
+    }
+    if (!env.CONNECTIONS) {
+      return plain(500, "Worker is missing CONNECTIONS KV binding. Check wrangler.toml.");
     }
 
     const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
@@ -57,11 +78,11 @@ export default {
       case "/authorize":
         return cors(await handleAuthorize(request, env, brand));
       case "/token":
-        return cors(await handleToken(request, env));
+        return cors(await handleToken(request, env, brand));
       case "/connect":
         return cors(await handleConnect(request, env, brand));
       case "/mcp":
-        return cors(await handleMcp(request, env));
+        return cors(await handleMcp(request, env, ctx));
       default:
         return cors(plain(404, "Not found"));
     }
@@ -72,7 +93,7 @@ export default {
 // Landing page (so visitors don't see a raw 404)
 // ---------------------------------------------------------------------------
 function landing(brand: string, origin: string): Response {
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${brand} MCP</title>
+  const h = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${brand} MCP</title>
 <style>body{font-family:-apple-system,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;line-height:1.5}code{background:#f4f4f4;padding:2px 6px;border-radius:4px}h2{font-size:16px;margin-top:28px}</style>
 </head><body>
 <h1>${brand} MCP</h1>
@@ -91,13 +112,13 @@ function landing(brand: string, origin: string): Response {
 <h2>Claude Desktop / Code</h2>
 <p>Install as a local stdio MCP — see <a href="https://github.com/topline-com/os-mcp">the repo</a>.</p>
 </body></html>`;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return new Response(h, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
 // ---------------------------------------------------------------------------
 // Self-serve token generator — for ChatGPT Apps and other Bearer-only clients
-// that can't complete the full OAuth dance. Same access-token format as the
-// OAuth flow issues, just minted directly from PIT+LocId via a form.
+// that can't complete the full OAuth dance. Creates a connection and issues
+// a {cid, exp} access token referencing it.
 // ---------------------------------------------------------------------------
 async function handleConnect(request: Request, env: Env, brand: string): Promise<Response> {
   const url = new URL(request.url);
@@ -124,9 +145,14 @@ async function handleConnect(request: Request, env: Env, brand: string): Promise
     return html(400, connectFormHtml({ brand, origin: url.origin, error: "Location ID is required." }));
   }
 
+  const cid = await createConnection(
+    env.CONNECTIONS,
+    { location_id: locationId, pit, brand_name: brand, source: "self-serve" },
+    env.TOKEN_SIGNING_SECRET,
+  );
+
   const payload: AccessTokenPayload = {
-    pit,
-    locationId,
+    cid,
     exp: Math.floor(Date.now() / 1000) + SELFSERVE_TOKEN_TTL_SECONDS,
   };
   const token = await signToken(payload, env.TOKEN_SIGNING_SECRET);
@@ -152,14 +178,13 @@ function oauthMetadata(origin: string): Response {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic Client Registration (RFC 7591) — we accept any client and echo back
-// a stable client_id. No actual per-client state is kept.
+// Dynamic Client Registration (RFC 7591)
 // ---------------------------------------------------------------------------
 async function handleRegister(request: Request): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
   let body: Record<string, unknown> = {};
   try {
-    body = await request.json() as Record<string, unknown>;
+    body = (await request.json()) as Record<string, unknown>;
   } catch {
     return json(400, { error: "invalid_request", error_description: "Body must be JSON" });
   }
@@ -175,7 +200,9 @@ async function handleRegister(request: Request): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// Authorization endpoint — shows a form, then issues a signed code.
+// Authorization endpoint — shows form, then issues a short-lived auth code.
+// The code still embeds PIT+LocId (short TTL, single use) — the connection
+// record is created when the code is exchanged at /token.
 // ---------------------------------------------------------------------------
 async function handleAuthorize(request: Request, env: Env, brand: string): Promise<Response> {
   if (request.method === "GET") {
@@ -198,19 +225,17 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
 
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
-  // Form submission: user has pasted their PIT + Location ID.
   const form = await request.formData();
   const pit = String(form.get("pit") ?? "").trim();
   const locationId = String(form.get("locationId") ?? "").trim();
   const redirect_uri = String(form.get("redirect_uri") ?? "").trim();
   const code_challenge = String(form.get("code_challenge") ?? "").trim();
-  const code_challenge_method = (String(form.get("code_challenge_method") ?? "S256") as
+  const code_challenge_method = String(form.get("code_challenge_method") ?? "S256") as
     | "S256"
-    | "plain");
+    | "plain";
   const state = String(form.get("state") ?? "").trim();
   const client_id = String(form.get("client_id") ?? "").trim();
 
-  // Validation (re-render form on error)
   const rerender = (error: string) =>
     html(
       400,
@@ -226,7 +251,9 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
     );
 
   if (!pit.startsWith("pit-")) {
-    return rerender(`Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`);
+    return rerender(
+      `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
+    );
   }
   if (!locationId) return rerender("Location ID is required.");
   if (!redirect_uri) return plain(400, "Missing redirect_uri");
@@ -248,9 +275,10 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
 }
 
 // ---------------------------------------------------------------------------
-// Token endpoint — exchange authorization code (+ PKCE verifier) for access token
+// Token endpoint — exchange auth code (+ PKCE verifier) for access token.
+// This is where we create the ConnectionDirectory record.
 // ---------------------------------------------------------------------------
-async function handleToken(request: Request, env: Env): Promise<Response> {
+async function handleToken(request: Request, env: Env, brand: string): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
   const contentType = request.headers.get("Content-Type") ?? "";
@@ -268,7 +296,7 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
   } else {
     let body: Record<string, string> = {};
     try {
-      body = await request.json() as Record<string, string>;
+      body = (await request.json()) as Record<string, string>;
     } catch {
       return json(400, { error: "invalid_request" });
     }
@@ -295,9 +323,15 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
     if (!ok) return json(400, { error: "invalid_grant", error_description: "PKCE verification failed" });
   }
 
+  // Create the connection record and issue a cid-referencing token.
+  const cid = await createConnection(
+    env.CONNECTIONS,
+    { location_id: payload.locationId, pit: payload.pit, brand_name: brand, source: "oauth" },
+    env.TOKEN_SIGNING_SECRET,
+  );
+
   const accessPayload: AccessTokenPayload = {
-    pit: payload.pit,
-    locationId: payload.locationId,
+    cid,
     exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_SECONDS,
   };
   const access_token = await signToken(accessPayload, env.TOKEN_SIGNING_SECRET);
@@ -320,7 +354,43 @@ interface JsonRpcRequest {
   params?: Record<string, unknown>;
 }
 
-async function handleMcp(request: Request, env: Env): Promise<Response> {
+/**
+ * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
+ *   - "pit-..."                         → raw PIT, location from header
+ *   - signed { cid, exp }               → look up connection, decrypt PIT
+ *   - signed { pit, locationId, exp }   → legacy, use embedded values
+ */
+async function resolveBearer(
+  bearer: string,
+  env: Env,
+): Promise<{ pit: string; locationId?: string; cid?: string } | { error: string }> {
+  if (bearer.startsWith("pit-")) {
+    return { pit: bearer };
+  }
+
+  // Try verifying as a signed token. The payload is either new-shape or legacy.
+  const payload = await verifyToken<unknown>(bearer, env.TOKEN_SIGNING_SECRET);
+  if (!payload) return { error: "Access token invalid or expired" };
+
+  if (isCidAccess(payload)) {
+    const decrypted = await loadAndDecryptConnection(
+      env.CONNECTIONS,
+      payload.cid,
+      env.TOKEN_SIGNING_SECRET,
+    );
+    if (!decrypted) return { error: "Access token references an unknown or revoked connection" };
+    return { pit: decrypted.pit, locationId: decrypted.location_id, cid: payload.cid };
+  }
+
+  if (isLegacyAccess(payload)) {
+    const p = payload as LegacyAccessTokenPayload;
+    return { pit: p.pit, locationId: p.locationId };
+  }
+
+  return { error: "Access token payload is not recognized" };
+}
+
+async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
   const authHeader = request.headers.get("Authorization") ?? "";
@@ -329,20 +399,15 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
     return jsonRpcError(-32001, "Missing Authorization header", null, 401);
   }
 
-  // Extract PIT + Location ID from either a signed access token OR a raw PIT.
-  let pit: string;
-  let locationId: string | undefined;
+  const resolved = await resolveBearer(bearer, env);
+  if ("error" in resolved) {
+    return jsonRpcError(-32001, resolved.error, null, 401);
+  }
+  let { pit, locationId, cid } = resolved;
 
-  if (bearer.startsWith("pit-")) {
-    // Direct PIT — useful for programmatic clients that can't do OAuth
-    // (mcp-inspector, curl, custom integrations). Location ID comes from header.
-    pit = bearer;
+  // For raw-PIT bearers, location may come from a side-channel header.
+  if (!locationId) {
     locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
-  } else {
-    const payload = await verifyToken<AccessTokenPayload>(bearer, env.TOKEN_SIGNING_SECRET);
-    if (!payload) return jsonRpcError(-32001, "Access token invalid or expired", null, 401);
-    pit = payload.pit;
-    locationId = payload.locationId;
   }
 
   let rpc: JsonRpcRequest;
@@ -357,9 +422,12 @@ async function handleMcp(request: Request, env: Env): Promise<Response> {
   }
 
   try {
-    return await credentialsContext.run({ pit, locationId }, async () => {
+    const response = await credentialsContext.run({ pit, locationId }, async () => {
       return dispatch(rpc, env);
     });
+    // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
+    if (cid) ctx.waitUntil(touchConnection(env.CONNECTIONS, cid));
+    return response;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const code = err instanceof ToplineApiError ? -32002 : -32603;
@@ -381,7 +449,6 @@ async function dispatch(rpc: JsonRpcRequest, env: Env): Promise<Response> {
 
     case "notifications/initialized":
     case "notifications/cancelled":
-      // Notifications: no response body, HTTP 202.
       return new Response(null, { status: 202 });
 
     case "ping":

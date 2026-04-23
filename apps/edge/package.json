@@ -14,7 +14,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@topline/shared": "*"
+    "@topline/shared": "*",
+    "@topline/shared-auth": "*"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",

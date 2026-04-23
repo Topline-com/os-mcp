@@ -1,91 +1,9 @@
-// OAuth 2.1 primitives for the remote (Cloudflare Worker) MCP server.
+// HTML rendering for the OAuth 2.1 and /connect flows in the remote worker.
 //
-// Design: no server-side storage. Everything the server needs to know about
-// a user's session — their Topline PIT and Location ID — is encoded directly
-// into signed tokens. Authorization codes and access tokens are HMAC-signed
-// with a worker-level secret (TOKEN_SIGNING_SECRET) so they cannot be forged.
-//
-// Flow: Claude → /register (DCR) → /authorize (HTML form collects PIT+LocId)
-//   → authorization code → /token (PKCE verify) → access token → /mcp
-
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-
-function b64urlEncode(bytes: Uint8Array): string {
-  let s = "";
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function b64urlDecode(str: string): Uint8Array {
-  const pad = str.length % 4 === 0 ? "" : "=".repeat(4 - (str.length % 4));
-  const s = atob(str.replace(/-/g, "+").replace(/_/g, "/") + pad);
-  const bytes = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
-  return bytes;
-}
-
-async function hmacKey(secret: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"],
-  );
-}
-
-export async function signToken(payload: object, secret: string): Promise<string> {
-  const key = await hmacKey(secret);
-  const payloadB64 = b64urlEncode(encoder.encode(JSON.stringify(payload)));
-  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", key, encoder.encode(payloadB64)));
-  return `${payloadB64}.${b64urlEncode(sig)}`;
-}
-
-export async function verifyToken<T = unknown>(token: string, secret: string): Promise<T | null> {
-  const parts = token.split(".");
-  if (parts.length !== 2) return null;
-  const [payloadB64, sigB64] = parts;
-  const key = await hmacKey(secret);
-  const sig = b64urlDecode(sigB64);
-  const ok = await crypto.subtle.verify("HMAC", key, sig, encoder.encode(payloadB64));
-  if (!ok) return null;
-  try {
-    const payload = JSON.parse(decoder.decode(b64urlDecode(payloadB64))) as T & { exp?: number };
-    if (payload.exp && Date.now() / 1000 > payload.exp) return null;
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-export interface AuthCodePayload {
-  pit: string;
-  locationId: string;
-  redirect_uri: string;
-  code_challenge: string;
-  code_challenge_method: "S256" | "plain";
-  exp: number;
-}
-
-export interface AccessTokenPayload {
-  pit: string;
-  locationId: string;
-  exp: number;
-}
-
-// PKCE verification (RFC 7636)
-export async function verifyPkce(
-  codeVerifier: string,
-  codeChallenge: string,
-  method: "S256" | "plain",
-): Promise<boolean> {
-  if (method === "plain") return codeVerifier === codeChallenge;
-  const hash = new Uint8Array(
-    await crypto.subtle.digest("SHA-256", encoder.encode(codeVerifier)),
-  );
-  return b64urlEncode(hash) === codeChallenge;
-}
+// Token primitives (signToken/verifyToken/verifyPkce) and payload types
+// (AuthCodePayload / AccessTokenPayload / LegacyAccessTokenPayload) live in
+// @topline/shared-auth — they're shared with the sync worker and any future
+// service that needs to validate inbound tokens.
 
 // --- HTML / responses ---
 

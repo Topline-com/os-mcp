@@ -19,5 +19,12 @@ TOPLINE_BRAND_NAME = "Topline OS"
 #   wrangler secret put TOKEN_SIGNING_SECRET
 # Generate with: openssl rand -hex 32
 
+# ConnectionDirectory — encrypted customer connections (key: connection_id).
+# PITs are encrypted at rest with a key derived from TOKEN_SIGNING_SECRET
+# via HKDF; see packages/shared-auth/src/encryption.ts.
+[[kv_namespaces]]
+binding = "CONNECTIONS"
+id = "f88571c17a4c47d4bf0a174d4c7dcb53"
+
 [observability]
 enabled = true
