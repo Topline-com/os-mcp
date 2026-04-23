@@ -26,5 +26,19 @@ TOPLINE_BRAND_NAME = "Topline OS"
 binding = "CONNECTIONS"
 id = "f88571c17a4c47d4bf0a174d4c7dcb53"
 
+# LocationDO — per-tenant Durable Object backed by SQLite. Owns the synced
+# data warehouse for one location_id. Class ships from packages/shared-do
+# and is re-exported by apps/edge/src/remote.ts so wrangler can bind it.
+[[durable_objects.bindings]]
+name = "LOCATION_DO"
+class_name = "LocationDO"
+
+# DO class registration. `new_sqlite_classes` enables the SQLite storage
+# backend (required for LocationDO to use ctx.storage.sql). Migrations are
+# append-only; never remove or renumber existing entries.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["LocationDO"]
+
 [observability]
 enabled = true

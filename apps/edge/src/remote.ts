@@ -39,11 +39,19 @@ import {
   connectFormHtml,
   connectResultHtml,
 } from "./remote-oauth.js";
+import { LocationDO } from "@topline/shared-do";
+
+// Re-export the DO class so wrangler can bind it to this Worker script.
+// The class implementation lives in packages/shared-do so the (future)
+// sync worker can import the same type surface without circular deps.
+export { LocationDO };
 
 interface Env {
   TOKEN_SIGNING_SECRET: string;
   TOPLINE_BRAND_NAME?: string;
   CONNECTIONS: KVNamespace;
+  LOCATION_DO: DurableObjectNamespace<LocationDO>;
+  ADMIN_TOKEN?: string;
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
@@ -83,6 +91,8 @@ export default {
         return cors(await handleConnect(request, env, brand));
       case "/mcp":
         return cors(await handleMcp(request, env, ctx));
+      case "/admin/do-info":
+        return cors(await handleAdminDoInfo(request, env));
       default:
         return cors(plain(404, "Not found"));
     }
@@ -496,6 +506,44 @@ async function dispatch(rpc: JsonRpcRequest, env: Env): Promise<Response> {
     default:
       return jsonRpcError(-32601, `Method not found: ${rpc.method}`, rpc.id ?? null);
   }
+}
+
+// ---------------------------------------------------------------------------
+// /admin/do-info — diagnostic for Phase 1 rollout. Gated by ADMIN_TOKEN
+// secret. Returns that tenant's LocationDO schema overview + sync state so
+// we can verify migrations ran cleanly without shipping a visible surface.
+//
+// Usage:
+//   curl "https://os-mcp.topline.com/admin/do-info?location=loc-test&token=<ADMIN_TOKEN>"
+//
+// The endpoint creates a DO instance on first access for the given location.
+// That instance sticks around (DO storage is persistent). For a clean test
+// use a throwaway location_id like "debug-2026-04-23".
+// ---------------------------------------------------------------------------
+async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plain(405, "Method not allowed");
+  const url = new URL(request.url);
+  const token = url.searchParams.get("token") ?? "";
+  const location = url.searchParams.get("location") ?? "";
+
+  if (!env.ADMIN_TOKEN) {
+    return plain(503, "ADMIN_TOKEN not configured. Set with: wrangler secret put ADMIN_TOKEN");
+  }
+  if (token !== env.ADMIN_TOKEN) {
+    return plain(401, "Invalid or missing token");
+  }
+  if (!location) {
+    return plain(400, "Missing ?location=<location_id>");
+  }
+
+  const id = env.LOCATION_DO.idFromName(location);
+  const stub = env.LOCATION_DO.get(id);
+  const [ping, schema, state] = await Promise.all([
+    stub.ping(),
+    stub.describeSchema(),
+    stub.getSyncState(),
+  ]);
+  return json(200, { location, ping, schema, sync_state: state });
 }
 
 // ---------------------------------------------------------------------------
