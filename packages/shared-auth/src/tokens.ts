@@ -53,14 +53,22 @@ export async function signToken(payload: object, secret: string): Promise<string
 }
 
 export async function verifyToken<T = unknown>(token: string, secret: string): Promise<T | null> {
-  const parts = token.split(".");
-  if (parts.length !== 2) return null;
-  const [payloadB64, sigB64] = parts;
-  const key = await hmacKey(secret);
-  const sig = b64urlDecode(sigB64);
-  const ok = await crypto.subtle.verify("HMAC", key, sig, encoder.encode(payloadB64));
-  if (!ok) return null;
+  // ALL parse + crypto operations are wrapped: any attacker-controlled input
+  // must fail closed as `null`, never throw and escape to the caller as a
+  // Worker exception. Bad inputs to watch:
+  //   - b64urlDecode can throw via atob("…%%…") on non-base64 chars
+  //   - crypto.subtle.verify can throw on malformed signature length
+  //   - importKey on an empty/undefined secret can throw
+  //   - JSON.parse on non-JSON payload can throw
   try {
+    const parts = token.split(".");
+    if (parts.length !== 2) return null;
+    const [payloadB64, sigB64] = parts;
+    if (!payloadB64 || !sigB64) return null;
+    const key = await hmacKey(secret);
+    const sig = b64urlDecode(sigB64);
+    const ok = await crypto.subtle.verify("HMAC", key, sig, encoder.encode(payloadB64));
+    if (!ok) return null;
     const payload = JSON.parse(decoder.decode(b64urlDecode(payloadB64))) as T & { exp?: number };
     if (payload.exp && Date.now() / 1000 > payload.exp) return null;
     return payload;

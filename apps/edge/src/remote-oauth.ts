@@ -47,7 +47,7 @@ export function authorizeFormHtml(params: {
 </head>
 <body>
 <h1>Connect ${escapeHtml(brand)} to Claude</h1>
-<p class="sub">Paste your Private Integration Token and Location ID. Both are stored only as a signed token in Claude — nothing is stored on this server.</p>
+<p class="sub">Paste your Private Integration Token and Location ID. They are encrypted at rest on this server so Claude can reach your sub-account; Claude itself receives only a signed reference token, never the raw credentials. Revoke at any time by rotating the PIT in ${escapeHtml(brand)}.</p>
 
 ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 
@@ -188,7 +188,7 @@ export function connectResultHtml(params: { brand: string; origin: string; token
 </head>
 <body>
 <h1>Your ${escapeHtml(brand)} access token</h1>
-<p class="sub">Copy this single token and paste it into your MCP client. It contains your signed PIT + Location ID. Valid for 1 year.</p>
+<p class="sub">Copy this single token and paste it into your MCP client. The token is a signed reference to your encrypted PIT + Location ID stored on this server — the plaintext credentials never travel back to clients. Valid for 1 year.</p>
 
 <div class="token-box">
   <textarea class="token" id="token" rows="5" readonly>${escapeHtml(token)}</textarea>
