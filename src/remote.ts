@@ -17,6 +17,8 @@ import {
   verifyToken,
   verifyPkce,
   authorizeFormHtml,
+  connectFormHtml,
+  connectResultHtml,
   type AuthCodePayload,
   type AccessTokenPayload,
 } from "./remote-oauth.js";
@@ -27,7 +29,8 @@ interface Env {
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
-const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days (OAuth flow)
+const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (self-serve /connect)
 const AUTH_CODE_TTL_SECONDS = 60 * 10; // 10 minutes
 
 export default {
@@ -55,6 +58,8 @@ export default {
         return cors(await handleAuthorize(request, env, brand));
       case "/token":
         return cors(await handleToken(request, env));
+      case "/connect":
+        return cors(await handleConnect(request, env, brand));
       case "/mcp":
         return cors(await handleMcp(request, env));
       default:
@@ -68,18 +73,64 @@ export default {
 // ---------------------------------------------------------------------------
 function landing(brand: string, origin: string): Response {
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${brand} MCP</title>
-<style>body{font-family:-apple-system,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;line-height:1.5}code{background:#f4f4f4;padding:2px 6px;border-radius:4px}</style>
+<style>body{font-family:-apple-system,sans-serif;max-width:640px;margin:48px auto;padding:0 20px;line-height:1.5}code{background:#f4f4f4;padding:2px 6px;border-radius:4px}h2{font-size:16px;margin-top:28px}</style>
 </head><body>
 <h1>${brand} MCP</h1>
-<p>This is a remote MCP server. To connect Claude.ai to it:</p>
+<p>Remote MCP server. MCP Server URL: <code>${origin}/mcp</code></p>
+
+<h2>Claude.ai (OAuth flow)</h2>
 <ol>
-<li>In Claude, open Settings → Connectors → Add custom connector.</li>
-<li>Paste this URL: <code>${origin}/mcp</code></li>
-<li>Click Add, then Connect. Paste your Private Integration Token and Location ID when prompted.</li>
+<li>Claude → Settings → Connectors → Add custom connector.</li>
+<li>Paste <code>${origin}/mcp</code> as the URL.</li>
+<li>Click Add, then Connect. Paste your PIT and Location ID in the popup.</li>
 </ol>
-<p>Desktop or Code users install differently — see <a href="https://github.com/topline-com/os-mcp">the repo</a>.</p>
+
+<h2>ChatGPT / other Bearer-only clients</h2>
+<p>Go to <a href="/connect">/connect</a> — paste your PIT and Location ID, get back a single signed token. Paste that token into ChatGPT's Bearer field.</p>
+
+<h2>Claude Desktop / Code</h2>
+<p>Install as a local stdio MCP — see <a href="https://github.com/topline-com/os-mcp">the repo</a>.</p>
 </body></html>`;
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// ---------------------------------------------------------------------------
+// Self-serve token generator — for ChatGPT Apps and other Bearer-only clients
+// that can't complete the full OAuth dance. Same access-token format as the
+// OAuth flow issues, just minted directly from PIT+LocId via a form.
+// ---------------------------------------------------------------------------
+async function handleConnect(request: Request, env: Env, brand: string): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    return html(200, connectFormHtml({ brand, origin: url.origin }));
+  }
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+
+  const form = await request.formData();
+  const pit = String(form.get("pit") ?? "").trim();
+  const locationId = String(form.get("locationId") ?? "").trim();
+
+  if (!pit.startsWith("pit-")) {
+    return html(
+      400,
+      connectFormHtml({
+        brand,
+        origin: url.origin,
+        error: `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
+      }),
+    );
+  }
+  if (!locationId) {
+    return html(400, connectFormHtml({ brand, origin: url.origin, error: "Location ID is required." }));
+  }
+
+  const payload: AccessTokenPayload = {
+    pit,
+    locationId,
+    exp: Math.floor(Date.now() / 1000) + SELFSERVE_TOKEN_TTL_SECONDS,
+  };
+  const token = await signToken(payload, env.TOKEN_SIGNING_SECRET);
+  return html(200, connectResultHtml({ brand, origin: url.origin, token }));
 }
 
 // ---------------------------------------------------------------------------
