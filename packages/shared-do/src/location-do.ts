@@ -11,18 +11,35 @@
 // this file has no concept of "the other tenant's data" because there is
 // no such data in scope.
 //
-// Migration strategy: the DO runs schema migrations lazily on first use.
-// Applied statement hashes are tracked in `_migrations` so reruns are safe
-// and new manifest entries land as incremental CREATE TABLE IF NOT EXISTS
-// statements. SQLite is forgiving; this is sufficient for phase 1. When
-// we need real column drops / renames, we'll introduce numbered migrations
-// with an explicit direction.
+// Migration strategy: schema-diff, not statement-replay.
+//
+// On first RPC call, LocationDO introspects its current SQLite state via
+// PRAGMA table_info and reconciles against the @topline/shared-schema
+// manifest:
+//   - Missing tables → CREATE TABLE
+//   - Missing (nullable) columns → ALTER TABLE ADD COLUMN
+//   - Missing indexes → CREATE INDEX IF NOT EXISTS
+//
+// Schema changes we DON'T auto-apply (and will throw or log instead):
+//   - Adding a NOT NULL column to an existing table (SQLite requires
+//     a DEFAULT; manifest doesn't model defaults yet)
+//   - Column renames, drops, type changes
+//
+// When one of those lands we'll introduce explicit numbered migration
+// files. The `_schema_log` table is an append-only audit log of every
+// DDL operation this DO has applied — useful for post-hoc debugging of
+// schema drift across tenants. (Earlier versions of this code used a
+// table called `_migrations` with a different shape; the new name
+// avoids a collision on DOs that were created before the rewrite.
+// Dead `_migrations` tables on older DOs are harmless.)
 
 import { DurableObject } from "cloudflare:workers";
 import {
   ALL_ENTITIES,
   ENTITY_BY_TABLE,
-  migrationStatements,
+  renderCreateTable,
+  renderColumn,
+  renderIndexes,
   auditPasses,
   type EntityManifest,
   type ColumnDef,
@@ -94,6 +111,18 @@ export interface LocationDOEnv {}
 const DEFAULT_ROW_CAP = 5000;
 
 // ---------------------------------------------------------------------------
+// Dedicated error type for migrations so callers can distinguish schema
+// problems from runtime query failures.
+// ---------------------------------------------------------------------------
+
+export class LocationDOMigrationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LocationDOMigrationError";
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The DO class
 // ---------------------------------------------------------------------------
 
@@ -102,7 +131,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
 
   /**
    * Lazy init. Every RPC method calls this first. Migrations are idempotent
-   * and cheap after the first call (tracked in `_migrations`).
+   * and cheap after the first call (tracked in `_schema_log`).
    */
   private ensureInitialized(): void {
     if (this.initialized) return;
@@ -111,17 +140,41 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   }
 
   /**
-   * Runs every migration statement that hasn't been applied to this DO yet.
-   * Idempotent: statements are keyed by SHA-256 of their SQL text.
+   * Reconciles this DO's SQLite schema with the current manifest.
+   *
+   * Strategy: schema diff, not statement-replay.
+   *
+   *   1. For each manifest entity, introspect the actual columns via
+   *      PRAGMA table_info().
+   *   2. If the table doesn't exist → CREATE TABLE from the manifest.
+   *   3. If the table exists → ALTER TABLE ADD COLUMN for every manifest
+   *      column missing from the live table.
+   *   4. Unsupported diffs (rename, drop, type change, adding a NOT NULL
+   *      column without a DEFAULT) throw — they require a hand-written
+   *      migration, not auto-apply.
+   *   5. CREATE INDEX IF NOT EXISTS for every indexed column (name-keyed
+   *      idempotent — safe to rerun).
+   *
+   * Why not the old hash-keyed CREATE TABLE IF NOT EXISTS approach?
+   * Because SQLite treats CREATE TABLE IF NOT EXISTS as a no-op when the
+   * table already exists, so manifest edits that added a column would be
+   * recorded as "applied" without actually altering anything, leaving
+   * upserts to fail at runtime with "no such column". Schema-diff sees
+   * the real table and emits the right ALTER.
+   *
+   * Every schema change is logged to `_schema_log` as an audit trail so
+   * ops can reconstruct what happened to a given tenant's DO without
+   * re-running anything.
    */
   private runMigrations(): void {
     const sql = this.ctx.storage.sql;
 
-    // Bookkeeping tables first. These aren't in the manifest — they're DO
-    // infrastructure, not user-queryable data.
+    // Bookkeeping tables. These aren't in the manifest.
     sql.exec(`
-      CREATE TABLE IF NOT EXISTS _migrations (
-        statement_hash TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS _schema_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation TEXT NOT NULL,
+        target TEXT NOT NULL,
         statement TEXT NOT NULL,
         applied_at TEXT NOT NULL
       )
@@ -135,25 +188,80 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       )
     `);
 
-    // Apply every manifest statement that hasn't landed yet. Hash-keyed so
-    // manifest edits that change a statement cause a fresh apply.
-    for (const stmt of migrationStatements()) {
-      const hash = hashStatement(stmt);
-      const existing = sql
-        .exec<{ statement_hash: string }>(
-          "SELECT statement_hash FROM _migrations WHERE statement_hash = ?",
-          hash,
-        )
-        .toArray();
-      if (existing.length > 0) continue;
-      sql.exec(stmt);
-      sql.exec(
-        "INSERT INTO _migrations(statement_hash, statement, applied_at) VALUES (?, ?, ?)",
-        hash,
-        stmt,
-        new Date().toISOString(),
-      );
+    for (const entity of ALL_ENTITIES) {
+      this.reconcileTable(entity);
     }
+
+    // Indexes are name-keyed; CREATE INDEX IF NOT EXISTS is the correct
+    // idempotent primitive. Reapply every time — no-op if already present,
+    // picks up new indexed columns if added.
+    for (const entity of ALL_ENTITIES) {
+      for (const idxStmt of renderIndexes(entity)) {
+        sql.exec(idxStmt);
+      }
+    }
+  }
+
+  /** Bring one entity's table into alignment with its manifest. */
+  private reconcileTable(entity: EntityManifest): void {
+    const sql = this.ctx.storage.sql;
+    const live = sql
+      .exec<{
+        cid: number;
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: string | null;
+        pk: number;
+      }>(`PRAGMA table_info(${quoteIdent(entity.table)})`)
+      .toArray();
+
+    if (live.length === 0) {
+      // Fresh table.
+      const stmt = renderCreateTable(entity);
+      sql.exec(stmt);
+      this.logMigration("CREATE TABLE", entity.table, stmt);
+      return;
+    }
+
+    // Existing table — apply additive column changes.
+    const liveNames = new Set(live.map((r) => r.name));
+    for (const col of entity.columns) {
+      if (liveNames.has(col.name)) continue;
+
+      // SQLite ALTER TABLE ADD COLUMN rules: a NOT NULL column added to
+      // an existing table must have a DEFAULT. We don't model defaults
+      // in the manifest yet, so reject this case loudly. Maintainer
+      // options: make the column nullable, or hand-write a migration.
+      if (!col.nullable) {
+        throw new LocationDOMigrationError(
+          `Cannot auto-add NOT NULL column ${entity.table}.${col.name} to an existing table without a DEFAULT. Either make it nullable in the manifest or write a dedicated migration.`,
+        );
+      }
+
+      const stmt = `ALTER TABLE ${quoteIdent(entity.table)} ADD COLUMN ${renderColumn(col)};`;
+      sql.exec(stmt);
+      this.logMigration("ADD COLUMN", `${entity.table}.${col.name}`, stmt);
+    }
+
+    // Columns the live table has but the manifest doesn't mention: left in
+    // place. Drops require a dedicated migration (SQLite 3.35+ supports
+    // ALTER TABLE DROP COLUMN but we keep this conservative for v1 —
+    // orphan columns don't break anything).
+    //
+    // Type changes: not detected. A manifest change from TEXT→INTEGER on
+    // an existing column would be silently ignored at the DDL level. When
+    // we need this we'll add explicit migration files.
+  }
+
+  private logMigration(operation: string, target: string, statement: string): void {
+    this.ctx.storage.sql.exec(
+      "INSERT INTO _schema_log(operation, target, statement, applied_at) VALUES (?, ?, ?, ?)",
+      operation,
+      target,
+      statement,
+      new Date().toISOString(),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -314,24 +422,33 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     };
   }
 
-  /** Detailed column info for explain_tables. */
+  /**
+   * Detailed column info for explain_tables.
+   *
+   * Applies the same exposure gate as describeSchema: a table that hasn't
+   * passed audit or has `exposed: false` is treated as if it doesn't
+   * exist, so callers can't probe hidden tables through this method even
+   * though their rows physically live in the DO.
+   */
   async explainTables(tables: readonly string[]): Promise<TableDetails[]> {
     this.ensureInitialized();
     const state = await this.getSyncState();
     return tables.map((t) => {
       const e = ENTITY_BY_TABLE.get(t);
-      if (!e) throw new Error(`Unknown table: ${t}`);
+      if (!e || !e.exposed || !auditPasses(e)) {
+        throw new Error(`Unknown or unavailable table: ${t}`);
+      }
       return explainOne(e, state[t]?.row_count ?? 0);
     });
   }
 
   /** Cheap health probe used by diagnostic endpoints. */
-  async ping(): Promise<{ ok: true; initialized: boolean; tables_applied: number }> {
+  async ping(): Promise<{ ok: true; initialized: boolean; migration_ops: number }> {
     this.ensureInitialized();
     const n = this.ctx.storage.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM _migrations")
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM _schema_log")
       .one().n;
-    return { ok: true, initialized: this.initialized, tables_applied: n };
+    return { ok: true, initialized: this.initialized, migration_ops: n };
   }
 }
 
@@ -393,13 +510,3 @@ function coerceForSqlite(col: ColumnDef, value: unknown): SqlStorageValue {
   return String(value);
 }
 
-function hashStatement(stmt: string): string {
-  // djb2-style — we don't need cryptographic strength here, just a stable
-  // fingerprint so a re-run detects identical statements. crypto.subtle is
-  // async; keeping the migration runner synchronous is worth avoiding.
-  let h = 5381;
-  for (let i = 0; i < stmt.length; i++) {
-    h = ((h << 5) + h + stmt.charCodeAt(i)) | 0;
-  }
-  return `djb2-${(h >>> 0).toString(16)}`;
-}

@@ -514,23 +514,28 @@ async function dispatch(rpc: JsonRpcRequest, env: Env): Promise<Response> {
 // we can verify migrations ran cleanly without shipping a visible surface.
 //
 // Usage:
-//   curl "https://os-mcp.topline.com/admin/do-info?location=loc-test&token=<ADMIN_TOKEN>"
+//   curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+//        "https://os-mcp.topline.com/admin/do-info?location=loc-test"
 //
-// The endpoint creates a DO instance on first access for the given location.
-// That instance sticks around (DO storage is persistent). For a clean test
-// use a throwaway location_id like "debug-2026-04-23".
+// Secrets go in the Authorization header, never the query string —
+// query strings leak to access logs, referrers, shell history, and
+// observability tooling. The endpoint creates a DO instance on first
+// access for the given location. That instance sticks around (DO
+// storage is persistent). For a clean test use a throwaway location_id
+// like "debug-2026-04-23".
 // ---------------------------------------------------------------------------
 async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const url = new URL(request.url);
-  const token = url.searchParams.get("token") ?? "";
   const location = url.searchParams.get("location") ?? "";
 
   if (!env.ADMIN_TOKEN) {
     return plain(503, "ADMIN_TOKEN not configured. Set with: wrangler secret put ADMIN_TOKEN");
   }
-  if (token !== env.ADMIN_TOKEN) {
-    return plain(401, "Invalid or missing token");
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer || bearer !== env.ADMIN_TOKEN) {
+    return plain(401, "Invalid or missing Authorization: Bearer <ADMIN_TOKEN>");
   }
   if (!location) {
     return plain(400, "Missing ?location=<location_id>");
