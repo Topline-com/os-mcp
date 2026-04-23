@@ -1,7 +1,7 @@
-import { toplineFetch, getLocationId } from "../client.js";
-import { BRAND_NAME } from "../branding.js";
+import { toplineFetch, getLocationId } from "@topline/shared";
+import { BRAND_NAME } from "@topline/shared";
 import type { ToolDef } from "./types.js";
-import { str, obj, objLoose } from "../schemas.js";
+import { str, obj, objLoose } from "@topline/shared";
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 type Method = (typeof METHODS)[number];

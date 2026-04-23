@@ -1,35 +1,34 @@
 {
   "name": "@topline-ai/mcp",
   "version": "0.1.0",
-  "description": "Topline MCP — drive your Topline sub-account from Claude.",
+  "description": "Topline OS MCP — drive your Topline sub-account from Claude. Monorepo root.",
   "license": "MIT",
   "type": "module",
+  "private": false,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "bin": {
-    "topline-mcp": "dist/index.js"
+    "topline-mcp": "apps/edge/dist/index.js"
   },
   "files": [
-    "dist",
+    "apps/edge/dist",
+    "packages/shared/dist",
+    "apps/edge/package.json",
+    "packages/shared/package.json",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "dev": "tsc --watch",
-    "start": "node dist/index.js",
+    "build": "npm run build -w @topline/shared && npm run build -w @topline-ai/edge",
+    "dev": "npm run dev -w @topline-ai/edge",
+    "start": "npm run start -w @topline-ai/edge",
     "prepare": "npm run build",
     "prepublishOnly": "npm run build",
-    "worker:dev": "wrangler dev",
-    "worker:deploy": "wrangler deploy",
-    "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
-  },
-  "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240405.0",
-    "@types/node": "^20.12.0",
-    "typescript": "^5.4.0",
-    "wrangler": "^3.60.0"
+    "worker:dev": "npm run worker:dev -w @topline-ai/edge",
+    "worker:deploy": "npm run worker:deploy -w @topline-ai/edge",
+    "worker:typecheck": "npm run worker:typecheck -w @topline-ai/edge"
   },
   "engines": {
     "node": ">=20"

@@ -1,6 +1,6 @@
-import { toplineFetch, getLocationId } from "../client.js";
+import { toplineFetch, getLocationId } from "@topline/shared";
 import type { ToolDef } from "./types.js";
-import { locationId, str, obj } from "../schemas.js";
+import { locationId, str, obj } from "@topline/shared";
 
 export const tools: ToolDef[] = [
   {

@@ -1,6 +1,6 @@
-import { toplineFetch } from "../client.js";
+import { toplineFetch } from "@topline/shared";
 import type { ToolDef } from "./types.js";
-import { contactId, str, bool, obj } from "../schemas.js";
+import { contactId, str, bool, obj } from "@topline/shared";
 
 const taskId = str("Task ID");
 

@@ -1,11 +1,11 @@
-import { toplineFetch, getLocationId } from "../client.js";
+import { toplineFetch, getLocationId } from "@topline/shared";
 import type { ToolDef } from "./types.js";
-import { locationId, surveyId, str, obj, limitProp, startAfterIdProp } from "../schemas.js";
+import { locationId, formId, str, obj, limitProp, startAfterIdProp } from "@topline/shared";
 
 export const tools: ToolDef[] = [
   {
-    name: "topline_list_surveys",
-    description: "List all surveys on the sub-account.",
+    name: "topline_list_forms",
+    description: "List all forms on the sub-account.",
     inputSchema: obj({ locationId, limit: limitProp, startAfterId: startAfterIdProp }),
     handler: async (args) => {
       const query: Record<string, string | number | boolean | undefined> = {
@@ -13,31 +13,31 @@ export const tools: ToolDef[] = [
       };
       if (args.limit) query.limit = args.limit as number;
       if (args.startAfterId) query.skip = String(args.startAfterId);
-      return await toplineFetch("/surveys/", { query });
+      return await toplineFetch("/forms/", { query });
     },
   },
   {
-    name: "topline_list_survey_submissions",
-    description: "List submissions for a specific survey.",
+    name: "topline_list_form_submissions",
+    description: "List submissions for a specific form.",
     inputSchema: obj(
       {
-        surveyId,
+        formId,
         limit: limitProp,
-        startAt: str("ISO date"),
-        endAt: str("ISO date"),
+        startAt: str("ISO date — only submissions after this date"),
+        endAt: str("ISO date — only submissions before this date"),
         locationId,
       },
-      ["surveyId"],
+      ["formId"],
     ),
     handler: async (args) => {
       const query: Record<string, string | number | boolean | undefined> = {
         locationId: getLocationId(args.locationId as string | undefined),
-        surveyId: String(args.surveyId),
+        formId: String(args.formId),
       };
       if (args.limit) query.limit = args.limit as number;
       if (args.startAt) query.startAt = String(args.startAt);
       if (args.endAt) query.endAt = String(args.endAt);
-      return await toplineFetch("/surveys/submissions", { query });
+      return await toplineFetch("/forms/submissions", { query });
     },
   },
 ];

@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { BRAND_NAME, SERVER_INFO } from "./branding.js";
+import { BRAND_NAME, SERVER_INFO } from "@topline/shared";
 import { ALL_TOOLS, toolsByName } from "./registry.js";
 
 const server = new Server(

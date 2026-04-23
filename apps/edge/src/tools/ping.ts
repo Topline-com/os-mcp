@@ -1,5 +1,5 @@
-import { toplineFetch, getLocationId } from "../client.js";
-import { BRAND_NAME } from "../branding.js";
+import { toplineFetch, getLocationId } from "@topline/shared";
+import { BRAND_NAME } from "@topline/shared";
 import type { ToolDef } from "./types.js";
 
 export const tools: ToolDef[] = [

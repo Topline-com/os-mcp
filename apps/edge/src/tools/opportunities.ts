@@ -1,4 +1,4 @@
-import { toplineFetch, getLocationId } from "../client.js";
+import { toplineFetch, getLocationId } from "@topline/shared";
 import type { ToolDef } from "./types.js";
 import {
   contactId,
@@ -12,7 +12,7 @@ import {
   obj,
   limitProp,
   startAfterIdProp,
-} from "../schemas.js";
+} from "@topline/shared";
 
 export const tools: ToolDef[] = [
   {

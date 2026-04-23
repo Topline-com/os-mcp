@@ -1,6 +1,6 @@
-import { toplineFetch } from "../client.js";
+import { toplineFetch } from "@topline/shared";
 import type { ToolDef } from "./types.js";
-import { contactId, str, obj } from "../schemas.js";
+import { contactId, str, obj } from "@topline/shared";
 
 const noteId = str("Note ID");
 

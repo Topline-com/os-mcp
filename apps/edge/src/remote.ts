@@ -11,7 +11,7 @@
 // TOKEN_SIGNING_SECRET (set with: wrangler secret put TOKEN_SIGNING_SECRET).
 
 import { ALL_TOOLS, toolsByName } from "./registry.js";
-import { credentialsContext, ToplineApiError } from "./client.js";
+import { credentialsContext, ToplineApiError } from "@topline/shared";
 import {
   signToken,
   verifyToken,

@@ -1,5 +1,5 @@
-import { toplineFetch, getLocationId, peekPit, peekLocationId, ToplineApiError } from "../client.js";
-import { BRAND_NAME } from "../branding.js";
+import { toplineFetch, getLocationId, peekPit, peekLocationId, ToplineApiError } from "@topline/shared";
+import { BRAND_NAME } from "@topline/shared";
 import type { ToolDef } from "./types.js";
 
 type ProbeStatus = "ok" | "forbidden" | "error" | "skipped";
