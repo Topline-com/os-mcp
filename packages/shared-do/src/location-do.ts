@@ -844,7 +844,28 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * Ensure a drain marker exists for (entity, parent_id). Called by the
    * per-parent loop on the first page of a parent that has no cursor
    * (e.g. single-page endpoints like tasks/notes that never call
-   * setParentSyncCursor). Idempotent via COALESCE.
+   * setParentSyncCursor). Idempotent via COALESCE on drain_started_at.
+   *
+   * Two critical semantics:
+   *
+   *   1. `last_sync_at` is NOT advanced here. That timestamp means
+   *      "the parent's most recent SUCCESSFUL drain completion" and
+   *      is the gate getNextParentsForChild uses to detect staleness.
+   *      If a previously-complete parent gets re-visited and the GHL
+   *      fetch throws before we call markParentBackfillComplete,
+   *      bumping last_sync_at mid-drain would leave the row looking
+   *      like "just synced" while backfill_complete stayed 1 — and
+   *      the next tick's freshness clause would never fire because
+   *      the parent's freshness column is no longer greater than the
+   *      bogusly-advanced last_sync_at. Signal lost until the parent
+   *      gets bumped upstream AGAIN.
+   *
+   *   2. `backfill_complete` MUST be flipped to 0 on the UPDATE
+   *      branch. A re-visited parent is mid-drain; if the fetch fails
+   *      before completion, the next tick's "incomplete" clause must
+   *      pick it up. If we left backfill_complete = 1 and didn't
+   *      advance last_sync_at (or advanced it past the freshness
+   *      column), NEITHER clause would select the parent again.
    */
   async ensureParentDrainMarker(
     entity: string,
@@ -854,13 +875,12 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     const now = new Date().toISOString();
     this.ctx.storage.sql.exec(
       `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-       VALUES (?, ?, NULL, 0, ?, ?)
+       VALUES (?, ?, NULL, 0, NULL, ?)
        ON CONFLICT(entity, parent_id) DO UPDATE
-         SET last_sync_at = excluded.last_sync_at,
+         SET backfill_complete = 0,
              drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
       entity,
       parentId,
-      now,
       now,
     );
     const row = this.ctx.storage.sql
@@ -917,6 +937,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       .toArray()[0]?.drain_started_at ?? null;
 
     let totalPruned = 0;
+    // Tables whose row_count cache in _sync_state may need refresh
+    // after the prune. Collect as we go; refresh in one pass at the
+    // end so we don't touch _sync_state multiple times.
+    const tablesPruned: string[] = [];
     if (drainStart) {
       // Prune stale children for the primary entity.
       const pruneCursor = this.ctx.storage.sql.exec(
@@ -927,7 +951,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       for (const _ of pruneCursor) {
         // iterate to force execution
       }
-      totalPruned += pruneCursor.rowsWritten ?? 0;
+      const childPruned = pruneCursor.rowsWritten ?? 0;
+      totalPruned += childPruned;
+      if (childPruned > 0) tablesPruned.push(childTable);
 
       // Prune stale derived rows for the same parent (e.g. call_events
       // where conversation_id = parentId, for a messages parent).
@@ -940,8 +966,28 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         for (const _ of c) {
           // force execution
         }
-        totalPruned += c.rowsWritten ?? 0;
+        const n = c.rowsWritten ?? 0;
+        totalPruned += n;
+        if (n > 0) tablesPruned.push(table);
       }
+    }
+
+    // Refresh cached row_counts for every table we deleted from.
+    // pruneStaleRows (the entity-level full-drain prune) does the same
+    // — without this, describe_schema/getSyncState would keep
+    // reporting pre-prune counts until the next successful upsert on
+    // that table bumped the cache by a different code path. For
+    // tables that rarely change (notes, tasks on stale contacts) the
+    // drift could persist indefinitely.
+    for (const table of new Set(tablesPruned)) {
+      const fresh = this.ctx.storage.sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)
+        .one().n;
+      this.ctx.storage.sql.exec(
+        `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
+        fresh,
+        table,
+      );
     }
 
     // Now mark complete + clear drain marker + cursor.
