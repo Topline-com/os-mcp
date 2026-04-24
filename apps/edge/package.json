@@ -11,6 +11,7 @@
     "worker:dev": "wrangler dev",
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
+    "pretest": "npm run build --workspace=@topline/shared --workspace=@topline/shared-auth --workspace=@topline/shared-schema --workspace=@topline/shared-do",
     "test": "tsx --test src/sql-safety.test.ts src/write-tools.test.ts"
   },
   "dependencies": {
