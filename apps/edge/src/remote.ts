@@ -488,14 +488,21 @@ async function dispatch(
     case "ping":
       return jsonRpcResult(rpc.id ?? null, {});
 
-    case "tools/list":
+    case "tools/list": {
+      // Hide analytics tools from raw-PIT sessions. tools/call will
+      // reject them anyway (see below), but filtering them out of the
+      // list avoids confusing the client into trying them.
+      const visible = auth.rawPitBearer
+        ? ALL_TOOLS.filter((t) => !ANALYTICS_TOOL_NAMES.has(t.name))
+        : ALL_TOOLS;
       return jsonRpcResult(rpc.id ?? null, {
-        tools: ALL_TOOLS.map(({ name, description, inputSchema }) => ({
+        tools: visible.map(({ name, description, inputSchema }) => ({
           name,
           description,
           inputSchema,
         })),
       });
+    }
 
     case "tools/call": {
       const params = rpc.params as { name?: string; arguments?: Record<string, unknown> } | undefined;
@@ -716,11 +723,14 @@ async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Res
 }
 
 // ---------------------------------------------------------------------------
-// /admin/do-query — run a raw SELECT against a tenant's DO. Gated by
-// ADMIN_TOKEN. Intended only for ops / verification while phase-1 step-4
-// (the real SELECT-only MCP tool) is being built. This endpoint trusts the
-// SQL — there is no parse guard here. It's an admin surface, not customer-
-// facing.
+// /admin/do-query — run a SELECT against a tenant's DO. Gated by
+// ADMIN_TOKEN.
+//
+// SQL passes through sanitizeQuery() so DDL/DML/PRAGMA/ATTACH/multi-
+// statement are blocked the same way customer-facing paths are. The
+// exposed-table allowlist is intentionally NOT applied here, so admins
+// can still SELECT from bookkeeping tables (_sync_state, _schema_log)
+// and SQLite metadata (sqlite_master) for diagnostics.
 //
 // Usage:
 //   curl -H "Authorization: Bearer $ADMIN_TOKEN" \

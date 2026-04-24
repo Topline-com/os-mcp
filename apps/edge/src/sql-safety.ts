@@ -140,6 +140,23 @@ export function sanitizeQuery(
     throw new SqlSafetyError(`Failed to re-serialize SQL after safety pass: ${message}`);
   }
 
+  // Block SQLite's table-valued PRAGMA helpers. These appear
+  // syntactically as function calls (SELECT ... FROM pragma_table_info(
+  // 'x')) not table references, so parser.tableList() returns nothing
+  // for them and the exposed-table allowlist in enforceExposedTables
+  // has nothing to reject. They expose schema metadata for every table
+  // in the DO — including hidden entities and bookkeeping tables —
+  // which is exactly what blocking PRAGMA is supposed to prevent.
+  //
+  // Detected by substring on the sanitized (sqlify) output so quoting
+  // is normalized. Does not affect json_each, json_tree, or other
+  // legitimate table-valued helpers — those don't start with pragma_.
+  if (/\bpragma_\w+\s*\(/i.test(rewritten)) {
+    throw new SqlSafetyError(
+      "Table-valued PRAGMA functions (pragma_table_info, pragma_foreign_key_list, pragma_index_list, etc.) are blocked. Call topline_explain_tables for schema introspection instead.",
+    );
+  }
+
   return {
     sql: rewritten,
     limited,
