@@ -26,6 +26,7 @@ import {
   PARENT_ENSURE_DRAIN_MARKER,
   PARENT_SET_SYNC_CURSOR,
   PARENT_MARK_COMPLETE,
+  PARENT_GET_DRAIN_START,
   parentPruneChildrenSql,
   nextParentsForChildSql,
   refreshRowCountSql,
@@ -104,8 +105,11 @@ function markParentBackfillComplete(
   fkColumn: string,
   now: string,
 ): { pruned: number } {
+  // PARENT_GET_DRAIN_START is the same string the RPC runs. Importing
+  // it here closes the last gap in the single-source-SQL guarantee: a
+  // regression in the drain-start read path now fails this test.
   const drainRow = db
-    .prepare(`SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`)
+    .prepare(PARENT_GET_DRAIN_START)
     .get(entity, parentId) as { drain_started_at: string | null } | undefined;
   const drainStart = drainRow?.drain_started_at ?? null;
 
