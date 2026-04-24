@@ -1,5 +1,20 @@
 // Shared tool registry — imported by both the stdio entry point (src/index.ts)
 // and the Cloudflare Worker entry point (src/remote.ts).
+//
+// Tools are split into two categories:
+//
+//   ACTION_TOOLS   — proxy individual GHL API endpoints (contacts,
+//                    opportunities, calendars, messages, etc). Available
+//                    in every runtime, including stdio. They depend only
+//                    on the shared toplineFetch client + credentialsContext.
+//
+//   ANALYTICS_TOOLS — the SQL surface (describe_schema, explain_tables,
+//                    execute_query, utilize_api). They require the
+//                    edge worker's request context (LOCATION_DO binding
+//                    + the edgeContext AsyncLocalStorage) and would
+//                    fail at runtime from stdio. Hidden from stdio.
+//
+// Worker consumers use ALL_TOOLS (union). Stdio uses ACTION_TOOLS only.
 
 import type { ToolDef } from "./tools/types.js";
 
@@ -21,10 +36,14 @@ import { tools as userTools } from "./tools/users.js";
 import { tools as formTools } from "./tools/forms.js";
 import { tools as surveyTools } from "./tools/surveys.js";
 
-export const ALL_TOOLS: ToolDef[] = [
+/**
+ * Runtime-independent GHL action tools. Safe to run from stdio (local
+ * Claude Desktop / Code install) because they only need the shared
+ * HTTP client + credentialsContext.
+ */
+export const ACTION_TOOLS: ToolDef[] = [
   ...pingTools,
   ...setupCheckTools,
-  ...sqlTools,
   ...passthroughTools,
   ...contactTools,
   ...conversationTools,
@@ -40,6 +59,25 @@ export const ALL_TOOLS: ToolDef[] = [
   ...formTools,
   ...surveyTools,
 ];
+
+/**
+ * Worker-only analytics tools (SQL surface). Require apps/edge's
+ * request context + LOCATION_DO binding; not usable from stdio.
+ */
+export const ANALYTICS_TOOLS: ToolDef[] = [
+  ...sqlTools,
+];
+
+/**
+ * Name set for category checks at dispatch time (e.g., rejecting
+ * raw-PIT bearers for analytics tools).
+ */
+export const ANALYTICS_TOOL_NAMES: ReadonlySet<string> = new Set(
+  ANALYTICS_TOOLS.map((t) => t.name),
+);
+
+/** Every tool available to the Worker (action + analytics). */
+export const ALL_TOOLS: ToolDef[] = [...ACTION_TOOLS, ...ANALYTICS_TOOLS];
 
 // Sanity check: reject duplicate tool names at startup.
 const seen = new Set<string>();

@@ -6,7 +6,14 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { BRAND_NAME, SERVER_INFO } from "@topline/shared";
-import { ALL_TOOLS, toolsByName } from "./registry.js";
+import { ACTION_TOOLS } from "./registry.js";
+
+// Stdio only exposes ACTION_TOOLS (GHL REST proxies). The analytics SQL
+// surface needs the Cloudflare Worker's request context (LOCATION_DO
+// binding + edgeContext); it would register successfully in stdio but
+// every call would throw at runtime. Better to not advertise it at all.
+const toolsForStdio = ACTION_TOOLS;
+const toolsByName = new Map(toolsForStdio.map((t) => [t.name, t]));
 
 const server = new Server(
   { name: SERVER_INFO.name, version: SERVER_INFO.version },
@@ -14,7 +21,7 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: ALL_TOOLS.map(({ name, description, inputSchema }) => ({
+  tools: toolsForStdio.map(({ name, description, inputSchema }) => ({
     name,
     description,
     inputSchema,
@@ -54,7 +61,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   // Log to stderr so we don't corrupt the stdio JSON-RPC stream.
   console.error(
-    `${BRAND_NAME} MCP v${SERVER_INFO.version} ready — ${ALL_TOOLS.length} tools registered.`,
+    `${BRAND_NAME} MCP v${SERVER_INFO.version} ready — ${toolsForStdio.length} tools registered.`,
   );
 }
 

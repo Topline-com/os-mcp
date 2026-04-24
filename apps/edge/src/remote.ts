@@ -19,7 +19,7 @@
 // HKDF. Rotating it invalidates every token AND every encrypted PIT in one
 // step.
 
-import { ALL_TOOLS, toolsByName } from "./registry.js";
+import { ALL_TOOLS, toolsByName, ANALYTICS_TOOL_NAMES } from "./registry.js";
 import { credentialsContext, ToplineApiError } from "@topline/shared";
 import {
   signToken,
@@ -42,7 +42,7 @@ import {
 import { LocationDO } from "@topline/shared-do";
 import { edgeContext } from "./request-context.js";
 import { locationClient } from "./location-do-client.js";
-import { sanitizeQuery, SqlSafetyError } from "./sql-safety.js";
+import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
@@ -426,6 +426,13 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
   let { pit, locationId, cid } = resolved;
 
+  // Raw-PIT bearers only (detected by the bearer starting with "pit-").
+  // Action tools tolerate raw PITs because GHL validates them upstream;
+  // analytics tools (SQL surface) never call GHL, so an unvalidated PIT
+  // plus a caller-supplied location header is an auth bypass. Tracked
+  // as a flag so dispatch can reject analytics calls for raw-PIT sessions.
+  const rawPitBearer = bearer.startsWith("pit-");
+
   // For raw-PIT bearers, location may come from a side-channel header.
   if (!locationId) {
     locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
@@ -445,7 +452,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   try {
     const response = await edgeContext.run({ location_do: env.LOCATION_DO }, () =>
       credentialsContext.run({ pit, locationId }, async () => {
-        return dispatch(rpc, env);
+        return dispatch(rpc, env, { rawPitBearer });
       }),
     );
     // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
@@ -458,7 +465,11 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
 }
 
-async function dispatch(rpc: JsonRpcRequest, env: Env): Promise<Response> {
+async function dispatch(
+  rpc: JsonRpcRequest,
+  env: Env,
+  auth: { rawPitBearer: boolean },
+): Promise<Response> {
   const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
   const serverName = `${brand.toLowerCase().replace(/\s+/g, "-")}-mcp`;
 
@@ -495,6 +506,21 @@ async function dispatch(rpc: JsonRpcRequest, env: Env): Promise<Response> {
         return jsonRpcResult(rpc.id ?? null, {
           isError: true,
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
+        });
+      }
+      // Analytics tools (the SQL surface) don't touch GHL and therefore
+      // can't implicitly validate a raw-PIT bearer the way action tools
+      // do. Block them under raw-PIT sessions — caller must upgrade to
+      // an OAuth-issued cid token or a /connect-minted signed bearer.
+      if (auth.rawPitBearer && ANALYTICS_TOOL_NAMES.has(name)) {
+        return jsonRpcResult(rpc.id ?? null, {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Tool '${name}' is not available under a raw PIT bearer. The analytics / SQL surface requires a connection-bound token. Use an OAuth-issued access token or mint one at /connect.`,
+            },
+          ],
         });
       }
       try {
@@ -584,21 +610,37 @@ async function authorizeQueryRequest(
   if (!bearer) {
     return plain(401, "Missing Authorization: Bearer <token>");
   }
+
+  // The SQL surface requires a CONNECTION-BOUND bearer (cid token from
+  // OAuth/connect, or the legacy signed { pit, locationId } token).
+  // Raw PITs are NOT accepted here: the action-tool path validates raw
+  // PITs implicitly by forwarding them to GHL, but the SQL path never
+  // calls GHL — it just picks a LocationDO by caller-supplied
+  // location_id. Without upstream validation, a raw "pit-" string plus
+  // any location header would let the caller read whatever SQLite DB
+  // they name. Reject at the door.
+  if (bearer.startsWith("pit-")) {
+    return plain(
+      401,
+      "Raw PIT bearers are not accepted on the SQL surface. Use an OAuth-issued access token or one minted at /connect.",
+    );
+  }
+
   const resolved = await resolveBearer(bearer, env);
   if ("error" in resolved) {
     return plain(401, resolved.error);
   }
-  let locationId = resolved.locationId;
-  if (!locationId) {
-    locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
-  }
-  if (!locationId) {
+  // After the raw-PIT guard above, resolved.locationId MUST come from
+  // the signed token's payload (cid → connection record, or legacy
+  // { pit, locationId }). We never fall back to the X-Topline-
+  // Location-Id header on the SQL path.
+  if (!resolved.locationId) {
     return plain(
-      400,
-      "No location resolved from the token. For raw-PIT bearers pass X-Topline-Location-Id too.",
+      401,
+      "Token does not carry a location. Reconnect via OAuth or /connect to mint a connection-bound token.",
     );
   }
-  return { locationId, cid: resolved.cid };
+  return { locationId: resolved.locationId, cid: resolved.cid };
 }
 
 async function handleQueryApiOverview(request: Request, env: Env): Promise<Response> {
@@ -648,6 +690,7 @@ async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Res
   let safe;
   try {
     safe = sanitizeQuery(sqlInput);
+    enforceExposedTables(safe.sql);
   } catch (err) {
     if (err instanceof SqlSafetyError) {
       return json(400, { error: err.message, rejected_query: sqlInput });
@@ -706,10 +749,26 @@ async function handleAdminDoQuery(request: Request, env: Env): Promise<Response>
   }
   if (!body.sql) return json(400, { error: "Missing sql" });
 
+  // Run the query through the SELECT-only parser even on the admin path.
+  // Admins sometimes copy-paste from chat threads; the parser catches
+  // accidental DDL/DML before it reaches SQLite. The exposed-table
+  // allowlist is intentionally NOT applied here so ops can still
+  // inspect bookkeeping tables (_sync_state, _schema_log) and SQLite
+  // metadata (sqlite_master) for diagnostics.
+  let safe;
+  try {
+    safe = sanitizeQuery(body.sql);
+  } catch (err) {
+    if (err instanceof SqlSafetyError) {
+      return json(400, { error: err.message, rejected_query: body.sql });
+    }
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+
   const id = env.LOCATION_DO.idFromName(location);
   const stub = env.LOCATION_DO.get(id);
   try {
-    const result = await stub.executeQuery(body.sql, (body.params as never[]) ?? []);
+    const result = await stub.executeQuery(safe.sql, (body.params as never[]) ?? []);
     return json(200, result);
   } catch (err) {
     return json(500, { error: err instanceof Error ? err.message : String(err) });

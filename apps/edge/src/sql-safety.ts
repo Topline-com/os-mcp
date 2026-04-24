@@ -14,8 +14,17 @@
 // should never reach SQLite.
 
 import { Parser } from "node-sql-parser";
+import { getExposedEntities } from "@topline/shared-schema";
 
 export const DEFAULT_ROW_CAP = 5000;
+
+/**
+ * Bookkeeping / internal-SQLite tables that must never be readable through
+ * the customer-facing SQL surface, even if an allowlist check misfires.
+ * Keeps SELECT name FROM sqlite_master, SELECT * FROM _sync_state, etc.
+ * from leaking schema internals or sync state.
+ */
+const INTERNAL_TABLE_PREFIXES: readonly string[] = ["sqlite_", "_"];
 
 export interface SafeQuery {
   /** The rewritten SQL, safe to execute. Equal to the input when no rewrite was needed. */
@@ -136,4 +145,98 @@ export function sanitizeQuery(
     limited,
     effective_limit: effectiveLimit,
   };
+}
+
+/**
+ * Second-pass safety check for the CUSTOMER-facing SQL surface (MCP
+ * topline_execute_query + HTTP /query/api/execute-sql).
+ *
+ * sanitizeQuery proves the statement is SELECT/WITH-only; this function
+ * proves it only references tables the tenant is allowed to see. Every
+ * DO physically contains:
+ *   - all manifest entity tables (whether exposed: true or not)
+ *   - the internal _sync_state, _schema_log bookkeeping tables
+ *   - SQLite's sqlite_* meta tables
+ *
+ * Without this check, an authenticated user could read hidden entities
+ * (opportunities/conversations/messages today), bookkeeping state, and
+ * SQLite metadata. We gate the customer surface to ONLY the
+ * `exposed: true && auditPasses()` subset returned by
+ * getExposedEntities().
+ *
+ * CTE aliases (WITH foo AS (...) SELECT * FROM foo) ARE returned by
+ * node-sql-parser's tableList alongside real tables. We parse the
+ * WITH clause from the AST, collect the alias names, and exempt them
+ * from the allowlist check.
+ *
+ * Admin surfaces (e.g. /admin/do-query) deliberately SKIP this check.
+ */
+export function enforceExposedTables(query: string): void {
+  const exposed = new Set(getExposedEntities().map((e) => e.table));
+
+  // Extract CTE alias names from the AST so "WITH n AS (...) SELECT * FROM n"
+  // doesn't get rejected because `n` isn't in the exposed set.
+  const cteNames = extractCteNames(query);
+
+  let tableRefs: readonly string[];
+  try {
+    // tableList returns entries like "select::<db>::<table>". We only
+    // care about the final segment.
+    tableRefs = parser.tableList(query, { database: "sqlite" });
+  } catch (err) {
+    // Shouldn't happen — sanitizeQuery already parsed successfully — but
+    // fail closed if the parser disagrees on the second pass.
+    const message = err instanceof Error ? err.message : String(err);
+    throw new SqlSafetyError(`Could not introspect table references: ${message}`);
+  }
+
+  for (const ref of tableRefs) {
+    const parts = ref.split("::");
+    const tableName = (parts[parts.length - 1] ?? ref).toLowerCase();
+
+    if (cteNames.has(tableName)) continue;
+
+    if (INTERNAL_TABLE_PREFIXES.some((p) => tableName.startsWith(p))) {
+      throw new SqlSafetyError(
+        `Access to internal table '${tableName}' is blocked. ` +
+          `This is a bookkeeping / SQLite-metadata table and is never exposed.`,
+      );
+    }
+
+    if (!exposed.has(tableName)) {
+      throw new SqlSafetyError(
+        `Table '${tableName}' is not currently exposed. ` +
+          `Call topline_describe_schema to see what's queryable.`,
+      );
+    }
+  }
+}
+
+/** AST helper: collect the aliases from `WITH x AS (...), y AS (...) SELECT ...`. */
+function extractCteNames(query: string): ReadonlySet<string> {
+  const names = new Set<string>();
+  let ast: unknown;
+  try {
+    ast = parser.astify(query, { database: "sqlite" });
+  } catch {
+    // sanitizeQuery already validated the query; if astify fails now
+    // let the main tableList path handle the follow-up error.
+    return names;
+  }
+  const single = Array.isArray(ast) ? ast[0] : ast;
+  if (!single || typeof single !== "object") return names;
+  const withClauses =
+    (single as { with?: Array<{ name?: { value?: string } | string }> }).with ?? [];
+  for (const clause of withClauses) {
+    const rawName =
+      clause && typeof clause === "object"
+        ? typeof clause.name === "string"
+          ? clause.name
+          : clause.name?.value
+        : undefined;
+    if (typeof rawName === "string" && rawName.length > 0) {
+      names.add(rawName.toLowerCase());
+    }
+  }
+  return names;
 }

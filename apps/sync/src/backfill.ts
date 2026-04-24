@@ -258,28 +258,48 @@ async function backfillStandardCursor(
 }
 
 /**
- * After a complete backfill, compute the max cursor_column value from
- * actual rows in the DO and persist it as the incremental watermark.
- * Then flip backfill_complete. Skipped if cursor_column is missing or
- * MAX returns null (table is empty).
+ * After a complete backfill (empty_page stop), record:
+ *   1. Clear the pagination cursor — a completed backfill is NOT a
+ *      partial one to resume. Leaving a stale cursor means a later
+ *      /sync/backfill resumes from the last page of the previous
+ *      complete run instead of doing a true full refresh.
+ *   2. Set the incremental watermark from MAX(cursor_column) in the DO.
+ *   3. Flip backfill_complete so the cron-driven incremental path
+ *      unlocks.
+ *
+ * Skipped cursor_column → skip the watermark step but still clear
+ * cursor + mark complete.
  */
 async function setWatermarkAndComplete(
   stub: LocationDOStub,
   entity: EntityManifest,
 ): Promise<void> {
-  const col = entity.incremental.cursor_column;
-  if (!col) return;
   try {
-    const result = await stub.executeQuery(
-      `SELECT MAX(${col}) AS w FROM ${entity.table}`,
-    );
-    const row = result.rows[0] as { w: string | null } | undefined;
-    if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
-      await stub.setSyncWatermark(entity.table, String(row.w));
+    await stub.clearSyncCursor(entity.table);
+  } catch {
+    // Non-fatal — worst case, a future resume reads a stale cursor
+    // and GHL returns an empty page. We'd rather proceed than throw.
+  }
+
+  const col = entity.incremental.cursor_column;
+  if (col) {
+    try {
+      const result = await stub.executeQuery(
+        `SELECT MAX(${col}) AS w FROM ${entity.table}`,
+      );
+      const row = result.rows[0] as { w: string | null } | undefined;
+      if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
+        await stub.setSyncWatermark(entity.table, String(row.w));
+      }
+    } catch {
+      // Non-fatal — watermark will be retried on the next empty_page.
     }
+  }
+
+  try {
     await stub.markBackfillComplete(entity.table);
   } catch {
-    // Non-fatal — watermark will be retried on the next empty_page.
+    // Non-fatal
   }
 }
 
@@ -660,8 +680,16 @@ async function backfillPollFull(
 
   // poll_full tables are always "complete" after a successful run — the
   // whole table's been refreshed in one shot. Mark so the cron knows to
-  // just re-invoke (no watermark filter for poll_full).
+  // just re-invoke (no watermark filter for poll_full). Also clear any
+  // stale pagination cursor from a prior partial run of a different
+  // sync mode (defensive — poll_full shouldn't set one, but a manifest
+  // change could leave one behind).
   if (stoppedReason === "empty_page") {
+    try {
+      await stub.clearSyncCursor(entity.table);
+    } catch {
+      // non-fatal
+    }
     try {
       await stub.markBackfillComplete(entity.table);
     } catch {

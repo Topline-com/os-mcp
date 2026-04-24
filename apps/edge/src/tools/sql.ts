@@ -9,7 +9,7 @@ import type { ToolDef } from "./types.js";
 import { str, obj, arr } from "@topline/shared";
 import { edgeContext } from "../request-context.js";
 import { locationClient } from "../location-do-client.js";
-import { sanitizeQuery, SqlSafetyError } from "../sql-safety.js";
+import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "../sql-safety.js";
 
 function getClient() {
   const locId = peekLocationId();
@@ -77,6 +77,7 @@ export const tools: ToolDef[] = [
       let safe;
       try {
         safe = sanitizeQuery(queryInput);
+        enforceExposedTables(safe.sql);
       } catch (err) {
         if (err instanceof SqlSafetyError) {
           // Return as structured error so the LLM can self-correct.
