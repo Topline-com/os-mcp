@@ -13,8 +13,20 @@
 // can catch — "PRAGMA", "ATTACH", "DETACH", "INSERT", "DROP", etc.
 // should never reach SQLite.
 
-import { Parser } from "node-sql-parser";
+// node-sql-parser ships as CommonJS. Native ESM (tsx test runner) can't
+// destructure named exports from CJS, so we import the default and pull
+// Parser off it. esbuild / wrangler bundling also handles this path
+// correctly via their CJS/ESM interop.
+import nodeSqlParser from "node-sql-parser";
 import { getExposedEntities } from "@topline/shared-schema";
+
+const { Parser } = nodeSqlParser as unknown as {
+  Parser: new () => {
+    astify(sql: string, opts: { database: string }): unknown;
+    sqlify(ast: unknown, opts: { database: string }): string;
+    tableList(sql: string, opts: { database: string }): string[];
+  };
+};
 
 export const DEFAULT_ROW_CAP = 5000;
 
