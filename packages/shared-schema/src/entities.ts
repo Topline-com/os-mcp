@@ -171,18 +171,16 @@ export const OPPORTUNITIES: EntityManifest = {
     query_extras: { limit: 100 },
   },
   incremental: {
-    type: "updated_after",
-    cursor_column: "updated_at",
-    cursor_query_param: "date_updated",
+    // poll_full: GHL's /opportunities/search silently ignores every
+    // date-filter query param we probed (date_updated, dateUpdated,
+    // dateAdded, startAfter=<epoch_ms>) — live-tested 2026-04-23 against
+    // ucNDNXi…. And PITs can't register webhooks in GHL v2 (probed the
+    // /webhooks, /hooks, /locations/{id}/webhooks endpoints — all 404).
+    // Every 15 min, re-pull the full paginated stream. Idempotent upserts
+    // make this cheap regardless of volume.
+    type: "poll_full",
     poll_interval_minutes: 15,
-    // GET /opportunities/search does not appear to support server-side
-    // date filtering: passing date_updated / dateUpdated / dateAdded /
-    // startAfter=<epoch_ms> either returns "property should not exist"
-    // or is silently ignored (every far-future value still returned the
-    // full page). Incremental relies on webhooks (step 5) or on
-    // periodic full backfills. Keep filter_ready: false until GHL
-    // exposes a real filter or we switch to a POST variant.
-    filter_ready: false,
+    filter_ready: true,
   },
   webhooks: [
     { ghl_event: "OpportunityCreate", kind: "upsert" },
@@ -190,14 +188,20 @@ export const OPPORTUNITIES: EntityManifest = {
     { ghl_event: "OpportunityDelete", kind: "delete" },
   ],
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
-    update_cursor: false,
-    notes: "GET /opportunities/search has no working date-filter query param — silently ignores dateUpdated/date_updated/startAfter regardless of value. Full re-backfill required until webhooks land.",
+    // Verified live on 2026-04-24 against ucNDNXi… sub-account:
+    //   - GET /opportunities/search returns 100 rows; cursor echoes
+    //     startAfterId back on over-consumption (treated as EOF).
+    //   - backfillPollFull walks every page within one cron invocation.
+    //   - Upserts are idempotent on `id`; re-pulling costs only the
+    //     GHL API budget, never duplicate rows.
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false, // N/A for poll_full — requiredAuditChecks skips it
+    notes: "Uses poll_full because (a) no working date-filter query param on GHL's /opportunities/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
   },
-  exposed: false,
+  exposed: true,
 };
 
 export const CONVERSATIONS: EntityManifest = {
@@ -236,31 +240,31 @@ export const CONVERSATIONS: EntityManifest = {
     query_extras: { limit: 100 },
   },
   incremental: {
-    type: "updated_after",
-    cursor_column: "last_message_date",
-    cursor_query_param: "lastMessageDate",
+    // poll_full: GHL's /conversations/search silently ignores every
+    // date-filter query param we probed (lastMessageDate, startAfterDate)
+    // — live-tested 2026-04-23. PITs can't register webhooks in GHL v2
+    // either (probed /webhooks, /hooks, /locations/{id}/webhooks — all
+    // 404). Every 15 min, re-pull the full paginated stream.
+    type: "poll_full",
     poll_interval_minutes: 15,
-    // GET /conversations/search silently accepts lastMessageDate and
-    // startAfterDate query params but does not filter on them (every
-    // far-future value still returns the full page). Only startAfterDate=0
-    // gave a degenerate 1-row response, suggesting these params have
-    // some other cursor semantics entirely. Keep filter_ready: false
-    // until the right mechanism is identified or webhooks land.
-    filter_ready: false,
+    filter_ready: true,
   },
   webhooks: [
     { ghl_event: "ConversationCreate", kind: "upsert" },
     { ghl_event: "ConversationUpdate", kind: "upsert" },
   ],
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
-    update_cursor: false,
-    notes: "GET /conversations/search date query params (lastMessageDate, startAfterDate) are silently ignored. Full re-backfill required until webhooks land.",
+    // Verified live on 2026-04-24 against ucNDNXi… sub-account.
+    // backfillPollFull walks every page of /conversations/search each
+    // tick. Upserts idempotent on `id`.
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false, // N/A for poll_full
+    notes: "Uses poll_full because (a) no working date-filter query param on GHL's /conversations/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
   },
-  exposed: false,
+  exposed: true,
 };
 
 export const MESSAGES: EntityManifest = {

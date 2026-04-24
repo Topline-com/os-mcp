@@ -608,65 +608,105 @@ async function backfillPollFull(
 
   let rowsUpserted = 0;
   let rowCountAfter = 0;
-  let stoppedReason: BackfillResult["stopped_reason"] = "empty_page";
+  let pagesProcessed = 0;
+  // Initializer uses a widening annotation cast — the inner assignments
+  // happen inside an async closure (runInContext callback) that TS's
+  // flow analysis doesn't peek into, so without the cast the post-try
+  // narrowed type would be just "empty_page" | "error".
+  let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
   let denormalizedStageRows = 0;
 
+  // poll_full starts from scratch every invocation — no prior cursor is
+  // read or persisted. Upserts are idempotent, so the old rows get
+  // refreshed in place. For cursor-paginated endpoints (opportunities,
+  // conversations) we still need to walk every page within this one
+  // invocation; "poll_full" names the freshness semantics, not the
+  // pagination shape.
   try {
     await runInContext(connection, async () => {
-      const { query, body } = buildRequest(entity, connection.location_id, null);
-      const response = await toplineFetch<Record<string, unknown>>(
-        backfill.endpoint,
-        buildFetchOptions(entity, query, body),
-      );
+      let cursorValue: unknown = null;
+      let cursorSerialized: string | null = null;
 
-      // Primary table: resolve items_field (or default to entity.table).
-      // Pipeline's primary items live at "pipelines"; pipeline_stages
-      // items are denormalized from pipelines[].stages[] (see below).
-      const itemsField =
-        entity.table === "pipeline_stages" ? "pipelines" : backfill.items_field ?? entity.table;
-      const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-      if (!Array.isArray(items) || items.length === 0) {
-        stoppedReason = "empty_page";
-        return;
-      }
+      while (pagesProcessed < MAX_PAGES_PER_INVOCATION) {
+        const { query, body } = buildRequest(entity, connection.location_id, cursorValue);
+        const response = await toplineFetch<Record<string, unknown>>(
+          backfill.endpoint,
+          buildFetchOptions(entity, query, body),
+        );
 
-      if (entity.table === "pipeline_stages") {
-        // Denormalize: expand every pipeline's stages[] into stage rows.
-        const stagesEntity = entity;
-        const stageRows: Array<Record<string, unknown>> = [];
-        for (const pipeline of items) {
-          const pipelineId = pipeline.id;
-          const stages = (pipeline.stages ?? []) as Array<Record<string, unknown>>;
-          for (const stage of stages) {
-            const row = mapRow(stagesEntity, stage);
-            if (row.pipeline_id === null || row.pipeline_id === undefined) {
-              row.pipeline_id = pipelineId ?? null;
+        // Primary table: resolve items_field (or default to entity.table).
+        // Pipeline's primary items live at "pipelines"; pipeline_stages
+        // items are denormalized from pipelines[].stages[] (see below).
+        const itemsField =
+          entity.table === "pipeline_stages" ? "pipelines" : backfill.items_field ?? entity.table;
+        const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
+        if (!Array.isArray(items) || items.length === 0) {
+          stoppedReason = "empty_page";
+          break;
+        }
+
+        if (entity.table === "pipeline_stages") {
+          // Denormalize: expand every pipeline's stages[] into stage rows.
+          const stageRows: Array<Record<string, unknown>> = [];
+          for (const pipeline of items) {
+            const pipelineId = pipeline.id;
+            const stages = (pipeline.stages ?? []) as Array<Record<string, unknown>>;
+            for (const stage of stages) {
+              const row = mapRow(entity, stage);
+              if (row.pipeline_id === null || row.pipeline_id === undefined) {
+                row.pipeline_id = pipelineId ?? null;
+              }
+              if (row.location_id === null || row.location_id === undefined) {
+                row.location_id = connection.location_id;
+              }
+              stageRows.push(row);
             }
+          }
+          if (stageRows.length > 0) {
+            const result = await stub.upsertRows("pipeline_stages", stageRows);
+            rowsUpserted += result.upserted;
+            rowCountAfter = result.row_count_after;
+            denormalizedStageRows += stageRows.length;
+          }
+        } else {
+          const rows = items.map((raw) => {
+            const row = mapRow(entity, raw);
             if (row.location_id === null || row.location_id === undefined) {
               row.location_id = connection.location_id;
             }
-            stageRows.push(row);
-          }
-        }
-        if (stageRows.length > 0) {
-          const result = await stub.upsertRows("pipeline_stages", stageRows);
-          rowsUpserted = result.upserted;
+            return row;
+          });
+          const result = await stub.upsertRows(entity.table, rows);
+          rowsUpserted += result.upserted;
           rowCountAfter = result.row_count_after;
-          denormalizedStageRows = stageRows.length;
         }
-      } else {
-        // Straightforward: map each item, upsert.
-        const rows = items.map((raw) => {
-          const row = mapRow(entity, raw);
-          if (row.location_id === null || row.location_id === undefined) {
-            row.location_id = connection.location_id;
-          }
-          return row;
-        });
-        const result = await stub.upsertRows(entity.table, rows);
-        rowsUpserted = result.upserted;
-        rowCountAfter = result.row_count_after;
+        pagesProcessed += 1;
+
+        // Single-page endpoints (pagination: "none") → we're done.
+        // Cursor-paginated endpoints → follow cursor_response_field.
+        if (backfill.pagination !== "cursor") {
+          stoppedReason = "empty_page";
+          break;
+        }
+        const cursorPath = backfill.cursor_response_field;
+        const nextCursor = cursorPath ? getByPath(response, cursorPath) : undefined;
+        if (nextCursor === null || nextCursor === undefined) {
+          stoppedReason = "empty_page";
+          break;
+        }
+        const nextSerialized = serializeCursor(nextCursor);
+        if (nextSerialized === cursorSerialized) {
+          // GHL echoed the same cursor back — common on the last page
+          // (returns final row's id as startAfterId). Treat as done.
+          stoppedReason = "cursor_stalled";
+          break;
+        }
+        cursorValue = nextCursor;
+        cursorSerialized = nextSerialized;
+      }
+      if (pagesProcessed >= MAX_PAGES_PER_INVOCATION) {
+        stoppedReason = "page_cap_hit";
       }
     });
   } catch (err) {
@@ -683,8 +723,10 @@ async function backfillPollFull(
   // just re-invoke (no watermark filter for poll_full). Also clear any
   // stale pagination cursor from a prior partial run of a different
   // sync mode (defensive — poll_full shouldn't set one, but a manifest
-  // change could leave one behind).
-  if (stoppedReason === "empty_page") {
+  // change could leave one behind). "cursor_stalled" counts as done for
+  // poll_full: GHL echoes the last-row-id back on an over-consumed
+  // cursor, which is the same end-of-stream signal as empty_page.
+  if (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") {
     try {
       await stub.clearSyncCursor(entity.table);
     } catch {
@@ -701,7 +743,7 @@ async function backfillPollFull(
     entity: entity.table,
     connection_id: connectionId,
     location_id: connection.location_id,
-    pages: rowsUpserted > 0 ? 1 : 0,
+    pages: pagesProcessed,
     rows_upserted: rowsUpserted,
     row_count_after: rowCountAfter,
     final_cursor: null,

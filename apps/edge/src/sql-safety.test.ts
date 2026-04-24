@@ -7,8 +7,8 @@
 // reject decision belongs in a committed test.
 //
 // Tests depend implicitly on the current manifest's exposure state:
-//   exposed:  contacts, pipelines, pipeline_stages
-//   hidden:   opportunities, conversations, messages, appointments
+//   exposed:  contacts, opportunities, conversations, pipelines, pipeline_stages
+//   hidden:   messages, appointments
 // When a manifest change flips any of these, the corresponding test
 // cases will flip — which is the intended forcing function for review.
 
@@ -171,10 +171,11 @@ describe("enforceExposedTables — accepts exposed tables", () => {
 });
 
 describe("enforceExposedTables — rejects hidden entity tables", () => {
-  // Not yet exposed per the current manifest (need webhooks or filter audit).
+  // Not yet exposed per the current manifest:
+  //   - messages: per-parent pagination, volume too high for poll_full;
+  //     needs webhooks or per-parent incremental to unlock.
+  //   - appointments: backfill pagination "unknown" — contract unaudited.
   const queries = [
-    "SELECT * FROM opportunities",
-    "SELECT * FROM conversations",
     "SELECT * FROM messages",
     "SELECT * FROM appointments",
   ];
@@ -212,12 +213,12 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
     );
   });
   it("CTE referencing a HIDDEN table still blocks via inner ref", () => {
-    // The CTE alias `x` is exempt from allowlist, but `opportunities`
+    // The CTE alias `x` is exempt from allowlist, but `messages`
     // inside its SELECT is not — the inner table ref fails.
     throws(
       () =>
         enforceExposedTables(
-          "WITH x AS (SELECT * FROM opportunities) SELECT * FROM x",
+          "WITH x AS (SELECT * FROM messages) SELECT * FROM x",
         ),
       SqlSafetyError,
     );
@@ -225,11 +226,11 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
 });
 
 describe("enforceExposedTables — join including hidden table", () => {
-  it("contacts JOIN opportunities is rejected because opportunities is hidden", () => {
+  it("contacts JOIN messages is rejected because messages is hidden", () => {
     throws(
       () =>
         enforceExposedTables(
-          "SELECT c.id FROM contacts c JOIN opportunities o ON o.contact_id = c.id",
+          "SELECT c.id FROM contacts c JOIN messages m ON m.contact_id = c.id",
         ),
       SqlSafetyError,
     );
@@ -265,14 +266,12 @@ describe("full customer gate — every pragma variant is blocked", () => {
 
 describe("full customer gate — hidden / bookkeeping / sqlite_ tables all blocked", () => {
   const forms = [
-    "SELECT * FROM opportunities",
-    "SELECT * FROM conversations",
     "SELECT * FROM messages",
     "SELECT * FROM appointments",
     "SELECT * FROM _sync_state",
     "SELECT * FROM _schema_log",
     "SELECT name FROM sqlite_master",
-    "SELECT c.id FROM contacts c JOIN opportunities o ON c.id = o.contact_id",
+    "SELECT c.id FROM contacts c JOIN messages m ON c.id = m.contact_id",
   ];
   for (const q of forms) {
     it(q, () => throws(() => runFullCustomerGate(q), SqlSafetyError));
@@ -287,6 +286,11 @@ describe("full customer gate — legitimate analytics queries pass", () => {
     "WITH n AS (SELECT COUNT(*) AS c FROM contacts) SELECT c FROM n",
     "SELECT p.name, COUNT(ps.id) AS stage_count FROM pipelines p LEFT JOIN pipeline_stages ps ON ps.pipeline_id = p.id GROUP BY p.id, p.name",
     "SELECT c.id, je.value AS tag FROM contacts c, json_each(c.tags) je",
+    // Newly exposed — opportunities + conversations. These are the
+    // Streamlined-style analytics queries the MCP ships to unlock.
+    "SELECT COUNT(*) FROM opportunities WHERE status = 'open'",
+    "SELECT c.id, COUNT(o.id) AS n FROM contacts c LEFT JOIN opportunities o ON o.contact_id = c.id GROUP BY c.id",
+    "SELECT type, COUNT(*) FROM conversations GROUP BY type",
   ];
   for (const q of forms) {
     it(q, () => doesNotThrow(() => runFullCustomerGate(q)));
