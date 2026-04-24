@@ -97,9 +97,15 @@ export const CONTACTS: EntityManifest = {
   incremental: {
     type: "updated_after",
     cursor_column: "updated_at",
+    // POST /contacts/search accepts:
+    //   body.filters = [{ field: "dateUpdated", operator: "range",
+    //                     value: { gte: watermark } }]
+    // Verified live. `gt` and `gte` as top-level operators are rejected
+    // ("Invalid Operator passed for field date_updated"); range with a
+    // nested gte object is the supported pattern for date fields.
     cursor_query_param: "dateUpdated",
     poll_interval_minutes: 15,
-    filter_ready: false,
+    filter_ready: true,
   },
   webhooks: [
     { ghl_event: "ContactCreate", kind: "upsert" },
@@ -157,6 +163,13 @@ export const OPPORTUNITIES: EntityManifest = {
     cursor_column: "updated_at",
     cursor_query_param: "date_updated",
     poll_interval_minutes: 15,
+    // GET /opportunities/search does not appear to support server-side
+    // date filtering: passing date_updated / dateUpdated / dateAdded /
+    // startAfter=<epoch_ms> either returns "property should not exist"
+    // or is silently ignored (every far-future value still returned the
+    // full page). Incremental relies on webhooks (step 5) or on
+    // periodic full backfills. Keep filter_ready: false until GHL
+    // exposes a real filter or we switch to a POST variant.
     filter_ready: false,
   },
   webhooks: [
@@ -170,6 +183,7 @@ export const OPPORTUNITIES: EntityManifest = {
     backfill_path: false,
     incremental_path: false,
     update_cursor: false,
+    notes: "GET /opportunities/search has no working date-filter query param — silently ignores dateUpdated/date_updated/startAfter regardless of value. Full re-backfill required until webhooks land.",
   },
   exposed: false,
 };
@@ -211,6 +225,12 @@ export const CONVERSATIONS: EntityManifest = {
     cursor_column: "last_message_date",
     cursor_query_param: "lastMessageDate",
     poll_interval_minutes: 15,
+    // GET /conversations/search silently accepts lastMessageDate and
+    // startAfterDate query params but does not filter on them (every
+    // far-future value still returns the full page). Only startAfterDate=0
+    // gave a degenerate 1-row response, suggesting these params have
+    // some other cursor semantics entirely. Keep filter_ready: false
+    // until the right mechanism is identified or webhooks land.
     filter_ready: false,
   },
   webhooks: [
@@ -223,6 +243,7 @@ export const CONVERSATIONS: EntityManifest = {
     backfill_path: false,
     incremental_path: false,
     update_cursor: false,
+    notes: "GET /conversations/search date query params (lastMessageDate, startAfterDate) are silently ignored. Full re-backfill required until webhooks land.",
   },
   exposed: false,
 };

@@ -895,15 +895,19 @@ export async function incrementalEntity(
           query[entity.incremental.cursor_query_param!] = watermarkBefore;
         } else if (body) {
           const existingFilters = Array.isArray(body.filters) ? body.filters : [];
+          // GHL's date fields in POST filters reject `gt` / `gte` as
+          // top-level operators and only accept `range` with a nested
+          // `{gte, lte}` object. Verified live against /contacts/search:
+          //   {field:"dateUpdated", operator:"range", value:{gte:X}}
+          // Using `gte: watermarkBefore` is equivalent to a strict-after
+          // bound for practical purposes — duplicates (updated exactly
+          // at the watermark) dedupe on PK during upsert.
           body.filters = [
             ...existingFilters,
             {
               field: entity.incremental.cursor_query_param,
-              // GHL's search operators are short codes: gt, gte, lt, lte,
-              // eq, contains, etc. Use gt (strict >) since the watermark
-              // itself was already captured in the previous run's data.
-              operator: "gt",
-              value: watermarkBefore,
+              operator: "range",
+              value: { gte: watermarkBefore },
             },
           ];
         }
