@@ -15,7 +15,8 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node --experimental-sqlite --import tsx --test src/parent-sync-state.test.ts 2>&1 | grep -v 'ExperimentalWarning\\|Use `node --trace-warnings`'"
   },
   "dependencies": {
     "@topline/shared-schema": "*"
@@ -23,6 +24,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",
     "@types/node": "^20.12.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.0"
   },
   "engines": {

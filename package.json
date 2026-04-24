@@ -29,7 +29,7 @@
     "worker:dev": "npm run worker:dev -w @topline-ai/edge",
     "worker:deploy": "npm run worker:deploy -w @topline-ai/edge",
     "worker:typecheck": "npm run worker:typecheck -w @topline-ai/edge",
-    "test": "npm run test -w @topline-ai/edge && npm run test -w @topline-ai/sync"
+    "test": "npm run test -w @topline-ai/edge && npm run test -w @topline-ai/sync && npm run test -w @topline/shared-do"
   },
   "engines": {
     "node": ">=20"
