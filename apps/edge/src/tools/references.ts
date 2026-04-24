@@ -33,6 +33,23 @@ const SUPPORTED_KINDS = [
 ] as const;
 type Kind = (typeof SUPPORTED_KINDS)[number];
 
+/**
+ * Hard cap on the total number of references returned per tool call.
+ * Each per-branch SQL has its own LIMIT 500 to stay under Cloudflare's
+ * DO compound-SELECT cap; here we also enforce a final global cap
+ * across concatenated results and set `truncated` accordingly. Prior
+ * behavior could return 1500+ rows from the "contact" kind while
+ * still reporting truncated=false.
+ */
+const GLOBAL_RESULT_CAP = 500;
+/**
+ * Per-branch SQL LIMIT. Kept one above GLOBAL_RESULT_CAP so a single
+ * branch returning its entire LIMIT is detectable — if the branch
+ * filled 501 rows, upstream had at least 501 and `truncated` must
+ * fire.
+ */
+const PER_BRANCH_SQL_LIMIT = 501;
+
 interface ReferenceHit {
   /** Base table the reference was found in. */
   table: string;
@@ -284,28 +301,41 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
         },
       ];
     case "opportunity":
-      // Messages / call_events tied to the contact on this opportunity.
-      // Opportunities don't have direct messages; we resolve through
-      // the contact_id.
+      // Direct references only: the opportunity itself + its pipeline,
+      // stage, and owning contact. Do NOT pull contact messages /
+      // call_events — contacts can own multiple opportunities, so
+      // including those would label unrelated calls as references to
+      // whichever opp the caller happened to ask about. If the caller
+      // wants the contact's activity, they can chain a second call
+      // with kind="contact" using the contact_id returned here.
       return wrap({
         sql: `
-          WITH target AS (SELECT contact_id FROM opportunities WHERE id = ?)
-          SELECT 'messages' AS "table",
-                 m.id AS row_id,
-                 COALESCE(substr(m.body, 1, 60), m.type, m.id) AS summary,
-                 json_object('type', m.type, 'direction', m.direction) AS extra
-            FROM messages m, target
-           WHERE m.contact_id = target.contact_id
+          SELECT 'opportunities' AS "table",
+                 o.id AS row_id,
+                 COALESCE(o.name, o.id) AS summary,
+                 json_object('status', o.status, 'monetary_value', o.monetary_value, 'pipeline_id', o.pipeline_id, 'pipeline_stage_id', o.pipeline_stage_id, 'contact_id', o.contact_id, 'assigned_to', o.assigned_to) AS extra
+            FROM opportunities o WHERE o.id = ?
           UNION ALL
-          SELECT 'call_events' AS "table",
-                 ce.id AS row_id,
-                 COALESCE(ce.call_type, ce.id) AS summary,
-                 json_object('direction', ce.direction, 'duration_seconds', ce.duration_seconds) AS extra
-            FROM call_events ce, target
-           WHERE ce.contact_id = target.contact_id
+          SELECT 'pipelines' AS "table",
+                 p.id AS row_id,
+                 COALESCE(p.name, p.id) AS summary,
+                 json_object('link', 'pipeline_of_opportunity') AS extra
+            FROM pipelines p WHERE p.id = (SELECT pipeline_id FROM opportunities WHERE id = ?)
+          UNION ALL
+          SELECT 'pipeline_stages' AS "table",
+                 ps.id AS row_id,
+                 COALESCE(ps.name, ps.id) AS summary,
+                 json_object('link', 'stage_of_opportunity') AS extra
+            FROM pipeline_stages ps WHERE ps.id = (SELECT pipeline_stage_id FROM opportunities WHERE id = ?)
+          UNION ALL
+          SELECT 'contacts' AS "table",
+                 c.id AS row_id,
+                 COALESCE(c.email, c.phone, c.first_name || ' ' || c.last_name, c.id) AS summary,
+                 json_object('link', 'contact_of_opportunity') AS extra
+            FROM contacts c WHERE c.id = (SELECT contact_id FROM opportunities WHERE id = ?)
            LIMIT 500
         `,
-        params: [id],
+        params: [id, id, id, id],
       });
     case "form":
       return wrap({
@@ -340,10 +370,11 @@ export const tools: ToolDef[] = [
   {
     name: "topline_find_references",
     description:
-      "Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs a hard-coded SQL query per kind; no arbitrary SQL accepted. " +
+      "Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. " +
       "Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. " +
       "WORKFLOWS are NOT supported: GHL's public API does not expose workflow internals, so we cannot know which workflows reference any given object. " +
-      "Returns { kind, id, references: [{ table, row_id, summary, extra }] }, capped at 500 hits. For tags, accepts either the tag id or the tag name.",
+      "kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. " +
+      "Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.",
     inputSchema: obj(
       {
         kind: { type: "string", enum: [...SUPPORTED_KINDS] },
@@ -366,10 +397,11 @@ export const tools: ToolDef[] = [
       // compound-SELECT cap forces us to split wide fan-outs (contact,
       // user) across multiple queries.
       const results = await Promise.all(
-        queries.map((q) => client.executeQuery(q.sql, q.params)),
+        queries.map((q) =>
+          client.executeQuery(q.sql, q.params, PER_BRANCH_SQL_LIMIT),
+        ),
       );
-      const truncated = results.some((r) => r.truncated);
-      const references: ReferenceHit[] = results.flatMap((result) =>
+      const allRows = results.flatMap((result) =>
         result.rows.map((r) => {
           const row = r as Record<string, unknown>;
           const extraRaw = row.extra;
@@ -389,6 +421,16 @@ export const tools: ToolDef[] = [
           };
         }),
       );
+      // Truncation fires when:
+      //   - any branch returned its DO-side rowCap worth (>= limit)
+      //   - OR the concatenated rows exceed the global cap
+      // Either condition means upstream had more than we're surfacing.
+      const anyBranchFilled = results.some(
+        (r) => r.truncated || r.rows.length >= PER_BRANCH_SQL_LIMIT,
+      );
+      const globalOverflow = allRows.length > GLOBAL_RESULT_CAP;
+      const truncated = anyBranchFilled || globalOverflow;
+      const references: ReferenceHit[] = allRows.slice(0, GLOBAL_RESULT_CAP);
       return {
         kind,
         id,

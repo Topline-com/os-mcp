@@ -1001,6 +1001,20 @@ async function backfillPerParent(
           if (backfill.pagination === "cursor") {
             query.limit = DEFAULT_PAGE_LIMIT;
           }
+          // locationId injection for query-param fan-out endpoints.
+          // Two shapes of per-parent endpoints:
+          //   (a) path template: /conversations/{parent}/messages,
+          //       /contacts/{parent}/tasks — tenancy is implicit in
+          //       the parent id; passing locationId is a no-op at
+          //       best and a 422 at worst (notes rejected `limit`).
+          //   (b) query fan-out: /calendars/events?calendarId=X —
+          //       tenancy is NOT in the path, so locationId must be
+          //       supplied as a query param (or the endpoint 401s).
+          // Inject only on shape (b), inferred from !usesPathTemplate.
+          if (!usesPathTemplate && !backfill.endpoint.includes("{locationId}")) {
+            const locParamName = backfill.location_param_name ?? "locationId";
+            query[locParamName] = connection.location_id;
+          }
           if (backfill.query_extras) {
             for (const [k, v] of Object.entries(backfill.query_extras)) {
               query[k] = v;

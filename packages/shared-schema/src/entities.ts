@@ -510,26 +510,37 @@ export const APPOINTMENTS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    // UNKNOWN. The current edge tools (apps/edge/src/tools/calendars.ts)
-    // expose only per-ID CRUD for appointments — no list/search endpoint.
-    // GHL may support listing via `/calendars/events` with time-window
-    // filters, but that contract has not been probed against a live
-    // sub-account. Pagination is intentionally "unknown" so the sync
-    // worker and audit runner refuse to operate on this entity until
-    // the contract is verified and this descriptor is updated with real
-    // pagination fields. Do not add cursor_* or items_field here as a
-    // placeholder — fabricated values would mislead any consumer that
-    // trusts this descriptor.
+    // Per-parent fan-out over calendars. GET /calendars/events requires
+    // locationId + calendarId (or userId/groupId) + startTime + endTime
+    // (must be strings of ms-epoch). Probed live 2026-04-24: response
+    // is {events: [...]} with no pagination metadata — all events in
+    // the window for that calendar come back in one shot. No limit /
+    // cursor / page params are honored. Using a wide static window
+    // (2020-01-01 → 2030-01-01) catches every appointment on disk
+    // today with headroom; revisit when a customer's activity pushes
+    // past 2030.
     endpoint: "/calendars/events",
     method: "GET",
-    pagination: "unknown",
+    pagination: "none",
+    items_field: "events",
+    per_parent: {
+      parent_entity: "calendars",
+      parent_fk_column: "calendar_id",
+      request_param: "calendarId",
+    },
+    query_extras: {
+      startTime: "1577836800000", // 2020-01-01T00:00:00Z
+      endTime: "1893456000000",   // 2030-01-01T00:00:00Z
+    },
   },
   incremental: {
-    type: "updated_after",
+    // per_parent: freshness tracks the parent calendar's updated_at
+    // via conversations-style active-parent selection. Same path
+    // messages uses; drain_started_at per parent + snapshot-and-swap.
+    type: "per_parent",
     cursor_column: "updated_at",
-    cursor_query_param: "updatedAfter",
     poll_interval_minutes: 15,
-    filter_ready: false,
+    filter_ready: true,
   },
   webhooks: [
     { ghl_event: "AppointmentCreate", kind: "upsert" },
@@ -537,14 +548,21 @@ export const APPOINTMENTS: EntityManifest = {
     { ghl_event: "AppointmentDelete", kind: "delete" },
   ],
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
-    update_cursor: false,
-    notes: "Backfill endpoint unverified — edge tools only expose per-ID CRUD. Need to probe GHL's /calendars/events list semantics (time-window vs cursor) before shipping the sync worker.",
+    // Verified live 2026-04-24 against ucNDNXi… sub-account:
+    //   - /calendars/events with calendarId + startTime + endTime
+    //     (strings) returns {events: [...]}; fields match our
+    //     manifest columns.
+    //   - No pagination — single fetch per calendar.
+    //   - 8 events on the first calendar; hundreds across the
+    //     sub-account's 91 calendars.
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false, // N/A for per_parent — requiredAuditChecks skips it
+    notes: "Fanned out per-calendar. Closes the P1 in topline_find_references where kind=calendar previously returned zero hits because appointments was never synced — users could delete a calendar that had real upstream appointments.",
   },
-  exposed: false,
+  exposed: true,
 };
 
 // ---------------------------------------------------------------------------

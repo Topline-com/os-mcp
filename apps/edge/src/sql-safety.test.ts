@@ -7,10 +7,15 @@
 // reject decision belongs in a committed test.
 //
 // Tests depend implicitly on the current manifest's exposure state:
-//   exposed:  contacts, opportunities, conversations, messages, pipelines, pipeline_stages
-//   hidden:   appointments
-// When a manifest change flips any of these, the corresponding test
-// cases will flip — which is the intended forcing function for review.
+//   exposed:  every EntityManifest with exposed=true && auditPasses()
+//   hidden:   auth/sync internals (_sync_state, _schema_log), SQLite
+//             meta tables, AND anything not present in the exposed
+//             allowlist (typo'd names, cataloged-only objects, etc.)
+// When a manifest flips an entity's exposure, the corresponding test
+// cases flip — intended forcing function for review. Every entity in
+// entities.ts currently has exposed=true, so "rejects hidden entity"
+// coverage uses a synthetic unknown-to-allowlist table name to prove
+// the gate still rejects anything not explicitly exposed.
 
 import { describe, it } from "node:test";
 import { strictEqual, throws, doesNotThrow, ok } from "node:assert";
@@ -170,11 +175,17 @@ describe("enforceExposedTables — accepts exposed tables", () => {
   }
 });
 
-describe("enforceExposedTables — rejects hidden entity tables", () => {
-  // Not yet exposed per the current manifest:
-  //   - appointments: backfill pagination "unknown" — contract unaudited.
+describe("enforceExposedTables — rejects unknown / non-allowlisted tables", () => {
+  // Every current EntityManifest has exposed=true, so this section
+  // proves the gate still rejects anything NOT explicitly in the
+  // allowlist — future hidden tables, typos, or attempts to probe
+  // marketplace-OAuth-only objects surfaced in catalog.ts
+  // (workflow_internals, pipeline_writes, form_writes, etc.).
   const queries = [
-    "SELECT * FROM appointments",
+    "SELECT * FROM workflow_internals",
+    "SELECT * FROM pipeline_writes",
+    "SELECT * FROM some_future_table",
+    "SELECT * FROM contact_typo",
   ];
   for (const q of queries) {
     it(q, () => throws(() => enforceExposedTables(q), SqlSafetyError));
@@ -210,12 +221,13 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
     );
   });
   it("CTE referencing a HIDDEN table still blocks via inner ref", () => {
-    // The CTE alias `x` is exempt from allowlist, but `appointments`
-    // inside its SELECT is not — the inner table ref fails.
+    // The CTE alias `x` is exempt from allowlist, but an internal
+    // bookkeeping table like _sync_state is not — the inner table
+    // ref fails regardless of the CTE wrapping.
     throws(
       () =>
         enforceExposedTables(
-          "WITH x AS (SELECT * FROM appointments) SELECT * FROM x",
+          "WITH x AS (SELECT * FROM _sync_state) SELECT * FROM x",
         ),
       SqlSafetyError,
     );
@@ -223,11 +235,11 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
 });
 
 describe("enforceExposedTables — join including hidden table", () => {
-  it("contacts JOIN appointments is rejected because appointments is hidden", () => {
+  it("contacts JOIN _sync_state is rejected because internals stay hidden", () => {
     throws(
       () =>
         enforceExposedTables(
-          "SELECT c.id FROM contacts c JOIN appointments a ON a.contact_id = c.id",
+          "SELECT c.id FROM contacts c JOIN _sync_state s ON s.entity = c.id",
         ),
       SqlSafetyError,
     );
@@ -261,13 +273,15 @@ describe("full customer gate — every pragma variant is blocked", () => {
   }
 });
 
-describe("full customer gate — hidden / bookkeeping / sqlite_ tables all blocked", () => {
+describe("full customer gate — bookkeeping / sqlite_ / unknown tables all blocked", () => {
   const forms = [
-    "SELECT * FROM appointments",
     "SELECT * FROM _sync_state",
     "SELECT * FROM _schema_log",
+    "SELECT * FROM _parent_sync_state",
     "SELECT name FROM sqlite_master",
-    "SELECT c.id FROM contacts c JOIN appointments a ON c.id = a.contact_id",
+    // Unknown-to-allowlist (typos, future/cataloged-only objects).
+    "SELECT * FROM some_future_table",
+    "SELECT c.id FROM contacts c JOIN _sync_state s ON c.id = s.entity",
   ];
   for (const q of forms) {
     it(q, () => throws(() => runFullCustomerGate(q), SqlSafetyError));
@@ -291,6 +305,13 @@ describe("full customer gate — legitimate analytics queries pass", () => {
     // first inbound call → first outbound callback per contact.
     "SELECT m.contact_id, MIN(CASE WHEN direction='inbound' THEN date_added END) AS first_in, MIN(CASE WHEN direction='outbound' THEN date_added END) AS first_out FROM messages m WHERE type IN ('TYPE_CALL','TYPE_IVR_CALL') GROUP BY m.contact_id",
     "SELECT COUNT(*) FROM messages WHERE type='TYPE_CALL' AND direction='inbound' AND call_duration_seconds <= 5",
+    // Appointments now exposed (per-parent backfill over calendars).
+    // Closes the find_references P1 where kind=calendar returned
+    // zero refs even when upstream appointments existed.
+    "SELECT COUNT(*) FROM appointments WHERE status = 'confirmed'",
+    "SELECT cal.name, COUNT(a.id) FROM calendars cal LEFT JOIN appointments a ON a.calendar_id = cal.id GROUP BY cal.id, cal.name",
+    // Workflows shallow sync.
+    "SELECT status, COUNT(*) FROM workflows GROUP BY status",
   ];
   for (const q of forms) {
     it(q, () => doesNotThrow(() => runFullCustomerGate(q)));
