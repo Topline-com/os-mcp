@@ -98,6 +98,8 @@ export default {
         return cors(await handleAdminDoInfo(request, env));
       case "/admin/do-query":
         return cors(await handleAdminDoQuery(request, env));
+      case "/admin/do-exec":
+        return cors(await handleAdminDoExec(request, env));
       case "/query/api/get-overview":
         return cors(await handleQueryApiOverview(request, env));
       case "/query/api/explain-tables":
@@ -779,6 +781,51 @@ async function handleAdminDoQuery(request: Request, env: Env): Promise<Response>
   const stub = env.LOCATION_DO.get(id);
   try {
     const result = await stub.executeQuery(safe.sql, (body.params as never[]) ?? []);
+    return json(200, result);
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /admin/do-exec — run an arbitrary write statement against a tenant's DO.
+// Gated by ADMIN_TOKEN. Intended for one-off maintenance: cleaning up
+// stale rows after a source-path change, dropping a bad index, etc.
+//
+// No SQL-safety gate — the caller is trusted. Don't expose this surface
+// to any customer path.
+//
+// Usage:
+//   curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+//        -H "Content-Type: application/json" \
+//        -d '{"sql":"DELETE FROM messages"}' \
+//        "https://os-mcp.topline.com/admin/do-exec?location=X"
+// ---------------------------------------------------------------------------
+async function handleAdminDoExec(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  if (!env.ADMIN_TOKEN) return plain(503, "ADMIN_TOKEN not configured");
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer || bearer !== env.ADMIN_TOKEN) {
+    return plain(401, "Invalid or missing Authorization: Bearer <ADMIN_TOKEN>");
+  }
+
+  const url = new URL(request.url);
+  const location = url.searchParams.get("location") ?? "";
+  if (!location) return plain(400, "Missing ?location=<location_id>");
+
+  let body: { sql?: string; params?: unknown[] } = {};
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json(400, { error: "Body must be JSON: { sql, params? }" });
+  }
+  if (!body.sql) return json(400, { error: "Missing sql" });
+
+  const id = env.LOCATION_DO.idFromName(location);
+  const stub = env.LOCATION_DO.get(id);
+  try {
+    const result = await stub.adminExecute(body.sql, (body.params as never[]) ?? []);
     return json(200, result);
   } catch (err) {
     return json(500, { error: err instanceof Error ? err.message : String(err) });

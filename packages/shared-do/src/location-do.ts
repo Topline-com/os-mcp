@@ -543,6 +543,35 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     };
   }
 
+  /**
+   * Escape hatch for admin-gated maintenance ops (schema fix-ups, one-off
+   * data wipes when a source-path change leaves stale rows in a table).
+   *
+   * Deliberately NOT exposed through any customer-facing surface. Only the
+   * edge worker's ADMIN_TOKEN-gated `/admin/do-exec` route reaches here.
+   * There's no SQL-safety gate — the caller is trusted.
+   *
+   * Returns the same shape as executeQuery so a DELETE or DDL statement
+   * can still report rows_written via SQLite's rowsWritten counter, which
+   * is surfaced by the cursor itself.
+   */
+  async adminExecute(
+    sql: string,
+    params: readonly SqlStorageValue[] = [],
+  ): Promise<{ rows_written: number; elapsed_ms: number }> {
+    this.ensureInitialized();
+    const started = Date.now();
+    const cursor = this.ctx.storage.sql.exec(sql, ...params);
+    // Drain so the statement actually runs to completion.
+    for (const _ of cursor) {
+      // discarded — callers use this for writes, not reads
+    }
+    return {
+      rows_written: cursor.rowsWritten ?? 0,
+      elapsed_ms: Date.now() - started,
+    };
+  }
+
   /** High-level schema overview for describe_schema. */
   async describeSchema(): Promise<SchemaOverview> {
     this.ensureInitialized();
