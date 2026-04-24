@@ -201,13 +201,19 @@ export function sanitizeQuery(
  * Admin surfaces (e.g. /admin/do-query) deliberately SKIP this check.
  */
 export function enforceExposedTables(query: string): void {
-  // Exposed set = every entity past the audit gate + every derived
-  // analytics view. Views read only from exposed base tables (enforced
-  // by how they're defined in shared-schema/views.ts), so they don't
-  // leak access to hidden data.
+  // Exposed set = every entity past the audit gate + every analytics
+  // view whose base_tables are ALL themselves exposed. The base-table
+  // check is defense-in-depth: if someone reshapes a view to UNION in
+  // a hidden table (the way contact_timeline used to include
+  // appointments), the view drops out of the allowlist automatically
+  // rather than silently leaking the hidden data through a side door.
+  const exposedEntityNames = new Set(getExposedEntities().map((e) => e.table));
+  const safeViewNames = ANALYTICS_VIEWS
+    .filter((v) => v.base_tables.every((bt) => exposedEntityNames.has(bt)))
+    .map((v) => v.name);
   const exposed = new Set<string>([
-    ...getExposedEntities().map((e) => e.table),
-    ...ANALYTICS_VIEWS.map((v) => v.name),
+    ...exposedEntityNames,
+    ...safeViewNames,
   ]);
 
   // Extract CTE alias names from the AST so "WITH n AS (...) SELECT * FROM n"

@@ -26,6 +26,7 @@
 //   declined         — decision made not to sync (document why)
 
 import { ALL_ENTITIES } from "./entities.js";
+import { ANALYTICS_VIEWS } from "./views.js";
 import { auditPasses, type EntityManifest } from "./types.js";
 
 export type CatalogStatus =
@@ -82,10 +83,14 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   { name: "associations", category: "Platform", description: "Cross-object relations (opportunity↔property, contact↔deal, etc.).", status: "requires_oauth" },
 
   // Communications
-  { name: "call_recordings", category: "Communications", description: "Audio recording URLs + metadata per call message.", status: "catalogued", notes: "Surface via raw_payload.meta.call until a dedicated endpoint ships." },
+  // call_events / email_events / sms_events are now derived SQL
+  // surfaces (call_events is a real synced table, email_events and
+  // sms_events are views in shared-schema/views.ts). buildCatalog()
+  // merges ANALYTICS_VIEWS + ALL_ENTITIES automatically, so no static
+  // catalog entries are needed here — keeping them would shadow the
+  // real "exposed" status with a stale "catalogued".
+  { name: "call_recordings", category: "Communications", description: "Audio recording URLs + metadata per call message.", status: "catalogued", notes: "Already surfaced via call_events.recording_url when upstream populates it; no dedicated endpoint ships yet." },
   { name: "call_transcripts", category: "Communications", description: "Text transcripts of call recordings (when available upstream).", status: "requires_oauth", notes: "GHL's Voice AI / transcription APIs are marketplace-scoped." },
-  { name: "email_events", category: "Communications", description: "Per-email delivery events (sent, delivered, opened, clicked, bounced). Streamlined calls this 'email_events'.", status: "catalogued", notes: "Upstream fields live in messages.raw_payload for type=TYPE_EMAIL. A derived view is the right ship." },
-  { name: "sms_events", category: "Communications", description: "SMS delivery status history (queued, sent, delivered, failed).", status: "catalogued", notes: "Available in messages.status + raw_payload." },
   { name: "chat_events", category: "Communications", description: "Live-chat widget events (session start, visitor typing, agent joined).", status: "declined", notes: "Low analytics value; skip unless a customer asks." },
 
   // Scheduling & lead capture
@@ -167,9 +172,17 @@ export interface CatalogEntryResolved extends CatalogEntry {
 }
 
 /**
- * Merge ALL_ENTITIES (what we sync) with STATIC_ENTRIES (what exists
- * upstream but isn't synced yet). Every row returned tells the LLM
- * exactly what it can query today and what's pending.
+ * Merge the three sources of truth into one catalog the LLM can read:
+ *
+ *   1. ALL_ENTITIES       — tables we sync (status: exposed / syncing)
+ *   2. ANALYTICS_VIEWS    — derived SQL surfaces (always exposed if
+ *                           all base_tables are exposed)
+ *   3. STATIC_ENTRIES     — upstream objects we know about but haven't
+ *                           built sync for (status: catalogued /
+ *                           requires_oauth / inaccessible / declined)
+ *
+ * Entity table names win over view names win over static entries —
+ * first wins dedupe by name.
  */
 export function buildCatalog(): CatalogEntryResolved[] {
   const out: CatalogEntryResolved[] = [];
@@ -191,8 +204,34 @@ export function buildCatalog(): CatalogEntryResolved[] {
     });
   }
 
+  // Analytics views: exposed when every base table is exposed. A view
+  // whose base_tables drop off the exposed set (e.g. contact_timeline
+  // when appointments is hidden) falls back to "catalogued" so the
+  // LLM still sees it exists but doesn't try to SELECT from it.
+  const exposedEntityNames = new Set(
+    ALL_ENTITIES.filter((e) => e.exposed && auditPasses(e)).map((e) => e.table),
+  );
+  for (const v of ANALYTICS_VIEWS) {
+    if (seen.has(v.name)) continue;
+    seen.add(v.name);
+    const allBaseExposed = v.base_tables.every((bt) => exposedEntityNames.has(bt));
+    out.push({
+      name: v.name,
+      category: inferCategory(v.name),
+      description: `[view] ${v.description}`,
+      status: allBaseExposed ? "exposed" : "catalogued",
+      synced: allBaseExposed,
+      sql_table: allBaseExposed ? v.name : undefined,
+      notes: allBaseExposed
+        ? `Derived view over: ${v.base_tables.join(", ")}.`
+        : `View hidden until all base tables are exposed. Missing: ${v.base_tables
+            .filter((bt) => !exposedEntityNames.has(bt))
+            .join(", ")}.`,
+    });
+  }
+
   for (const e of STATIC_ENTRIES) {
-    if (seen.has(e.name)) continue; // entity manifest wins
+    if (seen.has(e.name)) continue; // entity manifest or view wins
     out.push({
       ...e,
       synced: false,
@@ -218,6 +257,16 @@ export function buildCatalog(): CatalogEntryResolved[] {
 
 function inferCategory(table: string): CatalogEntry["category"] {
   if (table === "contacts" || table === "users") return "CRM";
+  if (
+    table === "call_events" ||
+    table === "email_events" ||
+    table === "sms_events" ||
+    table === "contact_timeline" ||
+    table === "lead_response_metrics"
+  ) {
+    return "Communications";
+  }
+  if (table === "opportunity_funnel") return "Pipelines";
   if (table === "opportunities" || table === "pipelines" || table === "pipeline_stages") return "Pipelines";
   if (table === "conversations" || table === "messages") return "Communications";
   if (table === "appointments" || table === "calendars") return "Scheduling";

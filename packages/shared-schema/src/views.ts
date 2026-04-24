@@ -83,7 +83,7 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "lead_response_metrics",
     description:
-      "Per-contact first-inbound-call → first-outbound-callback timeline. The headline Streamlined-style metric: callback_delta_seconds between a contact's first inbound call and our first outbound call afterwards. NULL in callback columns means we never returned the call. Use this for speed-to-lead, per-rep response time, and response-rate analytics. Built atop call_events (typed table), not raw messages.",
+      "Per-contact first-inbound-call → first-outbound-callback timeline. EXACTLY ONE ROW PER CONTACT. The headline Streamlined-style metric: callback_delta_seconds between a contact's first inbound call and our first outbound call afterwards. NULL in callback columns means we never returned the call. Use this for speed-to-lead, per-rep response time, and response-rate analytics.",
     base_tables: ["call_events", "contacts"],
     ddl: `
       CREATE VIEW lead_response_metrics AS
@@ -95,15 +95,30 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
          WHERE direction = 'inbound'
          GROUP BY contact_id
       ),
-      first_outbound AS (
-        SELECT ce.contact_id,
-               MIN(ce.event_at) AS first_outbound_at,
-               ce.user_id AS first_outbound_user_id
+      first_outbound_ts AS (
+        -- Earliest outbound call placed AFTER the contact's first inbound.
+        -- GROUP BY contact_id only, so one row per contact — prevents
+        -- the multi-rep inflation bug where two reps both placing
+        -- callbacks would double-count that contact.
+        SELECT ce.contact_id, MIN(ce.event_at) AS first_outbound_at
           FROM call_events ce
           JOIN first_inbound fi ON fi.contact_id = ce.contact_id
          WHERE ce.direction = 'outbound'
            AND ce.event_at > fi.first_inbound_at
-         GROUP BY ce.contact_id, ce.user_id
+         GROUP BY ce.contact_id
+      ),
+      first_outbound AS (
+        -- Attach the user_id of THAT specific first outbound call.
+        -- If multiple reps dialed the contact at the exact same
+        -- second (rare), pick one deterministically via MIN(user_id).
+        SELECT fot.contact_id,
+               fot.first_outbound_at,
+               (SELECT MIN(ce.user_id)
+                  FROM call_events ce
+                 WHERE ce.contact_id = fot.contact_id
+                   AND ce.direction = 'outbound'
+                   AND ce.event_at = fot.first_outbound_at) AS first_outbound_user_id
+          FROM first_outbound_ts fot
       )
       SELECT
         c.id AS contact_id,
@@ -124,17 +139,21 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         END AS callback_delta_seconds,
         CASE WHEN fo.first_outbound_at IS NOT NULL THEN 1 ELSE 0 END AS called_back
       FROM contacts c
-      LEFT JOIN first_inbound fi ON fi.contact_id = c.id
+      JOIN first_inbound fi ON fi.contact_id = c.id
       LEFT JOIN first_outbound fo ON fo.contact_id = c.id
-      WHERE fi.first_inbound_at IS NOT NULL
     `,
   },
 
   {
     name: "contact_timeline",
     description:
-      "Unified chronological stream of everything that happened to a contact — messages (calls, SMS, email), opportunities created/changed, appointments booked. One row per event, ordered by event_at. Use this for 'show me the full history of contact X' or 'what touches happened in the 48 hours after form submission'.",
-    base_tables: ["messages", "opportunities", "appointments"],
+      "Unified chronological stream of everything that happened to a contact — messages (calls, SMS, email) and opportunities created. One row per event, ordered by event_at. Use this for 'show me the full history of contact X' or 'what touches happened in the 48 hours after form submission'. Appointments will join this view once their backfill contract ships.",
+    base_tables: ["messages", "opportunities"],
+    // Intentionally does NOT UNION appointments: that table is still
+    // hidden (pagination: "unknown") so the exposure gate rejects
+    // direct reads. Including it here would leak the same rows through
+    // the view, bypassing the policy. When appointments ships, add
+    // a third UNION branch and bump base_tables.
     ddl: `
       CREATE VIEW contact_timeline AS
       SELECT
@@ -161,19 +180,6 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         o.assigned_to AS user_id
       FROM opportunities o
       WHERE o.created_at IS NOT NULL
-      UNION ALL
-      SELECT
-        a.contact_id,
-        a.location_id,
-        'appointment' AS event_kind,
-        a.status AS event_subtype,
-        NULL AS direction,
-        a.start_time AS event_at,
-        a.title AS summary,
-        a.id AS source_id,
-        a.assigned_user_id AS user_id
-      FROM appointments a
-      WHERE a.start_time IS NOT NULL
     `,
   },
 

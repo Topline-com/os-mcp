@@ -62,7 +62,14 @@ type LocationDOStub = {
   ): Promise<string[]>;
   getParentSyncCursor(entity: string, parentId: string): Promise<string | null>;
   setParentSyncCursor(entity: string, parentId: string, cursor: string): Promise<void>;
-  markParentBackfillComplete(entity: string, parentId: string): Promise<void>;
+  ensureParentDrainMarker(entity: string, parentId: string): Promise<string>;
+  markParentBackfillComplete(
+    entity: string,
+    parentId: string,
+    childTable: string,
+    fkColumn: string,
+    derivedTables?: ReadonlyArray<{ table: string; fk: string }>,
+  ): Promise<number>;
 };
 
 function locationStub(
@@ -952,6 +959,7 @@ async function backfillPerParent(
   let totalPages = 0;
   let rowsUpserted = 0;
   let callEventsUpserted = 0; // diagnostic only; logged on completion
+  let childrenPruned = 0; // deleted-upstream children caught by per-parent snapshot-and-swap
   let lastRowCount = 0;
   let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
@@ -966,6 +974,19 @@ async function backfillPerParent(
         let cursorSerialized: string | null = priorParentCursor;
         let pagesForParent = 0;
         let parentCompleted = false;
+        // Stamp the per-parent drain marker. For parents resumed from
+        // a prior tick (priorParentCursor present) drain_started_at is
+        // already set and COALESCE preserves it. For fresh parents
+        // this sets it to now(). Needed so markParentBackfillComplete
+        // below can snapshot-and-swap-prune children deleted upstream.
+        if (priorParentCursor === null) {
+          try {
+            await stub.ensureParentDrainMarker(entity.table, parentId);
+          } catch {
+            // non-fatal — missing marker means no prune this drain;
+            // data is still correct, just carries stale deletions
+          }
+        }
 
         while (pagesForParent < MAX_PAGES_PER_INVOCATION) {
           if (totalPages >= MAX_PAGES_PER_INVOCATION) {
@@ -1070,7 +1091,22 @@ async function backfillPerParent(
         }
 
         if (parentCompleted) {
-          await stub.markParentBackfillComplete(entity.table, parentId);
+          // Derived tables that also need a parent-scoped prune.
+          // Messages dual-writes call_events keyed by conversation_id,
+          // so when a message gets deleted upstream its call_event
+          // should go too — otherwise callback metrics stay wrong.
+          const derivedTables =
+            entity.table === "messages"
+              ? [{ table: "call_events", fk: "conversation_id" }]
+              : [];
+          const pruned = await stub.markParentBackfillComplete(
+            entity.table,
+            parentId,
+            entity.table,
+            fkColumn,
+            derivedTables,
+          );
+          childrenPruned += pruned;
         }
       }
     });
@@ -1086,6 +1122,11 @@ async function backfillPerParent(
   if (callEventsUpserted > 0) {
     console.log(
       `[per_parent:${entity.table}] dual-wrote ${callEventsUpserted} call_events rows`,
+    );
+  }
+  if (childrenPruned > 0) {
+    console.log(
+      `[per_parent:${entity.table}] snapshot-and-swap pruned ${childrenPruned} stale children (deleted upstream)`,
     );
   }
 

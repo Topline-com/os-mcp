@@ -227,6 +227,15 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         PRIMARY KEY (entity, parent_id)
       )
     `);
+    // drain_started_at on _parent_sync_state: stamped when a parent
+    // first starts syncing (pre-existing rows: NULL via additive
+    // migration). Used by the per-parent snapshot-and-swap at
+    // markParentBackfillComplete to prune children that existed in
+    // this DO but weren't re-observed during the current drain —
+    // i.e. the upstream record deleted them. Parent-scoped prune
+    // mirrors the entity-level pruneStaleRows but bounded to one
+    // parent's FK.
+    this.ensurePerParentStateColumn("drain_started_at", "TEXT");
     // Additive migration for DOs created before watermark / backfill_complete
     // were introduced. Both are nullable/defaulted so ADD COLUMN is safe.
     this.ensureSyncStateColumn("watermark", "TEXT");
@@ -430,6 +439,18 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     const stmt = `ALTER TABLE _sync_state ADD COLUMN ${column} ${decl}`;
     sql.exec(stmt);
     this.logMigration("ADD COLUMN", `_sync_state.${column}`, stmt);
+  }
+
+  /** Mirror of ensureSyncStateColumn for the _parent_sync_state table. */
+  private ensurePerParentStateColumn(column: string, decl: string): void {
+    const sql = this.ctx.storage.sql;
+    const cols = sql
+      .exec<{ name: string }>("PRAGMA table_info(_parent_sync_state)")
+      .toArray();
+    if (cols.some((c) => c.name === column)) return;
+    const stmt = `ALTER TABLE _parent_sync_state ADD COLUMN ${column} ${decl}`;
+    sql.exec(stmt);
+    this.logMigration("ADD COLUMN", `_parent_sync_state.${column}`, stmt);
   }
 
   // -------------------------------------------------------------------------
@@ -792,6 +813,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * Advance the cursor after successfully upserting a page of children
    * for one parent. Resets backfill_complete to 0 — we're mid-parent
    * until the caller explicitly flips it via markParentBackfillComplete.
+   * Stamps drain_started_at on first observation (COALESCE preserves
+   * the existing value across multi-tick resumes so prune-on-complete
+   * sees the true drain start).
    */
   async setParentSyncCursor(
     entity: string,
@@ -801,41 +825,140 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ensureInitialized();
     const now = new Date().toISOString();
     this.ctx.storage.sql.exec(
-      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at)
-       VALUES (?, ?, ?, 0, ?)
+      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
+       VALUES (?, ?, ?, 0, ?, ?)
        ON CONFLICT(entity, parent_id) DO UPDATE
          SET cursor = excluded.cursor,
              backfill_complete = 0,
-             last_sync_at = excluded.last_sync_at`,
+             last_sync_at = excluded.last_sync_at,
+             drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
       entity,
       parentId,
       cursor,
+      now,
       now,
     );
   }
 
   /**
-   * Flip the parent's child sync to complete. Called when a per-parent
-   * page loop reaches empty_page / null-next-cursor. Clears the cursor
-   * so a later re-activation (freshness bump) starts from scratch.
+   * Ensure a drain marker exists for (entity, parent_id). Called by the
+   * per-parent loop on the first page of a parent that has no cursor
+   * (e.g. single-page endpoints like tasks/notes that never call
+   * setParentSyncCursor). Idempotent via COALESCE.
+   */
+  async ensureParentDrainMarker(
+    entity: string,
+    parentId: string,
+  ): Promise<string> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
+       VALUES (?, ?, NULL, 0, ?, ?)
+       ON CONFLICT(entity, parent_id) DO UPDATE
+         SET last_sync_at = excluded.last_sync_at,
+             drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
+      entity,
+      parentId,
+      now,
+      now,
+    );
+    const row = this.ctx.storage.sql
+      .exec<{ drain_started_at: string | null }>(
+        `SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
+        entity,
+        parentId,
+      )
+      .one();
+    return row.drain_started_at ?? now;
+  }
+
+  /**
+   * Flip the parent's child sync to complete AND snapshot-and-swap
+   * prune any children whose _synced_at predates the drain marker
+   * (i.e. rows present in this DO from a previous drain that GHL did
+   * not return this time — upstream deleted them).
+   *
+   * For entities with a derived dual-write (messages → call_events),
+   * the caller passes `derivedTables` so the same parent-scoped prune
+   * runs on the derived rows too. Otherwise a deleted TYPE_CALL
+   * message would leave its call_events row affecting lead_response_
+   * metrics forever.
+   *
+   * Returns the pruned count for observability logging.
    */
   async markParentBackfillComplete(
     entity: string,
     parentId: string,
-  ): Promise<void> {
+    childTable: string,
+    fkColumn: string,
+    derivedTables: ReadonlyArray<{ table: string; fk: string }> = [],
+  ): Promise<number> {
     this.ensureInitialized();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(childTable)) {
+      throw new Error(`Invalid child table identifier: ${childTable}`);
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fkColumn)) {
+      throw new Error(`Invalid fk column identifier: ${fkColumn}`);
+    }
+    for (const { table, fk } of derivedTables) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(fk)) {
+        throw new Error(`Invalid derived table descriptor: ${table}.${fk}`);
+      }
+    }
+
     const now = new Date().toISOString();
+    const drainStart = this.ctx.storage.sql
+      .exec<{ drain_started_at: string | null }>(
+        `SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
+        entity,
+        parentId,
+      )
+      .toArray()[0]?.drain_started_at ?? null;
+
+    let totalPruned = 0;
+    if (drainStart) {
+      // Prune stale children for the primary entity.
+      const pruneCursor = this.ctx.storage.sql.exec(
+        `DELETE FROM ${childTable} WHERE ${fkColumn} = ? AND _synced_at < ?`,
+        parentId,
+        drainStart,
+      );
+      for (const _ of pruneCursor) {
+        // iterate to force execution
+      }
+      totalPruned += pruneCursor.rowsWritten ?? 0;
+
+      // Prune stale derived rows for the same parent (e.g. call_events
+      // where conversation_id = parentId, for a messages parent).
+      for (const { table, fk } of derivedTables) {
+        const c = this.ctx.storage.sql.exec(
+          `DELETE FROM ${table} WHERE ${fk} = ? AND _synced_at < ?`,
+          parentId,
+          drainStart,
+        );
+        for (const _ of c) {
+          // force execution
+        }
+        totalPruned += c.rowsWritten ?? 0;
+      }
+    }
+
+    // Now mark complete + clear drain marker + cursor.
     this.ctx.storage.sql.exec(
-      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at)
-       VALUES (?, ?, NULL, 1, ?)
+      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
+       VALUES (?, ?, NULL, 1, ?, NULL)
        ON CONFLICT(entity, parent_id) DO UPDATE
          SET cursor = NULL,
              backfill_complete = 1,
-             last_sync_at = excluded.last_sync_at`,
+             last_sync_at = excluded.last_sync_at,
+             drain_started_at = NULL`,
       entity,
       parentId,
       now,
     );
+
+    return totalPruned;
   }
 
   // -------------------------------------------------------------------------
