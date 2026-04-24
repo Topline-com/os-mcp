@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node --experimental-sqlite --import tsx --test src/parent-sync-state.test.ts 2>&1 | grep -v 'ExperimentalWarning\\|Use `node --trace-warnings`'"
+    "test": "node --no-warnings --experimental-sqlite --import tsx --test src/parent-sync-state.test.ts"
   },
   "dependencies": {
     "@topline/shared-schema": "*"
@@ -28,6 +28,6 @@
     "typescript": "^5.4.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

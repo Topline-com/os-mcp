@@ -2,9 +2,12 @@
 //
 // The state machine lives inside LocationDO (packages/shared-do/src/
 // location-do.ts) and manipulates a `_parent_sync_state` table via
-// Cloudflare's DurableObject storage.sql interface. These tests run the
-// EXACT same SQL statements against node:sqlite so we can prove state
-// transitions without standing up a Workers runtime.
+// Cloudflare's DurableObject storage.sql interface. These tests run
+// the EXACT same SQL statements LocationDO runs — imported from
+// parent-sync-sql.ts, the single source of truth for the state
+// machine's SQL — against node:sqlite. That way a regression in the
+// RPC's SQL appears as a failing test here, because both sides load
+// the same strings.
 //
 // Why this file exists: the P1 bug fixed in 9044d08 — where
 // ensureParentDrainMarker on a previously-complete parent would bump
@@ -14,15 +17,19 @@
 // not caught by any existing test. The SQL safety + mapping suites
 // don't exercise the DO's sync bookkeeping at all. This suite covers
 // exactly the invariants the P1 fix rests on.
-//
-// Maintenance note: the SQL strings below MUST match what location-do.ts
-// runs for the corresponding RPCs. When you change an RPC's SQL, update
-// the test. That duplication is intentional — it's the forcing function
-// that turns SQL regressions into test failures.
 
-import { describe, it, before, beforeEach } from "node:test";
+import { describe, it, beforeEach } from "node:test";
 import { strictEqual, deepStrictEqual, ok } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
+import {
+  PARENT_SYNC_STATE_DDL,
+  PARENT_ENSURE_DRAIN_MARKER,
+  PARENT_SET_SYNC_CURSOR,
+  PARENT_MARK_COMPLETE,
+  parentPruneChildrenSql,
+  nextParentsForChildSql,
+  refreshRowCountSql,
+} from "./parent-sync-sql.js";
 
 // ---------------------------------------------------------------------------
 // Test harness: an in-memory SQLite that mimics the LocationDO schema
@@ -34,17 +41,10 @@ let db: DatabaseSync;
 
 function initSchema(): void {
   db = new DatabaseSync(":memory:");
-  db.exec(`
-    CREATE TABLE _parent_sync_state (
-      entity TEXT NOT NULL,
-      parent_id TEXT NOT NULL,
-      cursor TEXT,
-      backfill_complete INTEGER NOT NULL DEFAULT 0,
-      last_sync_at TEXT,
-      drain_started_at TEXT,
-      PRIMARY KEY (entity, parent_id)
-    );
-  `);
+  // DDL imported from parent-sync-sql.ts — same string the DO uses
+  // during runMigrations. If the schema drifts here, both runtime
+  // and test see the drift together.
+  db.exec(PARENT_SYNC_STATE_DDL);
   // Surrogate contacts table for getNextParentsForChild's JOIN.
   db.exec(`
     CREATE TABLE contacts (
@@ -76,18 +76,16 @@ function initSchema(): void {
 }
 
 // ---------------------------------------------------------------------------
-// SQL statement helpers — copied verbatim from location-do.ts. If the
-// RPC SQL diverges from what's here, these tests fail, forcing a review.
+// State-machine call-site wrappers.
+//
+// Each helper runs the SAME SQL string the LocationDO RPC uses — the
+// imports above give us the single source of truth. Wrappers exist
+// only to bind node:sqlite's `.prepare().run()` / `.get()` API to our
+// state-machine operations.
 // ---------------------------------------------------------------------------
 
 function ensureParentDrainMarker(entity: string, parentId: string, now: string): void {
-  db.prepare(
-    `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-     VALUES (?, ?, NULL, 0, NULL, ?)
-     ON CONFLICT(entity, parent_id) DO UPDATE
-       SET backfill_complete = 0,
-           drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
-  ).run(entity, parentId, now);
+  db.prepare(PARENT_ENSURE_DRAIN_MARKER).run(entity, parentId, now);
 }
 
 function setParentSyncCursor(
@@ -96,15 +94,7 @@ function setParentSyncCursor(
   cursor: string,
   now: string,
 ): void {
-  db.prepare(
-    `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-     VALUES (?, ?, ?, 0, ?, ?)
-     ON CONFLICT(entity, parent_id) DO UPDATE
-       SET cursor = excluded.cursor,
-           backfill_complete = 0,
-           last_sync_at = excluded.last_sync_at,
-           drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
-  ).run(entity, parentId, cursor, now, now);
+  db.prepare(PARENT_SET_SYNC_CURSOR).run(entity, parentId, cursor, now, now);
 }
 
 function markParentBackfillComplete(
@@ -115,41 +105,25 @@ function markParentBackfillComplete(
   now: string,
 ): { pruned: number } {
   const drainRow = db
-    .prepare(
-      `SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
-    )
+    .prepare(`SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`)
     .get(entity, parentId) as { drain_started_at: string | null } | undefined;
   const drainStart = drainRow?.drain_started_at ?? null;
 
   let pruned = 0;
   if (drainStart) {
     const info = db
-      .prepare(
-        `DELETE FROM ${childTable} WHERE ${fkColumn} = ? AND _synced_at < ?`,
-      )
+      .prepare(parentPruneChildrenSql(childTable, fkColumn))
       .run(parentId, drainStart);
     pruned = Number(info.changes);
   }
 
   if (pruned > 0) {
-    const fresh = db
-      .prepare(`SELECT COUNT(*) AS n FROM ${childTable}`)
-      .get() as { n: number };
-    db.prepare(
-      `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
-    ).run(fresh.n, childTable);
+    const { select, update } = refreshRowCountSql(childTable);
+    const fresh = db.prepare(select).get() as { n: number };
+    db.prepare(update).run(fresh.n, childTable);
   }
 
-  db.prepare(
-    `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-     VALUES (?, ?, NULL, 1, ?, NULL)
-     ON CONFLICT(entity, parent_id) DO UPDATE
-       SET cursor = NULL,
-           backfill_complete = 1,
-           last_sync_at = excluded.last_sync_at,
-           drain_started_at = NULL`,
-  ).run(entity, parentId, now);
-
+  db.prepare(PARENT_MARK_COMPLETE).run(entity, parentId, now);
   return { pruned };
 }
 
@@ -159,23 +133,8 @@ function getNextParentsForChild(
   limit: number,
   freshnessColumns: readonly string[],
 ): string[] {
-  const freshnessSql =
-    freshnessColumns.length > 0
-      ? " OR " +
-        freshnessColumns
-          .map((col) => `p.${col} > COALESCE(s.last_sync_at, '')`)
-          .join(" OR ")
-      : "";
   const rows = db
-    .prepare(
-      `SELECT p.id
-         FROM ${parentTable} p
-         LEFT JOIN _parent_sync_state s
-           ON s.entity = ? AND s.parent_id = p.id
-        WHERE COALESCE(s.backfill_complete, 0) = 0${freshnessSql}
-        ORDER BY COALESCE(s.last_sync_at, ''), p.id
-        LIMIT ?`,
-    )
+    .prepare(nextParentsForChildSql(parentTable, freshnessColumns))
     .all(childEntity, limit) as Array<{ id: string }>;
   return rows.map((r) => r.id);
 }

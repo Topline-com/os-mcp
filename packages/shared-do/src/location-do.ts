@@ -45,6 +45,17 @@ import {
   type EntityManifest,
   type ColumnDef,
 } from "@topline/shared-schema";
+import {
+  PARENT_SYNC_STATE_DDL,
+  PARENT_ENSURE_DRAIN_MARKER,
+  PARENT_SET_SYNC_CURSOR,
+  PARENT_MARK_COMPLETE,
+  PARENT_GET_SYNC_CURSOR,
+  PARENT_GET_DRAIN_START,
+  parentPruneChildrenSql,
+  nextParentsForChildSql,
+  refreshRowCountSql,
+} from "./parent-sync-sql.js";
 
 // ---------------------------------------------------------------------------
 // RPC response shapes — kept serializable (no class instances, no functions)
@@ -217,16 +228,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // parent (conversation with a new message, contact with a new task)
     // gets picked back up on the next tick without re-walking the whole
     // parent table.
-    sql.exec(`
-      CREATE TABLE IF NOT EXISTS _parent_sync_state (
-        entity TEXT NOT NULL,
-        parent_id TEXT NOT NULL,
-        cursor TEXT,
-        backfill_complete INTEGER NOT NULL DEFAULT 0,
-        last_sync_at TEXT,
-        PRIMARY KEY (entity, parent_id)
-      )
-    `);
+    sql.exec(PARENT_SYNC_STATE_DDL);
     // drain_started_at on _parent_sync_state: stamped when a parent
     // first starts syncing (pre-existing rows: NULL via additive
     // migration). Used by the per-parent snapshot-and-swap at
@@ -771,21 +773,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         throw new Error(`Invalid freshness column identifier: ${col}`);
       }
     }
-    const freshnessSql = freshnessColumns.length > 0
-      ? " OR " + freshnessColumns
-          .map((col) => `p.${col} > COALESCE(s.last_sync_at, '')`)
-          .join(" OR ")
-      : "";
     const capped = Math.max(1, Math.min(500, Math.floor(limit)));
     const rows = this.ctx.storage.sql
       .exec<{ id: string }>(
-        `SELECT p.id
-           FROM ${parentTable} p
-           LEFT JOIN _parent_sync_state s
-             ON s.entity = ? AND s.parent_id = p.id
-          WHERE COALESCE(s.backfill_complete, 0) = 0${freshnessSql}
-          ORDER BY COALESCE(s.last_sync_at, ''), p.id
-          LIMIT ?`,
+        nextParentsForChildSql(parentTable, freshnessColumns),
         childEntity,
         capped,
       )
@@ -801,7 +792,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ensureInitialized();
     const rows = this.ctx.storage.sql
       .exec<{ cursor: string | null }>(
-        `SELECT cursor FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
+        PARENT_GET_SYNC_CURSOR,
         entity,
         parentId,
       )
@@ -825,13 +816,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ensureInitialized();
     const now = new Date().toISOString();
     this.ctx.storage.sql.exec(
-      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-       VALUES (?, ?, ?, 0, ?, ?)
-       ON CONFLICT(entity, parent_id) DO UPDATE
-         SET cursor = excluded.cursor,
-             backfill_complete = 0,
-             last_sync_at = excluded.last_sync_at,
-             drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
+      PARENT_SET_SYNC_CURSOR,
       entity,
       parentId,
       cursor,
@@ -874,11 +859,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ensureInitialized();
     const now = new Date().toISOString();
     this.ctx.storage.sql.exec(
-      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-       VALUES (?, ?, NULL, 0, NULL, ?)
-       ON CONFLICT(entity, parent_id) DO UPDATE
-         SET backfill_complete = 0,
-             drain_started_at = COALESCE(_parent_sync_state.drain_started_at, excluded.drain_started_at)`,
+      PARENT_ENSURE_DRAIN_MARKER,
       entity,
       parentId,
       now,
@@ -930,7 +911,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     const now = new Date().toISOString();
     const drainStart = this.ctx.storage.sql
       .exec<{ drain_started_at: string | null }>(
-        `SELECT drain_started_at FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
+        PARENT_GET_DRAIN_START,
         entity,
         parentId,
       )
@@ -944,7 +925,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     if (drainStart) {
       // Prune stale children for the primary entity.
       const pruneCursor = this.ctx.storage.sql.exec(
-        `DELETE FROM ${childTable} WHERE ${fkColumn} = ? AND _synced_at < ?`,
+        parentPruneChildrenSql(childTable, fkColumn),
         parentId,
         drainStart,
       );
@@ -959,7 +940,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       // where conversation_id = parentId, for a messages parent).
       for (const { table, fk } of derivedTables) {
         const c = this.ctx.storage.sql.exec(
-          `DELETE FROM ${table} WHERE ${fk} = ? AND _synced_at < ?`,
+          parentPruneChildrenSql(table, fk),
           parentId,
           drainStart,
         );
@@ -980,25 +961,14 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // tables that rarely change (notes, tasks on stale contacts) the
     // drift could persist indefinitely.
     for (const table of new Set(tablesPruned)) {
-      const fresh = this.ctx.storage.sql
-        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)
-        .one().n;
-      this.ctx.storage.sql.exec(
-        `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
-        fresh,
-        table,
-      );
+      const { select, update } = refreshRowCountSql(table);
+      const fresh = this.ctx.storage.sql.exec<{ n: number }>(select).one().n;
+      this.ctx.storage.sql.exec(update, fresh, table);
     }
 
     // Now mark complete + clear drain marker + cursor.
     this.ctx.storage.sql.exec(
-      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at, drain_started_at)
-       VALUES (?, ?, NULL, 1, ?, NULL)
-       ON CONFLICT(entity, parent_id) DO UPDATE
-         SET cursor = NULL,
-             backfill_complete = 1,
-             last_sync_at = excluded.last_sync_at,
-             drain_started_at = NULL`,
+      PARENT_MARK_COMPLETE,
       entity,
       parentId,
       now,
