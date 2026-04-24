@@ -40,6 +40,9 @@ import {
   connectResultHtml,
 } from "./remote-oauth.js";
 import { LocationDO } from "@topline/shared-do";
+import { edgeContext } from "./request-context.js";
+import { locationClient } from "./location-do-client.js";
+import { sanitizeQuery, SqlSafetyError } from "./sql-safety.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
@@ -95,6 +98,12 @@ export default {
         return cors(await handleAdminDoInfo(request, env));
       case "/admin/do-query":
         return cors(await handleAdminDoQuery(request, env));
+      case "/query/api/get-overview":
+        return cors(await handleQueryApiOverview(request, env));
+      case "/query/api/explain-tables":
+        return cors(await handleQueryApiExplainTables(request, env));
+      case "/query/api/execute-sql":
+        return cors(await handleQueryApiExecuteSql(request, env));
       default:
         return cors(plain(404, "Not found"));
     }
@@ -434,9 +443,11 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   }
 
   try {
-    const response = await credentialsContext.run({ pit, locationId }, async () => {
-      return dispatch(rpc, env);
-    });
+    const response = await edgeContext.run({ location_do: env.LOCATION_DO }, () =>
+      credentialsContext.run({ pit, locationId }, async () => {
+        return dispatch(rpc, env);
+      }),
+    );
     // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
     if (cid) ctx.waitUntil(touchConnection(env.CONNECTIONS, cid));
     return response;
@@ -551,6 +562,114 @@ async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> 
     stub.getSyncState(),
   ]);
   return json(200, { location, ping, schema, sync_state: state });
+}
+
+// ---------------------------------------------------------------------------
+// /query/api/* — customer-facing HTTP query API. Same SQL surface as the
+// SQL MCP tools, but accessible from anything that speaks HTTP with a
+// Bearer token. Dashboard tools (Looker, Retool, Lovable, n8n, curl...)
+// don't need to be MCP clients to hit this.
+//
+// All three endpoints share the same auth model: the Bearer token
+// resolves to a connection (new-style cid token or legacy raw PIT),
+// and the query runs against that connection's LocationDO.
+// ---------------------------------------------------------------------------
+
+async function authorizeQueryRequest(
+  request: Request,
+  env: Env,
+): Promise<{ locationId: string; cid?: string } | Response> {
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer) {
+    return plain(401, "Missing Authorization: Bearer <token>");
+  }
+  const resolved = await resolveBearer(bearer, env);
+  if ("error" in resolved) {
+    return plain(401, resolved.error);
+  }
+  let locationId = resolved.locationId;
+  if (!locationId) {
+    locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
+  }
+  if (!locationId) {
+    return plain(
+      400,
+      "No location resolved from the token. For raw-PIT bearers pass X-Topline-Location-Id too.",
+    );
+  }
+  return { locationId, cid: resolved.cid };
+}
+
+async function handleQueryApiOverview(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plain(405, "Method not allowed");
+  const auth = await authorizeQueryRequest(request, env);
+  if (auth instanceof Response) return auth;
+  try {
+    const client = locationClient(env.LOCATION_DO, auth.locationId);
+    const overview = await client.describeSchema();
+    return json(200, overview);
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleQueryApiExplainTables(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plain(405, "Method not allowed");
+  const auth = await authorizeQueryRequest(request, env);
+  if (auth instanceof Response) return auth;
+  const url = new URL(request.url);
+  const tables = url.searchParams.getAll("table");
+  if (tables.length === 0) {
+    return plain(400, "Missing table params. Repeat `?table=<name>` for each.");
+  }
+  try {
+    const client = locationClient(env.LOCATION_DO, auth.locationId);
+    const details = await client.explainTables(tables);
+    return json(200, details);
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  const auth = await authorizeQueryRequest(request, env);
+  if (auth instanceof Response) return auth;
+
+  let body: { sql?: string } = {};
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json(400, { error: "Body must be JSON: { sql: string }" });
+  }
+  const sqlInput = String(body.sql ?? "");
+
+  let safe;
+  try {
+    safe = sanitizeQuery(sqlInput);
+  } catch (err) {
+    if (err instanceof SqlSafetyError) {
+      return json(400, { error: err.message, rejected_query: sqlInput });
+    }
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+
+  try {
+    const client = locationClient(env.LOCATION_DO, auth.locationId);
+    const result = await client.executeQuery(safe.sql, []);
+    const hitCap = result.rows.length >= safe.effective_limit;
+    return json(200, {
+      columns: result.columns,
+      rows: result.rows,
+      elapsed_ms: result.elapsed_ms,
+      truncated: result.truncated || hitCap,
+      effective_limit: safe.effective_limit,
+      rewritten_sql: safe.sql,
+    });
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -17,7 +17,8 @@
     "@topline/shared": "*",
     "@topline/shared-auth": "*",
     "@topline/shared-do": "*",
-    "@topline/shared-schema": "*"
+    "@topline/shared-schema": "*",
+    "node-sql-parser": "^5.4.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",

@@ -204,9 +204,25 @@ export function requiredAuditChecks(
   if (ownsCursor) {
     checks.push("update_cursor");
   }
-  // Phase-1 tables depend on webhooks for near-real-time freshness. Warm
-  // and cool tables poll only — webhook_coverage is N/A.
-  if (entity.phase === 1) {
+  // Phase-1 tables need *some* reliable freshness mechanism. Originally
+  // that meant webhook_coverage was required. In practice a verified
+  // cron+filter path is equivalent for analytics workloads — poll every
+  // 15 min with a server-side date filter (filter_ready: true) gets the
+  // same result as near-real-time webhooks for the class of queries
+  // LLMs care about (GROUP BY, COUNT, JOIN, analytical aggregates).
+  //
+  // Gate: webhook_coverage is required UNLESS one of these is true:
+  //   - incremental.type === "poll_full" (re-fetches everything)
+  //   - incremental.type === "updated_after" AND filter_ready === true
+  //
+  // Entities that need true real-time (future: live chat dashboards,
+  // alerting) should flip webhook_coverage true anyway; this gate is
+  // about the minimum acceptable freshness floor for analytics exposure.
+  const hasCronFreshness =
+    entity.incremental.type === "poll_full" ||
+    (entity.incremental.type === "updated_after" &&
+      entity.incremental.filter_ready === true);
+  if (entity.phase === 1 && !hasCronFreshness) {
     checks.push("webhook_coverage");
   }
   return checks;

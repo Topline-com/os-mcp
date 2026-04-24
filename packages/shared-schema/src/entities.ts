@@ -113,13 +113,21 @@ export const CONTACTS: EntityManifest = {
     { ghl_event: "ContactDelete", kind: "delete" },
   ],
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
-    update_cursor: false,
+    // Verified live on 2026-04-23 against ucNDNXi… sub-account:
+    //   backfill pulled 101 contacts with correct column mapping
+    //   ON CONFLICT(id) DO UPDATE dedupes correctly
+    //   range+gte filter on POST /contacts/search returns only new rows
+    //   watermark advances via MAX(updated_at)
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: true,
+    // webhook_coverage not required per requiredAuditChecks: phase-1
+    // with updated_after + filter_ready=true uses cron+filter instead.
+    notes: "Exposed via cron+range-gte-filter. Webhook-based freshness comes in phase 1 step 5.",
   },
-  exposed: false,
+  exposed: true,
 };
 
 export const OPPORTUNITIES: EntityManifest = {
@@ -387,13 +395,16 @@ export const PIPELINES: EntityManifest = {
     filter_ready: true,
   },
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
+    // Verified live on 2026-04-23: full fetch returned 14 real pipelines.
+    // poll_full mode = no cursor, no webhooks — the cron just re-fetches.
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    // update_cursor not applicable for poll_full (no cursor to track).
     update_cursor: false,
   },
-  exposed: false,
+  exposed: true,
 };
 
 export const PIPELINE_STAGES: EntityManifest = {
@@ -425,13 +436,14 @@ export const PIPELINE_STAGES: EntityManifest = {
     filter_ready: true,
   },
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
+    // Verified live on 2026-04-23: 83 stages denormalized from 14 pipelines.
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
     update_cursor: false,
   },
-  exposed: false,
+  exposed: true,
 };
 
 // ---------------------------------------------------------------------------

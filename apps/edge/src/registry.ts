@@ -6,6 +6,7 @@ import type { ToolDef } from "./tools/types.js";
 import { tools as pingTools } from "./tools/ping.js";
 import { tools as setupCheckTools } from "./tools/setup_check.js";
 import { tools as passthroughTools } from "./tools/passthrough.js";
+import { tools as sqlTools } from "./tools/sql.js";
 import { tools as contactTools } from "./tools/contacts.js";
 import { tools as conversationTools } from "./tools/conversations.js";
 import { tools as opportunityTools } from "./tools/opportunities.js";
@@ -23,6 +24,7 @@ import { tools as surveyTools } from "./tools/surveys.js";
 export const ALL_TOOLS: ToolDef[] = [
   ...pingTools,
   ...setupCheckTools,
+  ...sqlTools,
   ...passthroughTools,
   ...contactTools,
   ...conversationTools,
