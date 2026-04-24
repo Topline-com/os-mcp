@@ -85,6 +85,45 @@ export interface ColumnDef {
 // Sync descriptors
 // ---------------------------------------------------------------------------
 
+/**
+ * Multi-field cursor config for endpoints that can't be expressed with a
+ * single (request_param, response_field) pair. See BackfillDescriptor.cursor.
+ */
+export interface CursorConfig {
+  /**
+   * Where next-cursor values live in the response:
+   *   "meta"      — inside response.meta (e.g. opportunities)
+   *   "last_item" — on the final element of items_field[]
+   *                 (e.g. contacts' per-item searchAfter, conversations'
+   *                  per-item lastMessageDate)
+   */
+  source: "meta" | "last_item";
+  /**
+   * One entry per field we need to send on the NEXT request. For compound
+   * cursors (opportunities: startAfter + startAfterId) list both — sending
+   * only one silently returns the same page.
+   */
+  fields: ReadonlyArray<CursorField>;
+}
+
+export interface CursorField {
+  /** Query param (GET) or body key (POST) to send on the next request. */
+  request_param: string;
+  /**
+   * Dot-path inside the cursor source (meta object or last item) where
+   * this value lives. Often the same as request_param, but conversations
+   * needs request_param="startAfterDate" / response_path="lastMessageDate".
+   */
+  response_path: string;
+  /**
+   * How to encode the value on the next request.
+   *   "scalar" — stringified and placed in GET query or POST body as-is
+   *   "array"  — kept as an array in the POST body (contacts' searchAfter)
+   * Default: "scalar".
+   */
+  encoding?: "scalar" | "array";
+}
+
 export interface BackfillDescriptor {
   /** API path relative to services.leadconnectorhq.com. */
   endpoint: string;
@@ -110,8 +149,38 @@ export interface BackfillDescriptor {
   /** Response field holding the array of records. Defaults vary per endpoint. */
   items_field?: string;
   /**
-   * For cursor pagination: response field containing the next cursor,
-   * and the query-param name to send it back on the next request.
+   * Structured cursor config. Required for entities with non-trivial
+   * pagination — GHL's cursor shapes vary wildly per endpoint:
+   *
+   *   contacts (POST /contacts/search)
+   *     cursor lives on each contact as `searchAfter: [ts, id]`.
+   *     Next page sends `searchAfter: [ts, id]` in the body.
+   *     → source: "last_item", 1 field with encoding: "array"
+   *
+   *   opportunities (GET /opportunities/search)
+   *     cursor is compound (startAfter, startAfterId) inside `meta`.
+   *     Sending only startAfterId is silently ignored — both required.
+   *     → source: "meta", 2 fields
+   *
+   *   conversations (GET /conversations/search)
+   *     no `meta` object; cursor is last item's `lastMessageDate`.
+   *     Next page sends `startAfterDate=<ms>` as a scalar query param.
+   *     → source: "last_item", 1 field, response_path differs from request_param
+   *
+   *   messages (GET /conversations/{id}/messages)
+   *     simple single-field cursor at meta-ish `messages.lastMessageId`.
+   *     → stays on the simple `cursor_request_param` / `cursor_response_field`
+   *       path for now (single-field scalar, no override needed).
+   *
+   * When `cursor` is present it takes precedence. Legacy entities with
+   * only cursor_request_param / cursor_response_field still work via the
+   * single-field fallback in the backfill loop.
+   */
+  cursor?: CursorConfig;
+  /**
+   * Legacy single-field cursor (deprecated). New entities should use
+   * `cursor` above. Kept for backward compatibility with entities whose
+   * pagination really is single-field-scalar (messages).
    */
   cursor_response_field?: string;
   cursor_request_param?: string;

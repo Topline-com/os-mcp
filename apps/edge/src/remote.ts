@@ -55,6 +55,14 @@ interface Env {
   CONNECTIONS: KVNamespace;
   LOCATION_DO: DurableObjectNamespace<LocationDO>;
   ADMIN_TOKEN?: string;
+  /**
+   * Service binding to the sync worker. Used by kickoffInitialBackfill
+   * to fire-and-forget the first backfill-all right after a connection
+   * is created. Optional at the type level so local / stdio builds still
+   * typecheck; at runtime the worker refuses to run without it when a
+   * new connection is created.
+   */
+  SYNC_WORKER?: Fetcher;
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
@@ -89,9 +97,9 @@ export default {
       case "/authorize":
         return cors(await handleAuthorize(request, env, brand));
       case "/token":
-        return cors(await handleToken(request, env, brand));
+        return cors(await handleToken(request, env, brand, ctx));
       case "/connect":
-        return cors(await handleConnect(request, env, brand));
+        return cors(await handleConnect(request, env, brand, ctx));
       case "/mcp":
         return cors(await handleMcp(request, env, ctx));
       case "/admin/do-info":
@@ -143,7 +151,7 @@ function landing(brand: string, origin: string): Response {
 // that can't complete the full OAuth dance. Creates a connection and issues
 // a {cid, exp} access token referencing it.
 // ---------------------------------------------------------------------------
-async function handleConnect(request: Request, env: Env, brand: string): Promise<Response> {
+async function handleConnect(request: Request, env: Env, brand: string, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "GET") {
     return html(200, connectFormHtml({ brand, origin: url.origin }));
@@ -173,6 +181,12 @@ async function handleConnect(request: Request, env: Env, brand: string): Promise
     { location_id: locationId, pit, brand_name: brand, source: "self-serve" },
     env.TOKEN_SIGNING_SECRET,
   );
+
+  // Fire the initial full backfill in the background. The cron would
+  // eventually seed this connection on its next 15-min tick, but running
+  // it now means the customer can query data the moment they finish
+  // setup instead of staring at an empty DO.
+  ctx.waitUntil(kickoffInitialBackfill(env, cid));
 
   const payload: AccessTokenPayload = {
     cid,
@@ -301,7 +315,7 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
 // Token endpoint — exchange auth code (+ PKCE verifier) for access token.
 // This is where we create the ConnectionDirectory record.
 // ---------------------------------------------------------------------------
-async function handleToken(request: Request, env: Env, brand: string): Promise<Response> {
+async function handleToken(request: Request, env: Env, brand: string, ctx: ExecutionContext): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
   const contentType = request.headers.get("Content-Type") ?? "";
@@ -352,6 +366,10 @@ async function handleToken(request: Request, env: Env, brand: string): Promise<R
     { location_id: payload.locationId, pit: payload.pit, brand_name: brand, source: "oauth" },
     env.TOKEN_SIGNING_SECRET,
   );
+
+  // Kick off the initial backfill immediately (same rationale as /connect
+  // — don't make the customer wait for the cron tick).
+  ctx.waitUntil(kickoffInitialBackfill(env, cid));
 
   const accessPayload: AccessTokenPayload = {
     cid,
@@ -829,6 +847,46 @@ async function handleAdminDoExec(request: Request, env: Env): Promise<Response> 
     return json(200, result);
   } catch (err) {
     return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fire a single backfill-all against the sync worker right after a
+// connection is minted. Runs inside ctx.waitUntil so customers don't wait
+// on the HTTP round-trip, and any per-entity failures are surfaced in
+// the sync worker's logs where they belong — this function only cares
+// that the kickoff POST was accepted.
+//
+// Falls back to a no-op (with a log line) when either binding is absent,
+// so stdio / local builds without the service binding still work.
+// ---------------------------------------------------------------------------
+async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<void> {
+  if (!env.SYNC_WORKER || !env.ADMIN_TOKEN) {
+    console.log(
+      `[kickoff] skipping connection=${connectionId} — ` +
+        (!env.SYNC_WORKER
+          ? "SYNC_WORKER binding not configured (check wrangler.toml [[services]])"
+          : "ADMIN_TOKEN secret not set on this worker"),
+    );
+    return;
+  }
+  try {
+    // Service-binding fetch ignores URL host; any valid URL works. We
+    // route to the same path the sync worker exposes for external
+    // admin calls so the behavior and logging stay identical.
+    const res = await env.SYNC_WORKER.fetch(
+      `https://sync/sync/backfill-all?connection_id=${encodeURIComponent(connectionId)}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
+      },
+    );
+    console.log(
+      `[kickoff] connection=${connectionId} backfill-all ${res.status} (sync worker)`,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[kickoff] connection=${connectionId} FAILED ${msg.slice(0, 200)}`);
   }
 }
 

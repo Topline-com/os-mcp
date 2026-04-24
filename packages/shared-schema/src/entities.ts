@@ -85,13 +85,24 @@ export const CONTACTS: EntityManifest = {
   ],
   backfill: {
     // Matches apps/edge/src/tools/contacts.ts `topline_search_contacts`:
-    // POST /contacts/search with body.searchAfter = [lastId], body.pageLimit.
+    // POST /contacts/search with body.searchAfter = [ts, lastId].
+    //
+    // GHL does NOT include a top-level cursor in the response. Instead
+    // the last contact in the `contacts[]` array carries a
+    // `searchAfter: [ms_epoch, id]` tuple that we must send BACK in
+    // the next body. Probed live 2026-04-24 on ucNDNXi… — only this
+    // shape advances through the 16k contacts; meta.searchAfter is
+    // absent (the former manifest reading it got 0 rows past page 1).
     endpoint: "/contacts/search",
     method: "POST",
     pagination: "cursor",
     items_field: "contacts",
-    cursor_response_field: "meta.searchAfter",
-    cursor_request_param: "searchAfter",
+    cursor: {
+      source: "last_item",
+      fields: [
+        { request_param: "searchAfter", response_path: "searchAfter", encoding: "array" },
+      ],
+    },
     query_extras: { pageLimit: 100 },
   },
   incremental: {
@@ -158,16 +169,24 @@ export const OPPORTUNITIES: EntityManifest = {
   ],
   backfill: {
     // Matches apps/edge/src/tools/opportunities.ts `topline_search_opportunities`:
-    // GET /opportunities/search with query startAfterId (not POST, not `page`).
-    // Note: this endpoint uses snake_case `location_id` where most GHL v2
-    // endpoints use camelCase `locationId`. The live edge tool confirms it.
+    // GET /opportunities/search. Uses snake_case `location_id`.
+    //
+    // Cursor is COMPOUND — sending only startAfterId silently returns
+    // the same page (probed live 2026-04-24 on ucNDNXi…). Both
+    // startAfter (ms epoch) and startAfterId (row id) must go on the
+    // next request for the cursor to advance.
     endpoint: "/opportunities/search",
     method: "GET",
     location_param_name: "location_id",
     pagination: "cursor",
     items_field: "opportunities",
-    cursor_response_field: "meta.startAfterId",
-    cursor_request_param: "startAfterId",
+    cursor: {
+      source: "meta",
+      fields: [
+        { request_param: "startAfter", response_path: "startAfter" },
+        { request_param: "startAfterId", response_path: "startAfterId" },
+      ],
+    },
     query_extras: { limit: 100 },
   },
   incremental: {
@@ -229,14 +248,21 @@ export const CONVERSATIONS: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    // Matches apps/edge/src/tools/conversations.ts `topline_search_conversations`:
-    // GET /conversations/search with query startAfterId.
+    // GET /conversations/search. No `meta` object in the response. The
+    // cursor is the last row's `lastMessageDate` (ms epoch). Sending
+    // it back as `startAfterDate=<ms>` advances the page. Probed live
+    // 2026-04-24 on ucNDNXi… — the previously-configured startAfterId
+    // was silently ignored, pinning us to page 1 (101 of 14k rows).
     endpoint: "/conversations/search",
     method: "GET",
     pagination: "cursor",
     items_field: "conversations",
-    cursor_response_field: "meta.startAfterId",
-    cursor_request_param: "startAfterId",
+    cursor: {
+      source: "last_item",
+      fields: [
+        { request_param: "startAfterDate", response_path: "lastMessageDate" },
+      ],
+    },
     query_extras: { limit: 100 },
   },
   incremental: {

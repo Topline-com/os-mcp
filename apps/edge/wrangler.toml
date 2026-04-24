@@ -33,6 +33,16 @@ id = "f88571c17a4c47d4bf0a174d4c7dcb53"
 name = "LOCATION_DO"
 class_name = "LocationDO"
 
+# Service binding to the sync worker. Used for fire-and-forget kickoff
+# calls when a new connection is created: the edge handler calls
+# env.SYNC_WORKER.fetch(...) via ctx.waitUntil so the customer's initial
+# backfill starts immediately rather than waiting up to 15 min for the
+# next cron tick. Authorized with the same ADMIN_TOKEN the sync worker
+# already checks — service bindings aren't a trust boundary on their own.
+[[services]]
+binding = "SYNC_WORKER"
+service = "topline-os-sync"
+
 # DO class registration. `new_sqlite_classes` enables the SQLite storage
 # backend (required for LocationDO to use ctx.storage.sql). Migrations are
 # append-only; never remove or renumber existing entries.

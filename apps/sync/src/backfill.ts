@@ -183,7 +183,11 @@ async function backfillStandardCursor(
   let pages = 0;
   let rowsUpserted = 0;
   let lastRowCount = priorState[entity.table]?.row_count ?? 0;
-  let stoppedReason: BackfillResult["stopped_reason"] = "empty_page";
+  // Widening cast — inner assignments live inside an async closure that
+  // TS flow analysis doesn't peek into, so without the cast the post-try
+  // narrowed type collapses to just "empty_page" | "error" and the
+  // "cursor_stalled" check below becomes "unintentional".
+  let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
 
   try {
@@ -208,8 +212,7 @@ async function backfillStandardCursor(
         lastRowCount = result.row_count_after;
         pages += 1;
 
-        const cursorPath = backfill.cursor_response_field;
-        const nextCursor = cursorPath ? getByPath(response, cursorPath) : undefined;
+        const nextCursor = nextCursorFrom(response, items, backfill);
         if (nextCursor === null || nextCursor === undefined) {
           stoppedReason = "empty_page";
           break;
@@ -236,10 +239,15 @@ async function backfillStandardCursor(
       : String(err);
   }
 
-  // Post-run bookkeeping: if we walked to an empty page, we've seen every
-  // row upstream. Capture the max cursor_column value as the watermark and
-  // flip backfill_complete so incremental polling can start.
-  if (stoppedReason === "empty_page" && entity.incremental.cursor_column) {
+  // Post-run bookkeeping: if we walked to end-of-stream (empty_page OR
+  // cursor_stalled), we've seen every row upstream. Capture the max
+  // cursor_column value as the watermark and flip backfill_complete so
+  // incremental polling can start. cursor_stalled is a legitimate EOF
+  // signal when GHL echoes the last-row-id back on the final page.
+  if (
+    (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") &&
+    entity.incremental.cursor_column
+  ) {
     await setWatermarkAndComplete(stub, entity);
   }
 
@@ -338,16 +346,25 @@ function buildRequest(
     body[locParamName] = locationId;
   }
 
-  // Cursor placement follows method conventions.
-  if (cursorValue !== null && cursorValue !== undefined && backfill.cursor_request_param) {
-    if (backfill.method === "GET") {
-      // GHL's GET cursor params are scalars. If GHL ever returned an array
-      // here, we'd need to JSON.stringify — but for the entities we
-      // support (startAfterId for opportunities/conversations), it's a
-      // plain string.
-      query[backfill.cursor_request_param] = String(cursorValue);
-    } else {
-      body[backfill.cursor_request_param] = cursorValue;
+  // Cursor placement. Two paths:
+  //
+  //   Structured cursor (backfill.cursor)  — multi-field, supports
+  //     compound cursors (opportunities' startAfter+startAfterId) and
+  //     array-encoded bodies (contacts' searchAfter). The cursorValue
+  //     is a Record<string, unknown> mapping request_param → value as
+  //     produced by extractNextCursor.
+  //
+  //   Legacy scalar (cursor_request_param)  — single-field string, used
+  //     by messages (per_parent child pagination).
+  if (cursorValue !== null && cursorValue !== undefined) {
+    if (backfill.cursor) {
+      applyCursor(query, body, backfill.method, cursorValue as Record<string, unknown>, backfill.cursor);
+    } else if (backfill.cursor_request_param) {
+      if (backfill.method === "GET") {
+        query[backfill.cursor_request_param] = String(cursorValue);
+      } else {
+        body[backfill.cursor_request_param] = cursorValue;
+      }
     }
   }
 
@@ -392,6 +409,110 @@ function parseCursor(stored: string): unknown {
     return JSON.parse(stored);
   } catch {
     return stored;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Structured cursor helpers (BackfillDescriptor.cursor).
+//
+// GHL's cursor shapes vary per endpoint; these helpers normalize the mess:
+//
+//   extractNextCursor  — pull the next-cursor record out of a response
+//                         (from `meta` or from the last item of items[]).
+//                         Returns a map of { request_param → value } that
+//                         buildRequest will inject into the next request,
+//                         or null if any required field is missing (treat
+//                         as end-of-stream).
+//
+//   applyCursor        — inject that map into the outbound query / body,
+//                         respecting each field's encoding (scalar string
+//                         for GETs, arrays-as-is for POST bodies like
+//                         contacts' searchAfter: [ts, id]).
+//
+// Legacy single-field manifests (messages uses cursor_request_param +
+// cursor_response_field) bypass these helpers and use the simpler scalar
+// code path in each loop.
+// ---------------------------------------------------------------------------
+
+function extractNextCursor(
+  response: unknown,
+  items: ReadonlyArray<Record<string, unknown>>,
+  cfg: NonNullable<EntityManifest["backfill"]["cursor"]>,
+): Record<string, unknown> | null {
+  let source: unknown;
+  if (cfg.source === "meta") {
+    source = (response as { meta?: unknown } | null | undefined)?.meta;
+  } else {
+    source = items[items.length - 1];
+  }
+  if (source === null || source === undefined || typeof source !== "object") {
+    return null;
+  }
+  const next: Record<string, unknown> = {};
+  for (const f of cfg.fields) {
+    const v = getByPath(source, f.response_path);
+    if (v === null || v === undefined) {
+      // Incomplete cursor → treat as end-of-stream. GHL leaves the
+      // trailing cursor field off on the last page.
+      return null;
+    }
+    next[f.request_param] = v;
+  }
+  return next;
+}
+
+/**
+ * Resolve the next cursor value for any of the 3 backfill-loop call
+ * sites, dispatching on manifest shape:
+ *
+ *   backfill.cursor (structured, multi-field) → extractNextCursor
+ *   backfill.cursor_response_field (legacy scalar) → getByPath
+ *   neither                                         → null (single-page)
+ *
+ * Returned value is shaped for the cursor storage + `cursorValue`
+ * threading each loop already uses — a compound cursor comes back as
+ * a Record<string, unknown>, a legacy scalar comes back as the raw
+ * value. Both round-trip through serializeCursor / parseCursor cleanly.
+ */
+function nextCursorFrom(
+  response: unknown,
+  items: ReadonlyArray<Record<string, unknown>>,
+  backfill: EntityManifest["backfill"],
+): unknown | null {
+  if (backfill.cursor) {
+    return extractNextCursor(response, items, backfill.cursor);
+  }
+  if (backfill.cursor_response_field) {
+    const v = getByPath(response, backfill.cursor_response_field);
+    return v === undefined ? null : v;
+  }
+  return null;
+}
+
+function applyCursor(
+  query: Record<string, string | number | boolean | undefined>,
+  body: Record<string, unknown>,
+  method: "GET" | "POST",
+  cursor: Record<string, unknown>,
+  cfg: NonNullable<EntityManifest["backfill"]["cursor"]>,
+): void {
+  for (const f of cfg.fields) {
+    const v = cursor[f.request_param];
+    if (v === null || v === undefined) continue;
+    const encoding = f.encoding ?? "scalar";
+    if (method === "GET") {
+      // GETs can't carry arrays meaningfully; if an entity ever needed
+      // array-valued query params we'd JSON-stringify here. Today only
+      // POST body shapes use encoding: "array" (contacts).
+      query[f.request_param] =
+        encoding === "array"
+          ? JSON.stringify(v)
+          : typeof v === "number" || typeof v === "boolean"
+          ? v
+          : String(v);
+    } else {
+      body[f.request_param] = encoding === "array" ? v : v;
+    }
   }
 }
 
@@ -617,18 +738,35 @@ async function backfillPollFull(
   let errorMsg: string | undefined;
   let denormalizedStageRows = 0;
 
-  // poll_full starts from scratch every invocation — no prior cursor is
-  // read or persisted. Upserts are idempotent, so the old rows get
-  // refreshed in place. For cursor-paginated endpoints (opportunities,
-  // conversations) we still need to walk every page within this one
-  // invocation; "poll_full" names the freshness semantics, not the
-  // pagination shape.
+  // Bi-modal poll_full:
+  //
+  //   backfill_complete = false  — initial drain. Resume from the
+  //     persisted cursor so a 14k-row table can work through the
+  //     Cloudflare 1000-subrequest-per-invocation cap across many
+  //     cron ticks. Without this, every tick re-fetches page 1 and
+  //     the tail of the table is never reached.
+  //
+  //   backfill_complete = true   — steady-state freshness. Fetch only
+  //     page 1 (newest rows) and upsert. GHL's /conversations/search
+  //     and /opportunities/search both return newest-first, so page 1
+  //     naturally carries every freshly-updated row. Cheaper than
+  //     re-walking the entire history every 15 min.
+  //
+  // Pipelines / pipeline_stages hit the backfill_complete branch after
+  // their first (single-page) run and stay fresh off page 1, same as
+  // conversations. Their small row counts make either mode equivalent.
+  const priorState = await stub.getSyncState();
+  const priorStateRow = priorState[entity.table];
+  const isFresh = !priorStateRow?.backfill_complete;
+  const resumeCursor = isFresh && priorStateRow?.cursor ? parseCursor(priorStateRow.cursor) : null;
+  const maxPagesThisRun = isFresh ? MAX_PAGES_PER_INVOCATION : 1;
+
   try {
     await runInContext(connection, async () => {
-      let cursorValue: unknown = null;
-      let cursorSerialized: string | null = null;
+      let cursorValue: unknown = resumeCursor;
+      let cursorSerialized: string | null = resumeCursor ? serializeCursor(resumeCursor) : null;
 
-      while (pagesProcessed < MAX_PAGES_PER_INVOCATION) {
+      while (pagesProcessed < maxPagesThisRun) {
         const { query, body } = buildRequest(entity, connection.location_id, cursorValue);
         const response = await toplineFetch<Record<string, unknown>>(
           backfill.endpoint,
@@ -684,13 +822,14 @@ async function backfillPollFull(
         pagesProcessed += 1;
 
         // Single-page endpoints (pagination: "none") → we're done.
-        // Cursor-paginated endpoints → follow cursor_response_field.
+        // Cursor-paginated endpoints → route through nextCursorFrom,
+        // which handles both structured multi-field cursors and legacy
+        // scalar cursor_response_field configs.
         if (backfill.pagination !== "cursor") {
           stoppedReason = "empty_page";
           break;
         }
-        const cursorPath = backfill.cursor_response_field;
-        const nextCursor = cursorPath ? getByPath(response, cursorPath) : undefined;
+        const nextCursor = nextCursorFrom(response, items, backfill);
         if (nextCursor === null || nextCursor === undefined) {
           stoppedReason = "empty_page";
           break;
@@ -704,8 +843,13 @@ async function backfillPollFull(
         }
         cursorValue = nextCursor;
         cursorSerialized = nextSerialized;
+        // Persist resume cursor on every page so a subrequest-cap error
+        // leaves the next invocation in a usable resume position.
+        if (isFresh) {
+          await stub.setSyncCursor(entity.table, nextSerialized);
+        }
       }
-      if (pagesProcessed >= MAX_PAGES_PER_INVOCATION) {
+      if (isFresh && pagesProcessed >= maxPagesThisRun) {
         stoppedReason = "page_cap_hit";
       }
     });
@@ -718,15 +862,12 @@ async function backfillPollFull(
       : String(err);
   }
 
-  // poll_full tables are always "complete" after a successful run — the
-  // whole table's been refreshed in one shot. Mark so the cron knows to
-  // just re-invoke (no watermark filter for poll_full). Also clear any
-  // stale pagination cursor from a prior partial run of a different
-  // sync mode (defensive — poll_full shouldn't set one, but a manifest
-  // change could leave one behind). "cursor_stalled" counts as done for
-  // poll_full: GHL echoes the last-row-id back on an over-consumed
-  // cursor, which is the same end-of-stream signal as empty_page.
-  if (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") {
+  // End-of-stream markers. Only mark the backfill complete when we've
+  // actually walked every page (empty_page or cursor_stalled). page_cap_hit
+  // and error leave backfill_complete untouched so the NEXT run resumes.
+  // Once complete, steady-state freshness runs (maxPagesThisRun=1) don't
+  // need to re-flip this.
+  if (isFresh && (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled")) {
     try {
       await stub.clearSyncCursor(entity.table);
     } catch {
@@ -865,22 +1006,33 @@ export async function incrementalEntity(
     };
   }
 
-  // Gate: refuse to incremental-sync if backfill isn't complete. The
-  // watermark would miss records upstream from the partial-sync point.
+  // If the initial backfill isn't complete yet, use this cron tick to
+  // advance it instead of bailing. This is the auto-seed path: on a
+  // fresh connection the DO has zero rows for an updated_after entity,
+  // and without this delegation the cron would refuse forever and
+  // contacts / any future updated_after entity would stay empty until
+  // a human ran /sync/backfill manually.
+  //
+  // backfillEntity resumes from the prior persisted cursor, so each
+  // successive cron tick advances more pages. Once it reaches
+  // empty_page the post-run hook flips backfill_complete and the NEXT
+  // tick naturally switches to the real incremental watermark filter.
   if (!stateRow?.backfill_complete) {
+    const res = await backfillEntity(env, connectionId, entityTable);
+    const stopped: IncrementalResult["stopped_reason"] =
+      res.stopped_reason === "unsupported" ? "error" : res.stopped_reason;
     return {
       entity: entity.table,
       connection_id: connectionId,
       location_id: connection.location_id,
-      skipped: "not_complete",
-      pages: 0,
-      rows_upserted: 0,
-      row_count_after: stateRow?.row_count ?? 0,
-      watermark_before: stateRow?.watermark ?? null,
-      watermark_after: stateRow?.watermark ?? null,
-      duration_ms: Date.now() - started,
-      stopped_reason: "skipped",
-      error: `Initial backfill not complete for ${entity.table}. Run /sync/backfill?entity=${entity.table} until stopped_reason=empty_page.`,
+      pages: res.pages,
+      rows_upserted: res.rows_upserted,
+      row_count_after: res.row_count_after,
+      watermark_before: null,
+      watermark_after: null,
+      duration_ms: res.duration_ms,
+      stopped_reason: stopped,
+      ...(res.error ? { error: res.error } : {}),
     };
   }
 
@@ -1000,8 +1152,7 @@ export async function incrementalEntity(
         lastRowCount = result.row_count_after;
         pages += 1;
 
-        const cursorPath = entity.backfill.cursor_response_field;
-        const nextCursor = cursorPath ? getByPath(response, cursorPath) : undefined;
+        const nextCursor = nextCursorFrom(response, items, entity.backfill);
         if (nextCursor === null || nextCursor === undefined) {
           stoppedReason = "empty_page";
           break;
