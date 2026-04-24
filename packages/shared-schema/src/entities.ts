@@ -243,11 +243,16 @@ export const MESSAGES: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
+    // GHL's /conversations/{id}/messages wraps its response in a
+    // "messages" object, with the actual array and cursor nested one
+    // level deeper. Confirmed against live GHL:
+    //   { messages: { lastMessageId, nextPage, messages: [...] },
+    //     traceId: "..." }
     endpoint: "/conversations/{parent}/messages",
     method: "GET",
     pagination: "cursor",
-    items_field: "messages",
-    cursor_response_field: "lastMessageId",
+    items_field: "messages.messages",
+    cursor_response_field: "messages.lastMessageId",
     cursor_request_param: "lastMessageId",
     query_extras: { limit: 100 },
     per_parent: { parent_entity: "conversations", parent_fk_column: "conversation_id" },

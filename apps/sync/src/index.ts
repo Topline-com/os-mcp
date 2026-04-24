@@ -12,7 +12,13 @@
 // webhook queue consumer come in phase 1 step 3b. Every route is gated
 // by Authorization: Bearer <ADMIN_TOKEN>.
 
-import { backfillEntity, type SyncEnv, type BackfillResult } from "./backfill.js";
+import {
+  backfillEntity,
+  backfillAll,
+  DEFAULT_BACKFILL_ORDER,
+  type SyncEnv,
+  type BackfillResult,
+} from "./backfill.js";
 
 interface Env extends SyncEnv {
   ADMIN_TOKEN?: string;
@@ -40,6 +46,8 @@ export default {
         return plain(200, `Topline OS sync worker. Admin-gated endpoints only.`);
       case "/sync/backfill":
         return handleBackfill(request, env);
+      case "/sync/backfill-all":
+        return handleBackfillAll(request, env);
       case "/sync/clear-cursor":
         return handleClearCursor(request, env);
       default:
@@ -47,6 +55,30 @@ export default {
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// POST /sync/backfill-all?connection_id=<uuid>
+//
+// Runs every entity in dependency order (pipelines first, then
+// pipeline_stages, then contacts / opportunities / conversations /
+// messages / appointments). One entity's failure does not stop the
+// others — each result is reported independently. The caller
+// inspects the per-entity payload to see what succeeded.
+// ---------------------------------------------------------------------------
+async function handleBackfillAll(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  const url = new URL(request.url);
+  const connectionId = url.searchParams.get("connection_id") ?? "";
+  if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
+
+  try {
+    const results = await backfillAll(env, connectionId);
+    return json(200, { order: DEFAULT_BACKFILL_ORDER, results });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return json(500, { error: message });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // POST /sync/clear-cursor?connection_id=<uuid>&entity=contacts
