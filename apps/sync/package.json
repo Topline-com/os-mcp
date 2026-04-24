@@ -8,7 +8,8 @@
     "build": "tsc --noEmit",
     "worker:dev": "wrangler dev",
     "worker:deploy": "wrangler deploy",
-    "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json"
+    "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
+    "test": "tsx --test src/mapping.test.ts"
   },
   "dependencies": {
     "@topline/shared": "*",
@@ -19,6 +20,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240405.0",
     "@types/node": "^20.12.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.0",
     "wrangler": "^3.60.0"
   },

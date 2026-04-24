@@ -64,6 +64,21 @@ export interface ColumnDef {
    * defaults to the column name.
    */
   source_path?: string;
+
+  /**
+   * How the upstream value represents a timestamp. Sync's mapRow
+   * normalizes all variants to ISO 8601 strings before writing into
+   * the DO so WHERE / ORDER BY / strftime(...) work consistently
+   * across every timestamp column, regardless of what GHL returned.
+   *
+   *   "iso8601"  — upstream is already an ISO string; passed through
+   *   "ms_epoch" — upstream is a Unix millisecond epoch number
+   *
+   * Omitting the flag disables conversion; the value passes through
+   * unchanged (and coerceForSqlite handles stringification for TEXT
+   * columns). Only applies to columns whose sqlite_type is TEXT.
+   */
+  timestamp_format?: "iso8601" | "ms_epoch";
 }
 
 // ---------------------------------------------------------------------------

@@ -147,9 +147,13 @@ export const OPPORTUNITIES: EntityManifest = {
     { name: "assigned_to", sqlite_type: "TEXT", nullable: true, description: "", references: "users.id", source_path: "assignedTo" },
     { name: "source", sqlite_type: "TEXT", nullable: true, description: "Attribution source." },
     { name: "lost_reason_id", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lostReasonId" },
-    { name: "last_status_change_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the last status change.", source_path: "lastStatusChangeAt" },
-    CREATED_AT,
-    UPDATED_AT,
+    { name: "last_status_change_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the last status change.", source_path: "lastStatusChangeAt", timestamp_format: "iso8601" },
+    { name: "last_stage_change_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the last pipeline-stage change.", source_path: "lastStageChangeAt", timestamp_format: "iso8601" },
+    // GHL's /opportunities/search response uses camelCase createdAt / updatedAt
+    // (ISO strings) — NOT the dateAdded / dateUpdated convention contacts
+    // uses. Overriding the shared CREATED_AT / UPDATED_AT constants here.
+    { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the opportunity was created upstream.", source_path: "createdAt", timestamp_format: "iso8601" },
+    { name: "updated_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the most recent mutation upstream.", indexed: true, source_path: "updatedAt", timestamp_format: "iso8601" },
     SYNCED_AT,
   ],
   backfill: {
@@ -212,9 +216,12 @@ export const CONVERSATIONS: EntityManifest = {
     { name: "inbox", sqlite_type: "INTEGER", nullable: true, description: "0 or 1." },
     { name: "last_message_type", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lastMessageType" },
     { name: "last_message_body", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lastMessageBody" },
-    { name: "last_message_date", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "lastMessageDate" },
-    CREATED_AT,
-    UPDATED_AT,
+    { name: "last_message_date", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "lastMessageDate", timestamp_format: "ms_epoch" },
+    // GHL's /conversations/search returns dateAdded / dateUpdated as
+    // Unix millisecond epoch NUMBERS, not ISO strings like contacts.
+    // timestamp_format: ms_epoch tells sync's mapRow to normalize to ISO.
+    { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the conversation was created upstream.", source_path: "dateAdded", timestamp_format: "ms_epoch" },
+    { name: "updated_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the most recent mutation upstream.", indexed: true, source_path: "dateUpdated", timestamp_format: "ms_epoch" },
     SYNCED_AT,
   ],
   backfill: {
@@ -266,12 +273,16 @@ export const MESSAGES: EntityManifest = {
     LOCATION_ID,
     { name: "conversation_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "conversations.id", source_path: "conversationId" },
     { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
-    { name: "type", sqlite_type: "TEXT", nullable: true, description: "Channel.", enum: ["TYPE_PHONE", "TYPE_EMAIL", "TYPE_WHATSAPP", "TYPE_FB", "TYPE_IG", "TYPE_CUSTOM", "TYPE_LIVE_CHAT", "TYPE_SMS"] },
+    // GHL returns BOTH `type` (integer numeric code like 1/2/28) and
+    // `messageType` (semantic string like "TYPE_CALL"/"TYPE_SMS"/
+    // "TYPE_LIVE_CHAT") on every message. Source the semantic string
+    // so LLMs can write readable WHERE clauses without a code lookup.
+    { name: "type", sqlite_type: "TEXT", nullable: true, description: "Channel (semantic name).", enum: ["TYPE_CALL", "TYPE_SMS", "TYPE_EMAIL", "TYPE_WHATSAPP", "TYPE_FB", "TYPE_IG", "TYPE_CUSTOM", "TYPE_LIVE_CHAT", "TYPE_REVIEW", "TYPE_IVR_CALL", "TYPE_SMS_REVIEW_REQUEST", "TYPE_WEBCHAT"], source_path: "messageType" },
     { name: "direction", sqlite_type: "TEXT", nullable: true, description: "", enum: ["inbound", "outbound"] },
     { name: "status", sqlite_type: "TEXT", nullable: true, description: "Delivery / interaction status." },
     { name: "body", sqlite_type: "TEXT", nullable: true, description: "Message body (SMS text, email plain body, etc.)." },
     { name: "attachments", sqlite_type: "TEXT", nullable: true, json: true, description: "JSON array of attachment URLs." },
-    { name: "date_added", sqlite_type: "TEXT", nullable: true, description: "ISO 8601. Primary time axis for messages.", indexed: true, source_path: "dateAdded" },
+    { name: "date_added", sqlite_type: "TEXT", nullable: true, description: "ISO 8601. Primary time axis for messages.", indexed: true, source_path: "dateAdded", timestamp_format: "iso8601" },
     SYNCED_AT,
   ],
   backfill: {

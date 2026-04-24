@@ -644,6 +644,10 @@ function quoteIdent(name: string): string {
  *   - JSON columns: stringify non-strings (pass strings through unchanged)
  *   - booleans: 0 or 1 (SQLite has no native bool)
  *   - null/undefined: null
+ *   - numbers into TEXT columns: explicitly String()-ify to avoid CF's
+ *     SQL binding layer formatting the JS float as "28.0" instead of "28"
+ *     (JavaScript has one Number type; the binding can't tell the
+ *     caller's intent without the column type as context)
  *   - anything else non-primitive: String()
  * The sync worker SHOULD pass clean values; this is defensive coercion so
  * a GHL payload shape change can't crash the upsert.
@@ -654,7 +658,14 @@ function coerceForSqlite(col: ColumnDef, value: unknown): SqlStorageValue {
     return typeof value === "string" ? value : JSON.stringify(value);
   }
   if (typeof value === "boolean") return value ? 1 : 0;
-  if (typeof value === "string" || typeof value === "number") return value;
+  if (typeof value === "number") {
+    // Number → TEXT: stringify explicitly so integers stay integers
+    // (String(28) === "28", not "28.0"). For INTEGER / REAL columns
+    // let the binding layer handle it natively.
+    if (col.sqlite_type === "TEXT") return String(value);
+    return value;
+  }
+  if (typeof value === "string") return value;
   if (value instanceof ArrayBuffer) return value;
   return String(value);
 }
