@@ -77,7 +77,9 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   { name: "users", category: "Metadata", description: "Sub-account users (owners, reps, agents). Join target for assigned_to / assigned_user_id columns.", status: "catalogued", endpoint: "/users/", notes: "Edge tool already exists; manifest pending." },
   { name: "tags", category: "Metadata", description: "Tag taxonomy for the sub-account. Contact tags are stored as JSON arrays on contacts.tags.", status: "catalogued", endpoint: "/locations/{locationId}/tags", notes: "Small table; poll_full daily is sufficient." },
   { name: "custom_fields", category: "Metadata", description: "Custom field definitions (name, dataType, picklistOptions). Contact values stored on contacts.custom_fields as a JSON array of {id,value} pairs.", status: "catalogued", endpoint: "/locations/{locationId}/customFields" },
-  { name: "custom_values", category: "Metadata", description: "Sub-account-scoped key/value pairs (not per-contact). Useful for {{custom_values.X}} merge tags.", status: "catalogued", endpoint: "/locations/{locationId}/customValues" },
+  // custom_values is now a full entity with CRUD tools; buildCatalog
+  // merges the manifest and dedupes static entries. Keeping a stub
+  // entry here would shadow the live status.
   { name: "custom_objects", category: "Platform", description: "User-defined object types beyond contacts/opportunities (e.g. 'Properties', 'Projects'). Records live under custom_object_records.", status: "requires_oauth", notes: "Custom objects API is marketplace-app scoped; PIT responses 401/404." },
   { name: "custom_object_records", category: "Platform", description: "Individual rows of a custom_objects type.", status: "requires_oauth" },
   { name: "associations", category: "Platform", description: "Cross-object relations (opportunity↔property, contact↔deal, etc.).", status: "requires_oauth" },
@@ -123,8 +125,26 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   // Activity / work
   { name: "tasks", category: "Activity", description: "Tasks attached to contacts (title, dueDate, completed).", status: "catalogued", endpoint: "/contacts/{contactId}/tasks" },
   { name: "notes", category: "Activity", description: "Free-form notes per contact.", status: "catalogued", endpoint: "/contacts/{contactId}/notes" },
-  { name: "workflows", category: "Activity", description: "Workflow definitions (automation flows).", status: "catalogued", endpoint: "/workflows/" },
+  // workflows is synced as a shallow entity (id/name/status/version).
+  // Internals (triggers, actions, branches, filters) are NOT in GHL's
+  // public v2 API under any auth — not PIT, not marketplace OAuth at
+  // the current docs level. Reference-extraction ("which workflows
+  // touch tag X") is blocked upstream until GHL opens the surface or
+  // we build a scraping path via the admin UI (out of scope).
+  { name: "workflow_internals", category: "Activity", description: "Workflow triggers, actions, branches, filters, and step configs.", status: "requires_oauth", notes: "Probed 2026-04-24: GET /workflows/ returns only {id, name, status, version, timestamps}. GET /workflows/{id} does not exist. POST/PUT/DELETE on /workflows/* 401 'not authorized for this scope' under PIT. Workflow authoring and inspection are UI-only today." },
   { name: "workflow_events", category: "Activity", description: "Per-contact workflow enrollment + step-execution history.", status: "requires_oauth", notes: "Detailed execution events are marketplace-scoped." },
+  // Pipeline writes: probed 2026-04-24 under PIT — all
+  // POST/PUT/DELETE on /opportunities/pipelines/* return 401 'not
+  // authorized for this scope'. Requires marketplace OAuth scope.
+  { name: "pipeline_writes", category: "Pipelines", description: "Creating, updating, deleting pipelines and pipeline stages.", status: "requires_oauth", notes: "Probed 2026-04-24: 401 on POST/PUT/DELETE /opportunities/pipelines/*. Reads are fine (pipelines + pipeline_stages are synced tables)." },
+  // Forms / surveys writes: probed 2026-04-24 — POST/DELETE return
+  // 401 'not yet supported by the IAM Service', PUT returns 404.
+  { name: "form_writes", category: "Lead capture", description: "Create/update/delete form definitions.", status: "requires_oauth", notes: "Probed 2026-04-24: POST /forms/ and DELETE /forms/{id} 401 'not yet supported by IAM Service'. PUT /forms/{id} 404 (route not wired)." },
+  { name: "survey_writes", category: "Lead capture", description: "Create/update/delete survey definitions.", status: "requires_oauth", notes: "Probed 2026-04-24: same pattern as forms — 401 / 404." },
+  // Calendar CREATE: POST /calendars/ returns 403 'token does not have
+  // access to this location' even though reads work. Update/delete
+  // are fine (shipped).
+  { name: "calendar_create", category: "Scheduling", description: "Creating new calendars.", status: "requires_oauth", notes: "Probed 2026-04-24: POST /calendars/ 403 'token does not have access to this location'. Update/delete ship as topline_update_calendar / topline_delete_calendar." },
   { name: "campaigns", category: "Activity", description: "Legacy campaign definitions (pre-workflow).", status: "catalogued", endpoint: "/campaigns/" },
   { name: "trigger_links", category: "Activity", description: "Trackable short links; click events feed attribution.", status: "catalogued" },
 

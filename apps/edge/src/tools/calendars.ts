@@ -104,4 +104,51 @@ export const tools: ToolDef[] = [
     handler: async (args) =>
       toplineFetch(`/calendars/events/appointments/${args.appointmentId}`, { method: "DELETE" }),
   },
+
+  // Calendar-definition writes. Live-probed 2026-04-24 under PIT:
+  //   PUT    /calendars/{id}  → reachable (400 on bad id means handler ran)
+  //   DELETE /calendars/{id}  → reachable
+  //   POST   /calendars/      → 403 "token does not have access to this location"
+  //                              (requires marketplace OAuth scope; omitted here)
+  {
+    name: "topline_get_calendar",
+    description:
+      "Get the full calendar definition (availability rules, team members, slot duration, etc.).",
+    inputSchema: obj({ calendarId }, ["calendarId"]),
+    handler: async (args) => toplineFetch(`/calendars/${args.calendarId}`),
+  },
+  {
+    name: "topline_update_calendar",
+    description:
+      "Update a calendar's name, description, slot duration, availability, team members, or event title. Pass only the fields you want to change. The calendar must already exist — calendar CREATE is not available under PIT (marketplace OAuth only).",
+    inputSchema: obj(
+      {
+        calendarId,
+        name: str("New calendar name"),
+        description: str("New description"),
+        slug: str("URL slug (shows in public booking URLs)"),
+        isActive: { type: "boolean", description: "Enable / disable the calendar" },
+        slotDuration: num("Appointment length in minutes"),
+        slotBuffer: num("Buffer (minutes) between appointments"),
+        eventTitle: str("Default event title template"),
+        eventColor: str("Hex color shown in the UI"),
+        appoinmentPerSlot: num("Max concurrent bookings per slot"),
+        allowReschedule: { type: "boolean" },
+        allowCancellation: { type: "boolean" },
+      },
+      ["calendarId"],
+    ),
+    handler: async (args) => {
+      const { calendarId: cid, ...body } = args;
+      return await toplineFetch(`/calendars/${cid}`, { method: "PUT", body });
+    },
+  },
+  {
+    name: "topline_delete_calendar",
+    description:
+      "Delete a calendar. All future appointments on this calendar are cancelled. Past appointments are retained as historical records.",
+    inputSchema: obj({ calendarId }, ["calendarId"]),
+    handler: async (args) =>
+      toplineFetch(`/calendars/${args.calendarId}`, { method: "DELETE" }),
+  },
 ];

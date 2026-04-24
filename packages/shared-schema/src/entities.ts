@@ -777,6 +777,54 @@ export const CALENDARS: EntityManifest = {
   exposed: true,
 };
 
+/**
+ * WORKFLOWS — shallow sync (id/name/status/version/timestamps).
+ *
+ * GHL's public API exposes only the list endpoint (GET /workflows/) and
+ * it returns this shape. There is NO GET /workflows/{id} with config
+ * details in v2 public — triggers, actions, filters, branches are not
+ * part of any public surface. Workflow authoring stays UI-only.
+ *
+ * This manifest exists so SQL can answer "how many active workflows"
+ * and "list workflow names by status" without a GHL round-trip. It
+ * does NOT enable reference extraction (cataloging which workflows
+ * touch which tags/custom-fields/etc.) — that would require workflow
+ * internals we cannot access.
+ */
+export const WORKFLOWS: EntityManifest = {
+  table: "workflows",
+  description: "Workflow definitions (id/name/status/version/timestamps). Shallow — internal config (triggers, actions, branches) is NOT accessible via GHL's public API; that would require a marketplace OAuth app.",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable workflow ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Display name.", indexed: true },
+    { name: "status", sqlite_type: "TEXT", nullable: true, description: "'published' | 'draft' (live values observed).", indexed: true },
+    { name: "version", sqlite_type: "INTEGER", nullable: true, description: "Workflow version counter; bumps on edit." },
+    { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", source_path: "createdAt", timestamp_format: "iso8601" },
+    { name: "updated_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "updatedAt", timestamp_format: "iso8601" },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/workflows/",
+    method: "GET",
+    pagination: "none",
+    items_field: "workflows",
+  },
+  incremental: { type: "poll_full", poll_interval_minutes: 60, filter_ready: true },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Shallow-only. Workflow configs are NOT exposed by GHL's public v2 API under any auth type we can use (PIT or marketplace OAuth). Reference-extraction (which workflows touch which tag/field/calendar) is blocked upstream.",
+  },
+  exposed: true,
+};
+
 export const CALENDAR_GROUPS: EntityManifest = {
   table: "calendar_groups",
   description: "Groupings of calendars for team booking pages (round-robin, collective).",
@@ -1065,6 +1113,7 @@ export const ALL_ENTITIES: readonly EntityManifest[] = [
   CUSTOM_VALUES,
   FORMS,
   SURVEYS,
+  WORKFLOWS,
   CONTACTS,
   OPPORTUNITIES,
   CONVERSATIONS,

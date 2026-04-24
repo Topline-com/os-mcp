@@ -22,6 +22,7 @@ import { tools as pingTools } from "./tools/ping.js";
 import { tools as setupCheckTools } from "./tools/setup_check.js";
 import { tools as passthroughTools } from "./tools/passthrough.js";
 import { tools as sqlTools } from "./tools/sql.js";
+import { tools as referenceTools } from "./tools/references.js";
 import { tools as contactTools } from "./tools/contacts.js";
 import { tools as conversationTools } from "./tools/conversations.js";
 import { tools as opportunityTools } from "./tools/opportunities.js";
@@ -29,6 +30,7 @@ import { tools as calendarTools } from "./tools/calendars.js";
 import { tools as taskTools } from "./tools/tasks.js";
 import { tools as noteTools } from "./tools/notes.js";
 import { tools as customFieldTools } from "./tools/custom_fields.js";
+import { tools as customValueTools } from "./tools/custom_values.js";
 import { tools as workflowTools } from "./tools/workflows.js";
 import { tools as tagTools } from "./tools/tags.js";
 import { tools as locationTools } from "./tools/locations.js";
@@ -52,6 +54,7 @@ export const ACTION_TOOLS: ToolDef[] = [
   ...taskTools,
   ...noteTools,
   ...customFieldTools,
+  ...customValueTools,
   ...workflowTools,
   ...tagTools,
   ...locationTools,
@@ -66,6 +69,7 @@ export const ACTION_TOOLS: ToolDef[] = [
  */
 export const ANALYTICS_TOOLS: ToolDef[] = [
   ...sqlTools,
+  ...referenceTools,
 ];
 
 /**
