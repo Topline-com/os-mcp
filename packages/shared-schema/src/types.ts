@@ -225,6 +225,27 @@ export interface BackfillDescriptor {
      * into the endpoint path via {parent}.
      */
     request_param?: string;
+    /**
+     * Steady-state sweep mode. When true, after the initial drain
+     * completes the cron's incremental path ignores the parent-
+     * freshness signal (`last_sync_at < parent.updated_at`) and
+     * instead rotates through ALL parents ordered by oldest last
+     * sync first, picking up to MAX_PARENTS_PER_INVOCATION per tick.
+     *
+     * Needed when the parent's freshness column doesn't actually
+     * track child-entity mutations. Canonical case: appointments
+     * fan out over calendars, but calendars.updated_at bumps only
+     * on calendar-definition edits — not on new bookings /
+     * cancellations. Without sweep mode, the active-parent
+     * selector never re-visits any calendar after the first drain,
+     * and new appointments never land.
+     *
+     * Cost: O(parents) GET calls per cron tick. Fine for small
+     * parent tables (91 calendars = 91 subrequests, well under
+     * Cloudflare's 1000 cap). Not appropriate for parent tables
+     * numbering in the thousands — those need a real watermark.
+     */
+    steady_state_sweep?: boolean;
   };
 }
 

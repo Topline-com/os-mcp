@@ -29,6 +29,7 @@ import {
   PARENT_GET_DRAIN_START,
   parentPruneChildrenSql,
   nextParentsForChildSql,
+  sweepParentsForChildSql,
   refreshRowCountSql,
 } from "./parent-sync-sql.js";
 
@@ -139,6 +140,17 @@ function getNextParentsForChild(
 ): string[] {
   const rows = db
     .prepare(nextParentsForChildSql(parentTable, freshnessColumns))
+    .all(childEntity, limit) as Array<{ id: string }>;
+  return rows.map((r) => r.id);
+}
+
+function getSweepParentsForChild(
+  childEntity: string,
+  parentTable: string,
+  limit: number,
+): string[] {
+  const rows = db
+    .prepare(sweepParentsForChildSql(parentTable))
     .all(childEntity, limit) as Array<{ id: string }>;
   return rows.map((r) => r.id);
 }
@@ -328,6 +340,65 @@ describe("parent-sync state machine", () => {
         .prepare(`SELECT row_count FROM _sync_state WHERE entity = 'tasks'`)
         .get() as { row_count: number };
       strictEqual(cached.row_count, 42, "row_count untouched when nothing pruned");
+    });
+  });
+
+  describe("getSweepParentsForChild — steady-state sweep selector", () => {
+    it("returns all parents ordered by oldest last_sync_at, ignoring backfill_complete", () => {
+      // Seed 3 parents in the surrogate "contacts" table.
+      db.prepare(`INSERT INTO contacts(id, updated_at) VALUES ('A','2026-04-01'),('B','2026-04-01'),('C','2026-04-01')`).run();
+      // Mark all three COMPLETE with different last_sync_at values.
+      // Activity-driven selector would return ZERO (all complete,
+      // no freshness bump). Sweep selector must return all three
+      // in last_sync_at-ascending order.
+      markParentBackfillComplete("tasks", "A", "tasks", "contact_id", "2026-04-24T10:00:00.000Z");
+      markParentBackfillComplete("tasks", "B", "tasks", "contact_id", "2026-04-24T09:00:00.000Z");
+      markParentBackfillComplete("tasks", "C", "tasks", "contact_id", "2026-04-24T11:00:00.000Z");
+
+      const activeOnly = getNextParentsForChild("tasks", "contacts", 10, ["updated_at"]);
+      deepStrictEqual(
+        activeOnly,
+        [],
+        "activity-driven selector returns empty when parents are complete and freshness hasn't bumped — this is the bug the sweep mode addresses",
+      );
+
+      const sweep = getSweepParentsForChild("tasks", "contacts", 10);
+      deepStrictEqual(
+        sweep,
+        ["B", "A", "C"],
+        "sweep ignores backfill_complete, orders by oldest last_sync_at first — rotates through every parent regardless of freshness signal",
+      );
+    });
+
+    it("respects the limit parameter for batching across ticks", () => {
+      db.prepare(`INSERT INTO contacts(id, updated_at) VALUES ('p1','2026-04-01'),('p2','2026-04-01'),('p3','2026-04-01'),('p4','2026-04-01'),('p5','2026-04-01')`).run();
+      // All complete with staggered timestamps.
+      for (let i = 1; i <= 5; i++) {
+        markParentBackfillComplete(
+          "tasks",
+          `p${i}`,
+          "tasks",
+          "contact_id",
+          `2026-04-24T1${i}:00:00.000Z`,
+        );
+      }
+      const batch1 = getSweepParentsForChild("tasks", "contacts", 2);
+      strictEqual(batch1.length, 2);
+      deepStrictEqual(batch1, ["p1", "p2"], "oldest two by last_sync_at");
+    });
+
+    it("includes parents that have NEVER been synced (null last_sync_at sorts first)", () => {
+      db.prepare(`INSERT INTO contacts(id, updated_at) VALUES ('synced','2026-04-01'),('virgin','2026-04-01')`).run();
+      markParentBackfillComplete(
+        "tasks",
+        "synced",
+        "tasks",
+        "contact_id",
+        "2026-04-24T12:00:00.000Z",
+      );
+      // 'virgin' has no _parent_sync_state row at all.
+      const sweep = getSweepParentsForChild("tasks", "contacts", 10);
+      strictEqual(sweep[0], "virgin", "NULL last_sync_at sorts before any real timestamp via COALESCE(_, '')");
     });
   });
 });

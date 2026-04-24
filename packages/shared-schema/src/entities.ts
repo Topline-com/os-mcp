@@ -527,6 +527,14 @@ export const APPOINTMENTS: EntityManifest = {
       parent_entity: "calendars",
       parent_fk_column: "calendar_id",
       request_param: "calendarId",
+      // Sweep mode: after the initial drain, calendars.updated_at is
+      // NOT a valid freshness signal for "this calendar got new
+      // appointments" (it bumps on calendar-definition edits only,
+      // not on booking events). Without sweep, the default active-
+      // parent selector would never re-visit any calendar after the
+      // first drain. 91 calendars × 1 GHL call per 15-min tick is
+      // well under Cloudflare's 1000-subrequest cap.
+      steady_state_sweep: true,
     },
     query_extras: {
       startTime: "1577836800000", // 2020-01-01T00:00:00Z

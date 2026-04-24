@@ -60,6 +60,11 @@ type LocationDOStub = {
     limit: number,
     freshnessColumns?: readonly string[],
   ): Promise<string[]>;
+  getSweepParentsForChild(
+    childEntity: string,
+    parentTable: string,
+    limit: number,
+  ): Promise<string[]>;
   getParentSyncCursor(entity: string, parentId: string): Promise<string | null>;
   setParentSyncCursor(entity: string, parentId: string, cursor: string): Promise<void>;
   ensureParentDrainMarker(entity: string, parentId: string): Promise<string>;
@@ -924,15 +929,43 @@ async function backfillPerParent(
   const stub = locationStub(env.LOCATION_DO, connection.location_id);
   const fkColumn = backfill.per_parent.parent_fk_column;
 
-  // Pull the next batch of parents to process. The DO RPC prioritizes
-  // parents that aren't complete yet, then parents whose freshness
-  // column has advanced since their last sync.
-  const parentIds = await stub.getNextParentsForChild(
-    entity.table,
-    parentEntity.table,
-    MAX_PARENTS_PER_INVOCATION,
-    parentFreshnessColumns(parentEntity),
-  );
+  // Pull the next batch of parents to process.
+  //
+  // Two selectors:
+  //
+  //   (A) Activity-driven [default]: prioritize incomplete parents,
+  //       then parents whose freshness column advanced since
+  //       last_sync_at. Efficient for entities whose parent table
+  //       genuinely tracks child mutations (messages →
+  //       conversations.last_message_date).
+  //
+  //   (B) Sweep [per_parent.steady_state_sweep=true]: once the
+  //       initial drain is done, rotate through every parent oldest-
+  //       sync-first regardless of freshness. Needed when the parent
+  //       freshness signal doesn't correlate with child mutations
+  //       (appointments → calendars.updated_at is orthogonal to new
+  //       bookings). Cost: O(parents) GHL calls per tick.
+  //
+  // Before the entity-level backfill completes, mode (A) applies
+  // regardless — sweep only kicks in for the post-drain steady state.
+  const priorState = await stub.getSyncState();
+  const priorStateRow = priorState[entity.table];
+  const doneInitialDrain = priorStateRow?.backfill_complete === true;
+  const sweepMode =
+    doneInitialDrain && backfill.per_parent.steady_state_sweep === true;
+
+  const parentIds = sweepMode
+    ? await stub.getSweepParentsForChild(
+        entity.table,
+        parentEntity.table,
+        MAX_PARENTS_PER_INVOCATION,
+      )
+    : await stub.getNextParentsForChild(
+        entity.table,
+        parentEntity.table,
+        MAX_PARENTS_PER_INVOCATION,
+        parentFreshnessColumns(parentEntity),
+      );
 
   if (parentIds.length === 0) {
     // No remaining parents needing work this tick. Flip the entity-
@@ -1871,6 +1904,7 @@ export const DEFAULT_INCREMENTAL_ORDER: readonly string[] = [
   "survey_submissions",
   "tasks", // per-parent over contacts
   "notes", // per-parent over contacts
+  "appointments", // per-parent over calendars, sweep mode
 ];
 
 export async function incrementalAll(

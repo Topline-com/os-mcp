@@ -167,3 +167,38 @@ export function refreshRowCountSql(table: string): { select: string; update: str
     update: `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
   };
 }
+
+/**
+ * Steady-state sweep selector.
+ *
+ * nextParentsForChildSql picks parents that are incomplete OR whose
+ * freshness column advanced past last_sync_at. That's correct when the
+ * parent table genuinely tracks child-entity mutations
+ * (conversations.last_message_date bumps on every new message). It's
+ * WRONG when the parent freshness signal doesn't track child activity
+ * — canonical case: calendars.updated_at doesn't bump on new
+ * appointments, so the active-parent selector never picks up a
+ * calendar after its first drain.
+ *
+ * This SQL is the sweep alternative: after the initial drain, rotate
+ * through every parent ordered by oldest last_sync_at first. Each
+ * tick visits up to LIMIT parents, re-fetches their children, and
+ * snapshot-and-swap prunes any that disappeared upstream.
+ *
+ * Params at runtime: (limit). Entity name is not filtered on because
+ * sweep is opt-in per-entity via per_parent.steady_state_sweep — the
+ * caller decides when to use this vs nextParentsForChildSql.
+ */
+export function sweepParentsForChildSql(parentTable: string): string {
+  // Runtime params: (childEntity, limit). Matches the binding order
+  // nextParentsForChildSql uses so the DO RPC signature stays
+  // consistent across the two modes.
+  return `
+    SELECT p.id
+      FROM ${parentTable} p
+      LEFT JOIN _parent_sync_state s
+        ON s.entity = ? AND s.parent_id = p.id
+     ORDER BY COALESCE(s.last_sync_at, ''), p.id
+     LIMIT ?
+  `;
+}

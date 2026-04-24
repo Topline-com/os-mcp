@@ -35,18 +35,18 @@ type Kind = (typeof SUPPORTED_KINDS)[number];
 
 /**
  * Hard cap on the total number of references returned per tool call.
- * Each per-branch SQL has its own LIMIT 500 to stay under Cloudflare's
- * DO compound-SELECT cap; here we also enforce a final global cap
- * across concatenated results and set `truncated` accordingly. Prior
- * behavior could return 1500+ rows from the "contact" kind while
- * still reporting truncated=false.
+ * The handler slices concatenated results to this size after running
+ * every branch; prior behavior could return 1500+ rows from the
+ * "contact" kind while still reporting truncated=false.
  */
 const GLOBAL_RESULT_CAP = 500;
 /**
- * Per-branch SQL LIMIT. Kept one above GLOBAL_RESULT_CAP so a single
- * branch returning its entire LIMIT is detectable — if the branch
- * filled 501 rows, upstream had at least 501 and `truncated` must
- * fire.
+ * Per-branch SQL LIMIT, interpolated into every kind's SQL. Set one
+ * above GLOBAL_RESULT_CAP so a single branch returning its entire
+ * LIMIT is detectable — if the branch filled 501 rows, upstream had
+ * at least 501 and `truncated` must fire. Without this, a kind with
+ * 1185 upstream matches would return exactly 500 rows (at the SQL
+ * LIMIT) and incorrectly report truncated=false.
  */
 const PER_BRANCH_SQL_LIMIT = 501;
 
@@ -110,7 +110,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('tags', c.tags) AS extra
             FROM contacts c, target, json_each(c.tags) je
            WHERE je.value = target.name
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id, id],
       });
@@ -125,7 +125,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('value', json_extract(je.value, '$.value')) AS extra
             FROM contacts c, json_each(c.custom_fields) je
            WHERE json_extract(je.value, '$.id') = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id],
       });
@@ -163,7 +163,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('position', "position") AS extra
             FROM pipeline_stages
            WHERE pipeline_id = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id, id],
       });
@@ -176,15 +176,15 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('status', status, 'pipeline_id', pipeline_id) AS extra
             FROM opportunities
            WHERE pipeline_stage_id = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id],
       });
     case "calendar":
-      // Appointments on this calendar. appointments is currently hidden
-      // in the customer gate, but the DO still stores it — we SELECT
-      // from the exposed projection via raw_payload fallback where
-      // needed. For safety we only expose the id + minimal summary.
+      // Appointments on this calendar. appointments is now fully
+      // synced (per-parent over calendars with steady_state_sweep)
+      // and exposed, so a calendar delete no longer silently
+      // orphans live bookings — this query returns a real count.
       return wrap({
         sql: `
           SELECT 'appointments' AS "table",
@@ -193,7 +193,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('start_time', start_time, 'status', status) AS extra
             FROM appointments
            WHERE calendar_id = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id],
       });
@@ -215,7 +215,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                    COALESCE(email, phone, first_name || ' ' || last_name, id) AS summary,
                    json_object('type', type) AS extra
               FROM contacts WHERE assigned_to = ?
-             LIMIT 500
+             LIMIT ${PER_BRANCH_SQL_LIMIT}
           `,
           params: [id, id],
         },
@@ -232,7 +232,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                    COALESCE(substr(body, 1, 60), type, id) AS summary,
                    json_object('type', type, 'direction', direction, 'date_added', date_added) AS extra
               FROM messages WHERE user_id = ?
-             LIMIT 500
+             LIMIT ${PER_BRANCH_SQL_LIMIT}
           `,
           params: [id, id],
         },
@@ -261,7 +261,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                    COALESCE(substr(body, 1, 60), type, id) AS summary,
                    json_object('type', type, 'direction', direction, 'date_added', date_added) AS extra
               FROM messages WHERE contact_id = ?
-             LIMIT 500
+             LIMIT ${PER_BRANCH_SQL_LIMIT}
           `,
           params: [id, id, id],
         },
@@ -278,7 +278,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                    COALESCE(title, id) AS summary,
                    json_object('due_date', due_date, 'completed', completed) AS extra
               FROM tasks WHERE contact_id = ?
-             LIMIT 500
+             LIMIT ${PER_BRANCH_SQL_LIMIT}
           `,
           params: [id, id],
         },
@@ -295,7 +295,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                    COALESCE(email, name, id) AS summary,
                    json_object('form_id', form_id, 'created_at', created_at) AS extra
               FROM form_submissions WHERE contact_id = ?
-             LIMIT 500
+             LIMIT ${PER_BRANCH_SQL_LIMIT}
           `,
           params: [id, id],
         },
@@ -333,7 +333,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  COALESCE(c.email, c.phone, c.first_name || ' ' || c.last_name, c.id) AS summary,
                  json_object('link', 'contact_of_opportunity') AS extra
             FROM contacts c WHERE c.id = (SELECT contact_id FROM opportunities WHERE id = ?)
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id, id, id, id],
       });
@@ -346,7 +346,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('contact_id', contact_id, 'created_at', created_at) AS extra
             FROM form_submissions
            WHERE form_id = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id],
       });
@@ -359,7 +359,7 @@ function queryFor(kind: Kind, id: string): Array<{ sql: string; params: unknown[
                  json_object('contact_id', contact_id, 'created_at', created_at) AS extra
             FROM survey_submissions
            WHERE survey_id = ?
-           LIMIT 500
+           LIMIT ${PER_BRANCH_SQL_LIMIT}
         `,
         params: [id],
       });

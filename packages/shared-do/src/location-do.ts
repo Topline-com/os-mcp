@@ -54,6 +54,7 @@ import {
   PARENT_GET_DRAIN_START,
   parentPruneChildrenSql,
   nextParentsForChildSql,
+  sweepParentsForChildSql,
   refreshRowCountSql,
 } from "./parent-sync-sql.js";
 
@@ -777,6 +778,45 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     const rows = this.ctx.storage.sql
       .exec<{ id: string }>(
         nextParentsForChildSql(parentTable, freshnessColumns),
+        childEntity,
+        capped,
+      )
+      .toArray();
+    return rows.map((r) => String(r.id));
+  }
+
+  /**
+   * Steady-state sweep variant of getNextParentsForChild.
+   *
+   * Returns the N oldest-synced parents regardless of the parent
+   * table's freshness signal. Used by per_parent entities where the
+   * parent's updated_at doesn't track child-entity mutations —
+   * appointments fan out over calendars, but calendars.updated_at
+   * doesn't bump on new bookings, so the activity-driven selector
+   * never re-visits. Sweep mode rotates through every parent so new
+   * children land eventually, and snapshot-and-swap inside
+   * markParentBackfillComplete prunes children that disappeared
+   * upstream.
+   *
+   * Only safe for small parent tables (91 calendars is fine; 16k
+   * contacts would cost 16k GHL calls per full rotation). Opt-in
+   * via per_parent.steady_state_sweep on the manifest; the sync
+   * worker dispatches to this RPC only when that flag is set AND
+   * the entity has completed its initial drain.
+   */
+  async getSweepParentsForChild(
+    childEntity: string,
+    parentTable: string,
+    limit: number,
+  ): Promise<string[]> {
+    this.ensureInitialized();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(parentTable)) {
+      throw new Error(`Invalid parent table identifier: ${parentTable}`);
+    }
+    const capped = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        sweepParentsForChildSql(parentTable),
         childEntity,
         capped,
       )
