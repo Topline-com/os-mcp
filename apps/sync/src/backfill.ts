@@ -218,7 +218,7 @@ async function backfillStandardCursor(
       while (pages < MAX_PAGES_PER_INVOCATION) {
         const { query, body } = buildRequest(entity, connection.location_id, cursorValue);
         const response = await toplineFetch<Record<string, unknown>>(
-          backfill.endpoint,
+          resolveEndpoint(backfill.endpoint, connection.location_id),
           buildFetchOptions(entity, query, body),
         );
 
@@ -400,14 +400,26 @@ function buildRequest(
     }
   }
 
-  // Location always scopes the request. The parameter name defaults to
-  // "locationId" (camelCase) but opportunities etc. use snake_case — the
-  // manifest overrides per-entity via location_param_name.
-  const locParamName = backfill.location_param_name ?? "locationId";
-  if (backfill.method === "GET") {
-    query[locParamName] = locationId;
-  } else {
-    body[locParamName] = locationId;
+  // Location scopes the request. Two shapes:
+  //   (a) as a query param or body key (most endpoints):
+  //         /opportunities/search?location_id=X
+  //         POST /contacts/search  { locationId: "X", ... }
+  //   (b) as a path segment with a {locationId} template in the manifest:
+  //         /locations/{locationId}/tags
+  //         /locations/{locationId}/customFields
+  //
+  // When the endpoint template carries {locationId}, don't ALSO add it
+  // as a query/body key — GHL's shape-(b) endpoints reject extra
+  // locationId params from some SDKs. resolveEndpoint() handles the
+  // path substitution; buildRequest just needs to skip the param.
+  const endpointHasLocationToken = backfill.endpoint.includes("{locationId}");
+  if (!endpointHasLocationToken) {
+    const locParamName = backfill.location_param_name ?? "locationId";
+    if (backfill.method === "GET") {
+      query[locParamName] = locationId;
+    } else {
+      body[locParamName] = locationId;
+    }
   }
 
   // Cursor placement. Two paths:
@@ -466,6 +478,16 @@ function runInContext<T>(
 
 function serializeCursor(value: unknown): string {
   return JSON.stringify(value);
+}
+
+/**
+ * Resolve `{locationId}` (and any future path-template variables) in
+ * the manifest's endpoint string. Some GHL endpoints take location as
+ * a path segment (`/locations/{locationId}/tags`) rather than a query
+ * param; this keeps the manifest declarative for both shapes.
+ */
+function resolveEndpoint(template: string, locationId: string): string {
+  return template.replace("{locationId}", locationId);
 }
 
 /**
@@ -624,9 +646,34 @@ function unsupportedResult(
 }
 
 // ---------------------------------------------------------------------------
-// per_parent — messages. Iterates every parent row (conversations) and
-// paginates its children.
+// per_parent — messages. Walks every parent row (conversations) and
+// paginates its children. Runs in two modes off the `backfill_complete`
+// flag in _sync_state:
+//
+//   fresh drain   (backfill_complete = false)
+//     Iterate every parent in id-ASC order starting from the persisted
+//     parent-id resume cursor. Fully paginate each parent's children
+//     within the invocation's subrequest budget. Advance the cursor to
+//     the last fully-processed parent id after every parent. When the
+//     next parent query returns zero rows we've walked the whole list
+//     → mark backfill_complete = 1 and clear the cursor.
+//
+//   steady state  (backfill_complete = true)
+//     Iterate parents whose cursor_column (conversations.last_message_
+//     date for messages) has advanced past the child's watermark —
+//     i.e. parents that received new messages since last tick. Re-fetch
+//     page 1 of each; upserts dedupe by id. Advance the watermark to
+//     the max cursor_column processed this tick. Cost: one subrequest
+//     per active parent, not thousands of idle ones.
 // ---------------------------------------------------------------------------
+
+// Paid-plan-friendly sizing. Each parent typically costs 1–3 GHL
+// subrequests + 1 DO upsert RPC, so 200 parents × ~4 calls = ~800
+// under the 1000-subrequest Cloudflare cap. Steady-state walks only
+// parents whose activity has advanced, so the higher cap rarely
+// matters — but keeps headroom for bursty re-polls.
+const MAX_PARENTS_PER_INVOCATION_FRESH = 200;
+const MAX_PARENTS_PER_INVOCATION_STEADY = 200;
 
 async function backfillPerParent(
   env: SyncEnv,
@@ -667,37 +714,11 @@ async function backfillPerParent(
   }
 
   const stub = locationStub(env.LOCATION_DO, connection.location_id);
+  const priorState = await stub.getSyncState();
+  const stateRow = priorState[entity.table];
+  const isFresh = !stateRow?.backfill_complete;
 
-  // Pull parent IDs that DON'T yet have any children in this DO. This
-  // lets repeated invocations make progress without re-walking already-
-  // processed parents. Ordered so iteration is deterministic across runs.
   const fkColumn = backfill.per_parent.parent_fk_column;
-  const parentQuery = await stub.executeQuery(
-    `SELECT p.id
-     FROM ${parentEntity.table} p
-     LEFT JOIN ${entity.table} c ON c.${fkColumn} = p.id
-     WHERE c.id IS NULL
-     GROUP BY p.id
-     ORDER BY p.id
-     LIMIT ${MAX_PARENTS_PER_INVOCATION}`,
-    [],
-  );
-  if (parentQuery.rows.length === 0) {
-    return {
-      entity: entity.table,
-      connection_id: connectionId,
-      location_id: connection.location_id,
-      pages: 0,
-      rows_upserted: 0,
-      row_count_after: 0,
-      final_cursor: null,
-      duration_ms: Date.now() - started,
-      stopped_reason: "empty_page",
-      error: `No unprocessed parents remaining in ${parentEntity.table}. Either all are synced or the parent table is empty — check ${parentEntity.table} first.`,
-    };
-  }
-
-  // Endpoint template uses {parent} as placeholder.
   const endpointTemplate = backfill.endpoint;
   if (!endpointTemplate.includes("{parent}")) {
     return unsupportedResult(
@@ -709,21 +730,78 @@ async function backfillPerParent(
     );
   }
 
+  // Parent selection differs by mode.
+  //
+  // Fresh drain: resume after the last fully-processed parent id. Order
+  // by id ASC so iteration is deterministic and monotonic across runs
+  // even if new conversations arrive mid-drain (they'd have ids after
+  // the resume pointer, which is fine — they'll be picked up eventually).
+  //
+  // Steady state: find parents whose activity has advanced past our
+  // child watermark. conversations.last_message_date bumps on every
+  // new message, so joining by (last_message_date > child_watermark)
+  // hits exactly the set that might carry unsynced children.
+  const parentQuery = await resolveParentBatch(
+    stub,
+    entity,
+    parentEntity.table,
+    isFresh,
+    stateRow?.cursor ?? null,
+    stateRow?.watermark ?? null,
+  );
+
+  if (parentQuery.rows.length === 0) {
+    // Fresh drain with no remaining parents → we've walked them all.
+    // Flip backfill_complete so the next run switches to steady state.
+    if (isFresh) {
+      try {
+        await stub.clearSyncCursor(entity.table);
+      } catch {
+        // non-fatal
+      }
+      try {
+        await stub.markBackfillComplete(entity.table);
+      } catch {
+        // non-fatal
+      }
+    }
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      final_cursor: null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "empty_page",
+      ...(isFresh ? {} : { error: "No active parents since watermark; nothing to refresh this tick." }),
+    };
+  }
+
   let totalPages = 0;
   let rowsUpserted = 0;
-  let lastRowCount = 0;
-  let stoppedReason: BackfillResult["stopped_reason"] = "empty_page";
+  let lastRowCount = stateRow?.row_count ?? 0;
+  let lastProcessedParentId: string | null = null;
+  let maxParentCursor: string | null = null;
+  let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
 
   try {
     await runInContext(connection, async () => {
       parentLoop: for (const parentRow of parentQuery.rows) {
         const parentId = String(parentRow.id);
+        const parentCursorValue = parentRow.parent_cursor as string | null | undefined;
+
         let cursorValue: unknown = null;
         let cursorSerialized: string | null = null;
         let pagesForParent = 0;
+        // Steady-state mode limits pages-per-parent to 1 by default so
+        // we don't burn budget re-paging conversations that already
+        // have their history in the DO.
+        const perParentPageCap = isFresh ? MAX_PAGES_PER_INVOCATION : 1;
 
-        while (pagesForParent < MAX_PAGES_PER_INVOCATION) {
+        while (pagesForParent < perParentPageCap) {
           if (totalPages >= MAX_PAGES_PER_INVOCATION) {
             stoppedReason = "page_cap_hit";
             break parentLoop;
@@ -772,6 +850,17 @@ async function backfillPerParent(
           cursorValue = nextCursor;
           cursorSerialized = nextSerialized;
         }
+
+        // Advance per-mode progress markers AFTER a parent's pagination
+        // completes — never mid-parent — so resuming later doesn't skip
+        // half-processed parents.
+        lastProcessedParentId = parentId;
+        if (parentCursorValue !== null && parentCursorValue !== undefined) {
+          const s = String(parentCursorValue);
+          if (maxParentCursor === null || s > maxParentCursor) {
+            maxParentCursor = s;
+          }
+        }
       }
     });
   } catch (err) {
@@ -783,6 +872,23 @@ async function backfillPerParent(
       : String(err);
   }
 
+  // Persist mode-specific progress so the next invocation picks up where
+  // this one left off.
+  if (isFresh && lastProcessedParentId !== null) {
+    try {
+      await stub.setSyncCursor(entity.table, lastProcessedParentId);
+    } catch {
+      // non-fatal
+    }
+  }
+  if (!isFresh && maxParentCursor !== null) {
+    try {
+      await stub.setSyncWatermark(entity.table, maxParentCursor);
+    } catch {
+      // non-fatal
+    }
+  }
+
   return {
     entity: entity.table,
     connection_id: connectionId,
@@ -790,11 +896,68 @@ async function backfillPerParent(
     pages: totalPages,
     rows_upserted: rowsUpserted,
     row_count_after: lastRowCount,
-    final_cursor: null,
+    final_cursor: lastProcessedParentId,
     duration_ms: Date.now() - started,
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
   };
+}
+
+/**
+ * Select the next batch of parent rows to walk. Returns a uniform shape
+ * of { id, parent_cursor } regardless of mode so the caller doesn't have
+ * to special-case steady vs fresh in the loop body.
+ *
+ * Fresh: `SELECT id, NULL FROM <parent> WHERE id > ? ORDER BY id ASC`
+ * Steady: `SELECT id, <cursor_col> FROM <parent>
+ *             WHERE <cursor_col> > ? ORDER BY <cursor_col> ASC`
+ *
+ * The steady-state cursor_col comes from the child entity's
+ * incremental.cursor_column setting mapped into the parent's schema.
+ * For messages → conversations, that's last_message_date.
+ */
+async function resolveParentBatch(
+  stub: LocationDOStub,
+  entity: EntityManifest,
+  parentTable: string,
+  isFresh: boolean,
+  resumeCursor: string | null,
+  watermark: string | null,
+): Promise<QueryResult> {
+  if (isFresh) {
+    const limit = MAX_PARENTS_PER_INVOCATION_FRESH;
+    if (resumeCursor) {
+      return stub.executeQuery(
+        `SELECT id, NULL AS parent_cursor FROM ${parentTable} WHERE id > ? ORDER BY id ASC LIMIT ${limit}`,
+        [resumeCursor],
+      );
+    }
+    return stub.executeQuery(
+      `SELECT id, NULL AS parent_cursor FROM ${parentTable} ORDER BY id ASC LIMIT ${limit}`,
+      [],
+    );
+  }
+  // Steady-state: activity-driven parent selection. The parent table
+  // should carry a column whose value bumps when any child mutates.
+  // For messages this is conversations.last_message_date (always
+  // updated by the platform when a new message lands).
+  const parentCursorCol = parentTable === "conversations" ? "last_message_date" : "updated_at";
+  const limit = MAX_PARENTS_PER_INVOCATION_STEADY;
+  if (watermark) {
+    return stub.executeQuery(
+      `SELECT id, ${parentCursorCol} AS parent_cursor FROM ${parentTable}
+       WHERE ${parentCursorCol} > ? ORDER BY ${parentCursorCol} ASC LIMIT ${limit}`,
+      [watermark],
+    );
+  }
+  // No watermark yet → first steady-state tick. Refresh the N most
+  // recently active parents to prime. Subsequent ticks will only see
+  // forward deltas.
+  return stub.executeQuery(
+    `SELECT id, ${parentCursorCol} AS parent_cursor FROM ${parentTable}
+     WHERE ${parentCursorCol} IS NOT NULL ORDER BY ${parentCursorCol} DESC LIMIT ${limit}`,
+    [],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -914,7 +1077,7 @@ async function backfillPollFull(
       while (pagesProcessed < maxPagesThisRun) {
         const { query, body } = buildRequest(entity, connection.location_id, cursorValue);
         const response = await toplineFetch<Record<string, unknown>>(
-          backfill.endpoint,
+          resolveEndpoint(backfill.endpoint, connection.location_id),
           buildFetchOptions(entity, query, body),
         );
 
@@ -1212,6 +1375,30 @@ export async function incrementalEntity(
     };
   }
 
+  // per_parent entities: delegate to backfillPerParent. That function
+  // is bi-modal off backfill_complete — fresh drain while the initial
+  // history is being loaded, then activity-driven refresh of parents
+  // whose cursor_column has advanced. Same function handles both,
+  // which keeps the state-machine transitions in one place.
+  if (entity.incremental.type === "per_parent") {
+    const res = await backfillEntity(env, connectionId, entityTable);
+    const stopped: IncrementalResult["stopped_reason"] =
+      res.stopped_reason === "unsupported" ? "error" : res.stopped_reason;
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      pages: res.pages,
+      rows_upserted: res.rows_upserted,
+      row_count_after: res.row_count_after,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: null,
+      duration_ms: res.duration_ms,
+      stopped_reason: stopped,
+      ...(res.error ? { error: res.error } : {}),
+    };
+  }
+
   if (entity.incremental.type !== "updated_after") {
     return {
       entity: entity.table,
@@ -1225,7 +1412,7 @@ export async function incrementalEntity(
       watermark_after: stateRow?.watermark ?? null,
       duration_ms: Date.now() - started,
       stopped_reason: "skipped",
-      error: `Incremental sync for ${entity.incremental.type} entities not implemented; use webhooks (phase 1 step 5).`,
+      error: `Incremental sync for ${entity.incremental.type} entities not implemented.`,
     };
   }
 
@@ -1361,7 +1548,7 @@ export async function incrementalEntity(
         }
 
         const response = await toplineFetch<Record<string, unknown>>(
-          entity.backfill.endpoint,
+          resolveEndpoint(entity.backfill.endpoint, connection.location_id),
           buildFetchOptions(entity, query, body),
         );
 
@@ -1444,12 +1631,21 @@ export async function incrementalEntity(
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_INCREMENTAL_ORDER: readonly string[] = [
+  // Metadata + join targets first so FK hints stay valid during the
+  // entity pulls that follow.
+  "calendar_groups",
+  "calendars",
+  "tags",
+  "custom_fields",
+  "custom_values",
   "pipelines",
   "pipeline_stages",
   "contacts",
   "opportunities",
+  // conversations must run BEFORE messages so the active-parent
+  // selector in backfillPerParent sees the freshest last_message_date
+  // values and fans out to the right conversations.
   "conversations",
-  // messages: webhooks handle freshness; incremental stub returns skipped
   "messages",
 ];
 
@@ -1488,6 +1684,11 @@ export async function backfillContacts(
  * / conversation / message / appointment fan-out.
  */
 export const DEFAULT_BACKFILL_ORDER: readonly string[] = [
+  "calendar_groups",
+  "calendars",
+  "tags",
+  "custom_fields",
+  "custom_values",
   "pipelines",
   "pipeline_stages",
   "contacts",

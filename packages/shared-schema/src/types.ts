@@ -79,6 +79,19 @@ export interface ColumnDef {
    * columns). Only applies to columns whose sqlite_type is TEXT.
    */
   timestamp_format?: "iso8601" | "ms_epoch";
+
+  /**
+   * When true, mapRow stores the ENTIRE upstream object (not a single
+   * field) in this column. Combined with `json: true`, this gives us a
+   * lossless escape hatch: every row keeps its full GHL payload so the
+   * LLM can json_extract(raw_payload, '$.meta.call.duration') for
+   * fields we haven't bothered to type yet. Zero schema migrations
+   * required when a new demand surfaces — just query into raw_payload.
+   *
+   * Only valid on one column per table (by convention named
+   * `raw_payload`), and only meaningful with `json: true`.
+   */
+  raw?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +311,10 @@ export function requiredAuditChecks(
   // Gate: webhook_coverage is required UNLESS one of these is true:
   //   - incremental.type === "poll_full" (re-fetches everything)
   //   - incremental.type === "updated_after" AND filter_ready === true
+  //   - incremental.type === "per_parent" AND filter_ready === true
+  //     (child freshness tied to parent's poll refresh + active-parent
+  //     re-polling in the sync worker — see backfillPerParent's
+  //     steady-state path for messages)
   //
   // Entities that need true real-time (future: live chat dashboards,
   // alerting) should flip webhook_coverage true anyway; this gate is
@@ -305,6 +322,8 @@ export function requiredAuditChecks(
   const hasCronFreshness =
     entity.incremental.type === "poll_full" ||
     (entity.incremental.type === "updated_after" &&
+      entity.incremental.filter_ready === true) ||
+    (entity.incremental.type === "per_parent" &&
       entity.incremental.filter_ready === true);
   if (entity.phase === 1 && !hasCronFreshness) {
     checks.push("webhook_coverage");

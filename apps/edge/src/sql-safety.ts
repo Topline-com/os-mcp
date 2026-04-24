@@ -18,7 +18,7 @@
 // Parser off it. esbuild / wrangler bundling also handles this path
 // correctly via their CJS/ESM interop.
 import nodeSqlParser from "node-sql-parser";
-import { getExposedEntities } from "@topline/shared-schema";
+import { getExposedEntities, ANALYTICS_VIEWS } from "@topline/shared-schema";
 
 const { Parser } = nodeSqlParser as unknown as {
   Parser: new () => {
@@ -201,7 +201,14 @@ export function sanitizeQuery(
  * Admin surfaces (e.g. /admin/do-query) deliberately SKIP this check.
  */
 export function enforceExposedTables(query: string): void {
-  const exposed = new Set(getExposedEntities().map((e) => e.table));
+  // Exposed set = every entity past the audit gate + every derived
+  // analytics view. Views read only from exposed base tables (enforced
+  // by how they're defined in shared-schema/views.ts), so they don't
+  // leak access to hidden data.
+  const exposed = new Set<string>([
+    ...getExposedEntities().map((e) => e.table),
+    ...ANALYTICS_VIEWS.map((v) => v.name),
+  ]);
 
   // Extract CTE alias names from the AST so "WITH n AS (...) SELECT * FROM n"
   // doesn't get rejected because `n` isn't in the exposed set.

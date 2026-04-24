@@ -23,6 +23,16 @@ export function mapRow(
     // `_synced_at` is stamped server-side by the DO; leave it absent here.
     if (col.name === "_synced_at") continue;
 
+    // Lossless escape hatch: `raw: true` columns store the entire
+    // upstream object (as JSON via coerceForSqlite's json: true path).
+    // Lets the LLM `json_extract(raw_payload, '$.meta.call.duration')`
+    // for fields we haven't bothered to type yet — no schema migration
+    // when a new analytics question shows up.
+    if (col.raw) {
+      row[col.name] = raw;
+      continue;
+    }
+
     const path = col.source_path ?? col.name;
     const value = getByPath(raw, path);
 

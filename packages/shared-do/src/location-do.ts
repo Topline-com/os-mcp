@@ -37,6 +37,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   ALL_ENTITIES,
   ENTITY_BY_TABLE,
+  ANALYTICS_VIEWS,
   renderCreateTable,
   renderColumn,
   renderIndexes,
@@ -100,7 +101,8 @@ export interface SchemaOverview {
 export interface TableDetails {
   table: string;
   description: string;
-  primary_key: string;
+  /** Null for views. */
+  primary_key: string | null;
   row_count: number;
   columns: Array<{
     name: string;
@@ -112,6 +114,7 @@ export interface TableDetails {
     json?: boolean;
   }>;
   relations: Array<{ column: string; references: string }>;
+  notes?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +239,16 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       for (const idxStmt of renderIndexes(entity)) {
         sql.exec(idxStmt);
       }
+    }
+
+    // Derived analytics views. CREATE VIEW IF NOT EXISTS is idempotent
+    // but does NOT update the view body when the definition changes —
+    // we DROP first so reshapes in code take effect on the next DO
+    // restart. Views are read-only aliases over the base tables; no
+    // storage cost, always consistent with the current data.
+    for (const v of ANALYTICS_VIEWS) {
+      sql.exec(`DROP VIEW IF EXISTS ${v.name}`);
+      sql.exec(v.ddl);
     }
   }
 
@@ -742,14 +755,27 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         description: e.description,
         row_count: state[e.table]?.row_count ?? 0,
       }));
+    // Derived analytics views show up alongside base tables. Row counts
+    // are best-effort — computing them requires a full scan, so we
+    // return undefined and let the LLM use COUNT(*) if it cares.
+    for (const v of ANALYTICS_VIEWS) {
+      tables.push({
+        name: v.name,
+        description: `[view] ${v.description}`,
+        row_count: 0,
+      });
+    }
     return {
       tables,
       dialect_notes: [
         "SQLite dialect. No DATE_TRUNC — use strftime('%Y-%m-%d', col) for date truncation.",
         "Timestamps are ISO 8601 strings. Compare lexicographically or parse with strftime.",
-        "JSON columns (e.g. contacts.tags, contacts.custom_fields) — query with json_extract() and json_each().",
+        "JSON columns (e.g. contacts.tags, contacts.custom_fields, every table's raw_payload) — query with json_extract() and json_each().",
+        "Every table has a `raw_payload` TEXT/JSON column holding the full upstream GHL object — use json_extract(raw_payload, '$.meta.call.duration') etc. for fields that aren't surfaced as their own columns.",
+        "Derived views (call_events, email_events, sms_events, lead_response_metrics, contact_timeline, opportunity_funnel) are READ-ONLY virtual tables — cheaper to query than re-deriving from messages yourself.",
         "Tenant isolation is physical; every row you see is already scoped to your sub-account.",
         "Counts are eventually consistent: the sync worker polls upstream every 15 min, and a small sampling gap (~0.03% on conversations) exists because the upstream cursor uses a single timestamp field with no tie-breaker. For questions sensitive to single-row exactness, prefer SUM/COUNT over ranges to smooth the variance.",
+        "When a question asks about an object that doesn't appear here (calls, transcripts, forms, invoices, etc.), call topline_describe_data_catalog to see whether it's synced, pending, or requires OAuth — don't assume it doesn't exist.",
       ],
       query_rules: [
         "SELECT and WITH only. DDL, DML, PRAGMA, ATTACH, and script-loading are rejected.",
@@ -773,11 +799,49 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     const state = await this.getSyncState();
     return tables.map((t) => {
       const e = ENTITY_BY_TABLE.get(t);
-      if (!e || !e.exposed || !auditPasses(e)) {
-        throw new Error(`Unknown or unavailable table: ${t}`);
+      if (e && e.exposed && auditPasses(e)) {
+        return explainOne(e, state[t]?.row_count ?? 0);
       }
-      return explainOne(e, state[t]?.row_count ?? 0);
+      // Analytics views are exposed-by-default; they live off base
+      // tables that already passed the same exposure gate.
+      const view = ANALYTICS_VIEWS.find((v) => v.name === t);
+      if (view) {
+        const detail: TableDetails = {
+          table: view.name,
+          description: `[view] ${view.description}`,
+          row_count: 0,
+          columns: this.inferViewColumns(view.name),
+          primary_key: null,
+          relations: [],
+          notes: `Derived view over: ${view.base_tables.join(", ")}. Read-only.`,
+        };
+        return detail;
+      }
+      throw new Error(`Unknown or unavailable table: ${t}`);
     });
+  }
+
+  /**
+   * Pull column names out of the live view by doing a zero-row SELECT.
+   * The cursor's columnNames carries the schema even when no rows match.
+   * Types come back as "TEXT" in SQLite's type-affinity model unless we
+   * want to parse the view DDL — for now we just surface names, which
+   * is all the LLM needs to write a query.
+   */
+  private inferViewColumns(
+    viewName: string,
+  ): TableDetails["columns"] {
+    try {
+      const cursor = this.ctx.storage.sql.exec(`SELECT * FROM ${viewName} LIMIT 0`);
+      return cursor.columnNames.map((n) => ({
+        name: n,
+        type: "TEXT" as const,
+        nullable: true,
+        description: "",
+      }));
+    } catch {
+      return [];
+    }
   }
 
   /** Cheap health probe used by diagnostic endpoints. */

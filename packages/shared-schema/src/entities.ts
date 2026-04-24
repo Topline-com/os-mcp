@@ -49,6 +49,25 @@ const SYNCED_AT: ColumnDef = {
   description: "ISO 8601 timestamp the sync worker last wrote this row. Use to detect stale data.",
 };
 
+/**
+ * Lossless raw upstream payload. Every exposed entity includes this so
+ * the LLM can query fields we haven't bothered to type yet via
+ * json_extract(raw_payload, '$.path.to.field'). Zero schema migrations
+ * needed when a new analytics question surfaces — it's already on disk.
+ *
+ * Populated by mapRow's `col.raw === true` branch (writes the entire
+ * upstream object), stringified by coerceForSqlite's json: true path.
+ */
+const RAW_PAYLOAD: ColumnDef = {
+  name: "raw_payload",
+  sqlite_type: "TEXT",
+  nullable: true,
+  json: true,
+  raw: true,
+  description:
+    "Full upstream GHL JSON for this row. Use json_extract(raw_payload, '$.field') or json_each(raw_payload, '$.arr') for fields not yet surfaced as their own columns.",
+};
+
 // ---------------------------------------------------------------------------
 // Phase 1 — hot tables (webhook + 15-min poll)
 // ---------------------------------------------------------------------------
@@ -81,6 +100,7 @@ export const CONTACTS: EntityManifest = {
     { name: "postal_code", sqlite_type: "TEXT", nullable: true, description: "", source_path: "postalCode" },
     CREATED_AT,
     UPDATED_AT,
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -165,6 +185,7 @@ export const OPPORTUNITIES: EntityManifest = {
     // uses. Overriding the shared CREATED_AT / UPDATED_AT constants here.
     { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the opportunity was created upstream.", source_path: "createdAt", timestamp_format: "iso8601" },
     { name: "updated_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the most recent mutation upstream.", indexed: true, source_path: "updatedAt", timestamp_format: "iso8601" },
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -248,6 +269,7 @@ export const CONVERSATIONS: EntityManifest = {
     // timestamp_format: ms_epoch tells sync's mapRow to normalize to ISO.
     { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the conversation was created upstream.", source_path: "dateAdded", timestamp_format: "ms_epoch" },
     { name: "updated_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the most recent mutation upstream.", indexed: true, source_path: "dateUpdated", timestamp_format: "ms_epoch" },
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -319,12 +341,19 @@ export const MESSAGES: EntityManifest = {
     // `messageType` (semantic string like "TYPE_CALL"/"TYPE_SMS"/
     // "TYPE_LIVE_CHAT") on every message. Source the semantic string
     // so LLMs can write readable WHERE clauses without a code lookup.
-    { name: "type", sqlite_type: "TEXT", nullable: true, description: "Channel (semantic name).", enum: ["TYPE_CALL", "TYPE_SMS", "TYPE_EMAIL", "TYPE_WHATSAPP", "TYPE_FB", "TYPE_IG", "TYPE_CUSTOM", "TYPE_LIVE_CHAT", "TYPE_REVIEW", "TYPE_IVR_CALL", "TYPE_SMS_REVIEW_REQUEST", "TYPE_WEBCHAT"], source_path: "messageType" },
-    { name: "direction", sqlite_type: "TEXT", nullable: true, description: "", enum: ["inbound", "outbound"] },
-    { name: "status", sqlite_type: "TEXT", nullable: true, description: "Delivery / interaction status." },
-    { name: "body", sqlite_type: "TEXT", nullable: true, description: "Message body (SMS text, email plain body, etc.)." },
+    { name: "type", sqlite_type: "TEXT", nullable: true, description: "Channel (semantic name).", enum: ["TYPE_CALL", "TYPE_SMS", "TYPE_EMAIL", "TYPE_WHATSAPP", "TYPE_FB", "TYPE_IG", "TYPE_CUSTOM", "TYPE_LIVE_CHAT", "TYPE_REVIEW", "TYPE_IVR_CALL", "TYPE_SMS_REVIEW_REQUEST", "TYPE_WEBCHAT", "TYPE_ACTIVITY_OPPORTUNITY", "TYPE_ACTIVITY_APPOINTMENT", "TYPE_ACTIVITY_CONTACT", "TYPE_CUSTOM_EMAIL", "TYPE_CUSTOM_CALL", "TYPE_CAMPAIGN_CALL"], source_path: "messageType" },
+    { name: "direction", sqlite_type: "TEXT", nullable: true, description: "", enum: ["inbound", "outbound"], indexed: true },
+    { name: "status", sqlite_type: "TEXT", nullable: true, description: "Delivery / interaction status. For calls: 'completed' / 'no-answer' / 'voicemail' / etc." },
+    { name: "body", sqlite_type: "TEXT", nullable: true, description: "Message body (SMS text, email plain body, transcript excerpt for calls)." },
     { name: "attachments", sqlite_type: "TEXT", nullable: true, json: true, description: "JSON array of attachment URLs." },
-    { name: "date_added", sqlite_type: "TEXT", nullable: true, description: "ISO 8601. Primary time axis for messages.", indexed: true, source_path: "dateAdded", timestamp_format: "iso8601" },
+    { name: "date_added", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 when the message was recorded. Primary time axis — use this for 'first message' / 'last message' queries.", indexed: true, source_path: "dateAdded", timestamp_format: "iso8601" },
+    { name: "user_id", sqlite_type: "TEXT", nullable: true, description: "Sub-account user who sent/handled the message (NULL for pure inbound without an owner).", indexed: true, source_path: "userId", references: "users.id" },
+    // For TYPE_CALL / TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL
+    // messages GHL nests call-specific fields under `meta.call`. Duration
+    // in seconds is the key signal for distinguishing voicemails (usually
+    // status = 'voicemail' or duration < ~5s) from real conversations.
+    { name: "call_duration_seconds", sqlite_type: "INTEGER", nullable: true, description: "Call length in seconds. NULL for non-call messages. Use with type IN ('TYPE_CALL','TYPE_IVR_CALL') and direction='inbound' + duration<=5 to isolate voicemails / missed calls.", source_path: "meta.call.duration" },
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -343,22 +372,42 @@ export const MESSAGES: EntityManifest = {
     per_parent: { parent_entity: "conversations", parent_fk_column: "conversation_id" },
   },
   incremental: {
+    // per_parent: freshness inherits from the conversations table's
+    // poll_full refresh cycle. Each cron tick the sync worker picks
+    // conversations whose last_message_date has advanced since the
+    // messages watermark and re-pulls their messages. PITs can't
+    // register webhooks so this is the only path to <=15 min freshness.
+    //
+    // filter_ready: true — the "date filter" here is a DO-side query
+    // against conversations.last_message_date, not a GHL server-side
+    // filter. It's been probed live (the conversations table is
+    // self-polling via its own poll_full path, so its last_message_date
+    // is always within ~15 min of upstream).
     type: "per_parent",
+    cursor_column: "date_added",
     poll_interval_minutes: 15,
-    filter_ready: false,
+    filter_ready: true,
   },
   webhooks: [
     { ghl_event: "InboundMessage", kind: "upsert" },
     { ghl_event: "OutboundMessage", kind: "upsert" },
   ],
   audit: {
-    live_tested: false,
-    stable_pk: false,
-    backfill_path: false,
-    incremental_path: false,
-    update_cursor: false,
+    // Verified live on 2026-04-24 against ucNDNXi… sub-account:
+    //   - /conversations/{id}/messages returns calls with
+    //     meta.call.duration + direction + status as expected
+    //   - per-parent backfill walks every conversation, resume cursor
+    //     persists across subrequest-cap hits
+    //   - steady-state freshness re-polls conversations whose
+    //     last_message_date has advanced
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false, // N/A for per_parent — requiredAuditChecks skips it
+    notes: "Unlocks call-log analytics (first inbound → first outbound callback, response rates). Columns include direction, call_duration_seconds, date_added — everything needed for Streamlined-style queries.",
   },
-  exposed: false,
+  exposed: true,
 };
 
 export const APPOINTMENTS: EntityManifest = {
@@ -380,6 +429,7 @@ export const APPOINTMENTS: EntityManifest = {
     { name: "notes", sqlite_type: "TEXT", nullable: true, description: "" },
     CREATED_AT,
     UPDATED_AT,
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -433,6 +483,7 @@ export const PIPELINES: EntityManifest = {
     { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable pipeline ID." },
     LOCATION_ID,
     { name: "name", sqlite_type: "TEXT", nullable: true, description: "Pipeline display name." },
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -472,6 +523,7 @@ export const PIPELINE_STAGES: EntityManifest = {
     { name: "name", sqlite_type: "TEXT", nullable: true, description: "Stage display name." },
     { name: "position", sqlite_type: "INTEGER", nullable: true, description: "Ordering within the pipeline. Low = earlier." },
     { name: "show_in_funnel", sqlite_type: "INTEGER", nullable: true, description: "0 or 1.", source_path: "showInFunnel" },
+    RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
@@ -503,11 +555,199 @@ export const PIPELINE_STAGES: EntityManifest = {
 // Registry
 // ---------------------------------------------------------------------------
 
+export const TAGS: EntityManifest = {
+  table: "tags",
+  description: "Tag taxonomy for the sub-account. Contacts reference tags by name via contacts.tags (JSON array).",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable tag ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Display name of the tag (what shows on contacts.tags).", indexed: true },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/locations/{locationId}/tags",
+    method: "GET",
+    pagination: "none",
+    items_field: "tags",
+  },
+  incremental: {
+    type: "poll_full",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Small (hundreds of tags); poll_full hourly is overkill-safe.",
+  },
+  exposed: true,
+};
+
+export const CUSTOM_FIELDS: EntityManifest = {
+  table: "custom_fields",
+  description: "Custom field definitions (name, dataType, model). Contact custom-field values live on contacts.custom_fields as a JSON array of {id,value}; join against this table by id to resolve the field's name / type.",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable custom-field ID (matches contact.custom_fields[].id)." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Human-readable field name.", indexed: true },
+    { name: "field_key", sqlite_type: "TEXT", nullable: true, description: "Programmatic key like 'contact.phone_alt'.", source_path: "fieldKey" },
+    { name: "data_type", sqlite_type: "TEXT", nullable: true, description: "Storage type (TEXT, LARGE_TEXT, NUMERICAL, PHONE, EMAIL, SINGLE_OPTIONS, MULTIPLE_OPTIONS, CHECKBOX, DATE, FILE_UPLOAD, etc.).", source_path: "dataType" },
+    { name: "model", sqlite_type: "TEXT", nullable: true, description: "Object this field belongs to: 'contact', 'opportunity', 'appointment'.", enum: ["contact", "opportunity", "appointment"] },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/locations/{locationId}/customFields",
+    method: "GET",
+    pagination: "none",
+    items_field: "customFields",
+  },
+  incremental: {
+    type: "poll_full",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
+export const CUSTOM_VALUES: EntityManifest = {
+  table: "custom_values",
+  description: "Sub-account-scoped key/value pairs used as merge tags ({{custom_values.X}}). Not per-contact — shared across the whole sub-account.",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable custom-value ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Human-readable name." },
+    { name: "field_key", sqlite_type: "TEXT", nullable: true, description: "Merge-tag key like {{custom_values.review_request_link}}.", source_path: "fieldKey" },
+    { name: "value", sqlite_type: "TEXT", nullable: true, description: "The actual value." },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/locations/{locationId}/customValues",
+    method: "GET",
+    pagination: "none",
+    items_field: "customValues",
+  },
+  incremental: {
+    type: "poll_full",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
+export const CALENDARS: EntityManifest = {
+  table: "calendars",
+  description: "Calendar definitions (booking pages). Join target for appointments.calendar_id.",
+  phase: 2,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable calendar ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Display name of the booking page." },
+    { name: "group_id", sqlite_type: "TEXT", nullable: true, description: "Parent calendar group (for team / round-robin pages).", source_path: "groupId", references: "calendar_groups.id" },
+    { name: "slug", sqlite_type: "TEXT", nullable: true, description: "URL slug: /widget/booking/<slug>." },
+    { name: "is_active", sqlite_type: "INTEGER", nullable: true, description: "0 or 1.", source_path: "isActive" },
+    { name: "event_type", sqlite_type: "TEXT", nullable: true, description: "Calendar type (service, round-robin, collective, event, etc.).", source_path: "eventType" },
+    { name: "event_title", sqlite_type: "TEXT", nullable: true, description: "Default event title for bookings.", source_path: "eventTitle" },
+    { name: "slot_duration", sqlite_type: "INTEGER", nullable: true, description: "Appointment length in minutes.", source_path: "slotDuration" },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/calendars/",
+    method: "GET",
+    pagination: "none",
+    items_field: "calendars",
+  },
+  incremental: {
+    type: "poll_full",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Small table; hourly poll is generous. teamMembers / availability rules are in raw_payload for LLMs that want to drill into booking-page config.",
+  },
+  exposed: true,
+};
+
+export const CALENDAR_GROUPS: EntityManifest = {
+  table: "calendar_groups",
+  description: "Groupings of calendars for team booking pages (round-robin, collective).",
+  phase: 2,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable group ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Group display name." },
+    { name: "description", sqlite_type: "TEXT", nullable: true, description: "" },
+    { name: "slug", sqlite_type: "TEXT", nullable: true, description: "URL slug." },
+    { name: "is_active", sqlite_type: "INTEGER", nullable: true, description: "0 or 1.", source_path: "isActive" },
+    CREATED_AT,
+    UPDATED_AT,
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/calendars/groups",
+    method: "GET",
+    pagination: "none",
+    items_field: "groups",
+  },
+  incremental: {
+    type: "poll_full",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
 /** Every entity defined in this manifest. Order matters for table creation
  * (metadata tables first so FK hints resolve). */
 export const ALL_ENTITIES: readonly EntityManifest[] = [
   PIPELINES,
   PIPELINE_STAGES,
+  CALENDAR_GROUPS,
+  CALENDARS,
+  TAGS,
+  CUSTOM_FIELDS,
+  CUSTOM_VALUES,
   CONTACTS,
   OPPORTUNITIES,
   CONVERSATIONS,

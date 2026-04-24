@@ -43,6 +43,7 @@ import { LocationDO } from "@topline/shared-do";
 import { edgeContext } from "./request-context.js";
 import { locationClient } from "./location-do-client.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
+import { buildCatalog } from "@topline/shared-schema";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
@@ -110,6 +111,8 @@ export default {
         return cors(await handleAdminDoExec(request, env));
       case "/query/api/get-overview":
         return cors(await handleQueryApiOverview(request, env));
+      case "/query/api/catalog":
+        return cors(await handleQueryApiCatalog(request, env));
       case "/query/api/explain-tables":
         return cors(await handleQueryApiExplainTables(request, env));
       case "/query/api/execute-sql":
@@ -678,6 +681,17 @@ async function handleQueryApiOverview(request: Request, env: Env): Promise<Respo
     const client = locationClient(env.LOCATION_DO, auth.locationId);
     const overview = await client.describeSchema();
     return json(200, overview);
+  } catch (err) {
+    return json(500, { error: err instanceof Error ? err.message : String(err) });
+  }
+}
+
+async function handleQueryApiCatalog(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return plain(405, "Method not allowed");
+  const auth = await authorizeQueryRequest(request, env);
+  if (auth instanceof Response) return auth;
+  try {
+    return json(200, { entries: buildCatalog() });
   } catch (err) {
     return json(500, { error: err instanceof Error ? err.message : String(err) });
   }

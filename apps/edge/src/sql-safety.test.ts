@@ -7,8 +7,8 @@
 // reject decision belongs in a committed test.
 //
 // Tests depend implicitly on the current manifest's exposure state:
-//   exposed:  contacts, opportunities, conversations, pipelines, pipeline_stages
-//   hidden:   messages, appointments
+//   exposed:  contacts, opportunities, conversations, messages, pipelines, pipeline_stages
+//   hidden:   appointments
 // When a manifest change flips any of these, the corresponding test
 // cases will flip — which is the intended forcing function for review.
 
@@ -172,11 +172,8 @@ describe("enforceExposedTables — accepts exposed tables", () => {
 
 describe("enforceExposedTables — rejects hidden entity tables", () => {
   // Not yet exposed per the current manifest:
-  //   - messages: per-parent pagination, volume too high for poll_full;
-  //     needs webhooks or per-parent incremental to unlock.
   //   - appointments: backfill pagination "unknown" — contract unaudited.
   const queries = [
-    "SELECT * FROM messages",
     "SELECT * FROM appointments",
   ];
   for (const q of queries) {
@@ -213,12 +210,12 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
     );
   });
   it("CTE referencing a HIDDEN table still blocks via inner ref", () => {
-    // The CTE alias `x` is exempt from allowlist, but `messages`
+    // The CTE alias `x` is exempt from allowlist, but `appointments`
     // inside its SELECT is not — the inner table ref fails.
     throws(
       () =>
         enforceExposedTables(
-          "WITH x AS (SELECT * FROM messages) SELECT * FROM x",
+          "WITH x AS (SELECT * FROM appointments) SELECT * FROM x",
         ),
       SqlSafetyError,
     );
@@ -226,11 +223,11 @@ describe("enforceExposedTables — CTE aliases exempted", () => {
 });
 
 describe("enforceExposedTables — join including hidden table", () => {
-  it("contacts JOIN messages is rejected because messages is hidden", () => {
+  it("contacts JOIN appointments is rejected because appointments is hidden", () => {
     throws(
       () =>
         enforceExposedTables(
-          "SELECT c.id FROM contacts c JOIN messages m ON m.contact_id = c.id",
+          "SELECT c.id FROM contacts c JOIN appointments a ON a.contact_id = c.id",
         ),
       SqlSafetyError,
     );
@@ -266,12 +263,11 @@ describe("full customer gate — every pragma variant is blocked", () => {
 
 describe("full customer gate — hidden / bookkeeping / sqlite_ tables all blocked", () => {
   const forms = [
-    "SELECT * FROM messages",
     "SELECT * FROM appointments",
     "SELECT * FROM _sync_state",
     "SELECT * FROM _schema_log",
     "SELECT name FROM sqlite_master",
-    "SELECT c.id FROM contacts c JOIN messages m ON c.id = m.contact_id",
+    "SELECT c.id FROM contacts c JOIN appointments a ON c.id = a.contact_id",
   ];
   for (const q of forms) {
     it(q, () => throws(() => runFullCustomerGate(q), SqlSafetyError));
@@ -291,6 +287,10 @@ describe("full customer gate — legitimate analytics queries pass", () => {
     "SELECT COUNT(*) FROM opportunities WHERE status = 'open'",
     "SELECT c.id, COUNT(o.id) AS n FROM contacts c LEFT JOIN opportunities o ON o.contact_id = c.id GROUP BY c.id",
     "SELECT type, COUNT(*) FROM conversations GROUP BY type",
+    // Messages now exposed — the Streamlined-demo query shape:
+    // first inbound call → first outbound callback per contact.
+    "SELECT m.contact_id, MIN(CASE WHEN direction='inbound' THEN date_added END) AS first_in, MIN(CASE WHEN direction='outbound' THEN date_added END) AS first_out FROM messages m WHERE type IN ('TYPE_CALL','TYPE_IVR_CALL') GROUP BY m.contact_id",
+    "SELECT COUNT(*) FROM messages WHERE type='TYPE_CALL' AND direction='inbound' AND call_duration_seconds <= 5",
   ];
   for (const q of forms) {
     it(q, () => doesNotThrow(() => runFullCustomerGate(q)));
