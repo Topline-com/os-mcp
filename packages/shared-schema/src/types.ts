@@ -203,8 +203,29 @@ export interface BackfillDescriptor {
    * For endpoints that iterate over a parent (e.g. contact tasks require
    * a contactId), name the parent entity and the child column holding
    * the parent ID. Sync iterates all parent rows and paginates per parent.
+   *
+   * Two per-parent shapes are supported:
+   *
+   *   Path template (messages, tasks, notes)
+   *     endpoint: "/contacts/{parent}/tasks"
+   *     → {parent} is replaced with the parent id per request.
+   *
+   *   Query param (forms/surveys when submissions are fanned out by
+   *   form/survey id instead of location)
+   *     endpoint: "/forms/submissions"
+   *     per_parent.request_param: "formId"
+   *     → `?formId=<id>` is appended per request.
    */
-  per_parent?: { parent_entity: string; parent_fk_column: string };
+  per_parent?: {
+    parent_entity: string;
+    parent_fk_column: string;
+    /**
+     * When set, the parent id is sent as a query param (GET) / body key
+     * (POST) of this name on every request, instead of being substituted
+     * into the endpoint path via {parent}.
+     */
+    request_param?: string;
+  };
 }
 
 export interface IncrementalDescriptor {

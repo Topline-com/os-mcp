@@ -210,6 +210,23 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         row_count INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // Per-parent sync state. Replaces the naive "ORDER BY parent.id ASC
+    // with a global resume cursor" approach in backfillPerParent: each
+    // parent tracks its own cursor + completion flag, so a mid-parent
+    // subrequest-cap error doesn't lose progress and a freshly-bumped
+    // parent (conversation with a new message, contact with a new task)
+    // gets picked back up on the next tick without re-walking the whole
+    // parent table.
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS _parent_sync_state (
+        entity TEXT NOT NULL,
+        parent_id TEXT NOT NULL,
+        cursor TEXT,
+        backfill_complete INTEGER NOT NULL DEFAULT 0,
+        last_sync_at TEXT,
+        PRIMARY KEY (entity, parent_id)
+      )
+    `);
     // Additive migration for DOs created before watermark / backfill_complete
     // were introduced. Both are nullable/defaulted so ADD COLUMN is safe.
     this.ensureSyncStateColumn("watermark", "TEXT");
@@ -227,6 +244,25 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // code; when the gap exceeds ~10% the cron resets the complete flag
     // and re-drains from scratch.
     this.ensureSyncStateColumn("upstream_total", "INTEGER");
+
+    // Drop any existing view whose name collides with a manifested
+    // entity. This happens during the call_events view → real-table
+    // migration: a DO initialized before this change had call_events
+    // as a VIEW, which reconcileTable's PRAGMA table_info check sees
+    // as a "table with no primary key" and fails on. Query
+    // sqlite_master so we only DROP VIEW on names that are actually
+    // views (DROP VIEW on a table throws "use DROP TABLE").
+    const entityNameSet = new Set(ALL_ENTITIES.map((e) => e.table));
+    const existingViews = sql
+      .exec<{ name: string }>(
+        `SELECT name FROM sqlite_master WHERE type = 'view'`,
+      )
+      .toArray();
+    for (const row of existingViews) {
+      if (entityNameSet.has(row.name)) {
+        sql.exec(`DROP VIEW IF EXISTS ${row.name}`);
+      }
+    }
 
     for (const entity of ALL_ENTITIES) {
       this.reconcileTable(entity);
@@ -674,6 +710,131 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ctx.storage.sql.exec(
       `UPDATE _sync_state SET drain_started_at = NULL WHERE entity = ?`,
       entity,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-parent sync state (for per_parent entities: messages, tasks,
+  // notes, form_submissions, survey_submissions where fanned out by
+  // parent). Each parent tracks its own cursor + completion flag so
+  // mid-parent errors don't lose progress and re-activated parents
+  // get revisited.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pick the next batch of parent IDs to process for a per-parent sync.
+   *
+   * Priority order:
+   *   1. Parents that haven't completed their child sync (backfill_complete = 0)
+   *   2. Parents that DID complete, but whose `freshnessColumns` have
+   *      advanced past their last_sync_at (new activity → re-visit)
+   *
+   * Within each bucket, oldest-last-sync-first so the work spreads
+   * across ticks without starving any one parent. Caller is expected
+   * to pass parent table columns (e.g. conversations.last_message_date
+   * or contacts.updated_at) that bump when something the child entity
+   * cares about has changed.
+   */
+  async getNextParentsForChild(
+    childEntity: string,
+    parentTable: string,
+    limit: number,
+    freshnessColumns: readonly string[] = [],
+  ): Promise<string[]> {
+    this.ensureInitialized();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(parentTable)) {
+      throw new Error(`Invalid parent table identifier: ${parentTable}`);
+    }
+    for (const col of freshnessColumns) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) {
+        throw new Error(`Invalid freshness column identifier: ${col}`);
+      }
+    }
+    const freshnessSql = freshnessColumns.length > 0
+      ? " OR " + freshnessColumns
+          .map((col) => `p.${col} > COALESCE(s.last_sync_at, '')`)
+          .join(" OR ")
+      : "";
+    const capped = Math.max(1, Math.min(500, Math.floor(limit)));
+    const rows = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `SELECT p.id
+           FROM ${parentTable} p
+           LEFT JOIN _parent_sync_state s
+             ON s.entity = ? AND s.parent_id = p.id
+          WHERE COALESCE(s.backfill_complete, 0) = 0${freshnessSql}
+          ORDER BY COALESCE(s.last_sync_at, ''), p.id
+          LIMIT ?`,
+        childEntity,
+        capped,
+      )
+      .toArray();
+    return rows.map((r) => String(r.id));
+  }
+
+  /** Read the persisted cursor for one parent's child sync. */
+  async getParentSyncCursor(
+    entity: string,
+    parentId: string,
+  ): Promise<string | null> {
+    this.ensureInitialized();
+    const rows = this.ctx.storage.sql
+      .exec<{ cursor: string | null }>(
+        `SELECT cursor FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
+        entity,
+        parentId,
+      )
+      .toArray();
+    return rows[0]?.cursor ?? null;
+  }
+
+  /**
+   * Advance the cursor after successfully upserting a page of children
+   * for one parent. Resets backfill_complete to 0 — we're mid-parent
+   * until the caller explicitly flips it via markParentBackfillComplete.
+   */
+  async setParentSyncCursor(
+    entity: string,
+    parentId: string,
+    cursor: string,
+  ): Promise<void> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at)
+       VALUES (?, ?, ?, 0, ?)
+       ON CONFLICT(entity, parent_id) DO UPDATE
+         SET cursor = excluded.cursor,
+             backfill_complete = 0,
+             last_sync_at = excluded.last_sync_at`,
+      entity,
+      parentId,
+      cursor,
+      now,
+    );
+  }
+
+  /**
+   * Flip the parent's child sync to complete. Called when a per-parent
+   * page loop reaches empty_page / null-next-cursor. Clears the cursor
+   * so a later re-activation (freshness bump) starts from scratch.
+   */
+  async markParentBackfillComplete(
+    entity: string,
+    parentId: string,
+  ): Promise<void> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _parent_sync_state(entity, parent_id, cursor, backfill_complete, last_sync_at)
+       VALUES (?, ?, NULL, 1, ?)
+       ON CONFLICT(entity, parent_id) DO UPDATE
+         SET cursor = NULL,
+             backfill_complete = 1,
+             last_sync_at = excluded.last_sync_at`,
+      entity,
+      parentId,
+      now,
     );
   }
 

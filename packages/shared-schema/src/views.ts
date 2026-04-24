@@ -29,37 +29,10 @@ export interface AnalyticsView {
 }
 
 export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
-  {
-    name: "call_events",
-    description:
-      "Every call message (inbound + outbound, voice + IVR) with the call-specific fields pulled out of messages.raw_payload.meta.call. Use this for call-duration analysis, missed-call detection (duration <= 5s), rep-level volume.",
-    base_tables: ["messages"],
-    ddl: `
-      CREATE VIEW call_events AS
-      SELECT
-        m.id,
-        m.location_id,
-        m.conversation_id,
-        m.contact_id,
-        m.user_id,
-        m.direction,
-        m.status,
-        m.type AS call_type,
-        m.date_added AS call_at,
-        m.call_duration_seconds AS duration_seconds,
-        CASE
-          WHEN m.status = 'voicemail' THEN 1
-          WHEN m.direction = 'inbound' AND COALESCE(m.call_duration_seconds, 0) <= 5 THEN 1
-          ELSE 0
-        END AS is_voicemail_or_missed,
-        json_extract(m.raw_payload, '$.meta.call.recordingUrl') AS recording_url,
-        json_extract(m.raw_payload, '$.meta.call.transcriptionUrl') AS transcription_url,
-        m.body AS transcript_excerpt
-      FROM messages m
-      WHERE m.type IN ('TYPE_CALL', 'TYPE_IVR_CALL', 'TYPE_CUSTOM_CALL', 'TYPE_CAMPAIGN_CALL')
-    `,
-  },
-
+  // call_events is now a REAL synced table (see entities.ts CALL_EVENTS)
+  // populated by callEventFromMessage during messages backfill. Kept out
+  // of the view list because you can't CREATE VIEW over a table with the
+  // same name; queries against call_events hit the typed table directly.
   {
     name: "email_events",
     description:
@@ -110,27 +83,27 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "lead_response_metrics",
     description:
-      "Per-contact first-inbound-call → first-outbound-callback timeline. The headline Streamlined-style metric: callback_delta_seconds between a contact's first inbound call and our first outbound call afterwards. NULL in callback columns means we never returned the call. Use this for speed-to-lead, per-rep response time, and response-rate analytics.",
-    base_tables: ["messages", "contacts"],
+      "Per-contact first-inbound-call → first-outbound-callback timeline. The headline Streamlined-style metric: callback_delta_seconds between a contact's first inbound call and our first outbound call afterwards. NULL in callback columns means we never returned the call. Use this for speed-to-lead, per-rep response time, and response-rate analytics. Built atop call_events (typed table), not raw messages.",
+    base_tables: ["call_events", "contacts"],
     ddl: `
       CREATE VIEW lead_response_metrics AS
       WITH first_inbound AS (
         SELECT contact_id,
-               MIN(date_added) AS first_inbound_at,
-               MIN(CASE WHEN COALESCE(call_duration_seconds, 0) > 5 THEN date_added END) AS first_real_inbound_at
-          FROM messages
-         WHERE type IN ('TYPE_CALL', 'TYPE_IVR_CALL', 'TYPE_CUSTOM_CALL')
-           AND direction = 'inbound'
+               MIN(event_at) AS first_inbound_at,
+               MIN(CASE WHEN COALESCE(duration_seconds, 0) > 5 THEN event_at END) AS first_real_inbound_at
+          FROM call_events
+         WHERE direction = 'inbound'
          GROUP BY contact_id
       ),
       first_outbound AS (
-        SELECT m.contact_id, MIN(m.date_added) AS first_outbound_at, m.user_id AS first_outbound_user_id
-          FROM messages m
-          JOIN first_inbound fi ON fi.contact_id = m.contact_id
-         WHERE m.type IN ('TYPE_CALL', 'TYPE_IVR_CALL', 'TYPE_CUSTOM_CALL', 'TYPE_CAMPAIGN_CALL')
-           AND m.direction = 'outbound'
-           AND m.date_added > fi.first_inbound_at
-         GROUP BY m.contact_id, m.user_id
+        SELECT ce.contact_id,
+               MIN(ce.event_at) AS first_outbound_at,
+               ce.user_id AS first_outbound_user_id
+          FROM call_events ce
+          JOIN first_inbound fi ON fi.contact_id = ce.contact_id
+         WHERE ce.direction = 'outbound'
+           AND ce.event_at > fi.first_inbound_at
+         GROUP BY ce.contact_id, ce.user_id
       )
       SELECT
         c.id AS contact_id,

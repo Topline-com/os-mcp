@@ -52,6 +52,17 @@ type LocationDOStub = {
   setUpstreamTotal(entity: string, total: number): Promise<void>;
   pruneStaleRows(table: string, drainStartedAt: string): Promise<number>;
   clearDrainMarker(entity: string): Promise<void>;
+  // Per-parent sync state — durable cursor + completion flag per parent
+  // for per_parent entities (messages, call_events, tasks, notes).
+  getNextParentsForChild(
+    childEntity: string,
+    parentTable: string,
+    limit: number,
+    freshnessColumns?: readonly string[],
+  ): Promise<string[]>;
+  getParentSyncCursor(entity: string, parentId: string): Promise<string | null>;
+  setParentSyncCursor(entity: string, parentId: string, cursor: string): Promise<void>;
+  markParentBackfillComplete(entity: string, parentId: string): Promise<void>;
 };
 
 function locationStub(
@@ -106,14 +117,10 @@ const DEFAULT_PAGE_LIMIT = 100;
 // per invocation (Paid tier) — conservatively budget for ~20 parents
 // per run. Each parent costs one GHL fetch + one DO upsert = 2
 // subrequests, plus per-page follow-ups. 20 × (say 3 pages + 3 upserts)
-// = ~120 subrequests leaves plenty of headroom.
-//
-// For initial backfill of a tenant with hundreds of parents, callers
-// repeatedly hit /sync/backfill?entity=messages; a future resume-state
-// implementation (track "last parent processed") will make this
-// automatic. Until then each invocation processes the next batch based
-// on which children are missing.
-const MAX_PARENTS_PER_INVOCATION = 20;
+// = ~120 subrequests leaves plenty of headroom. Re-declared as the
+// single source of truth in the per_parent backfill section below;
+// this legacy comment is retained so the rationale survives the
+// constant's move.
 
 // ---------------------------------------------------------------------------
 // Public: dispatcher
@@ -157,6 +164,19 @@ export async function backfillEntity(
       connectionId,
       connection.location_id,
       `Backfill contract for ${entityTable} is marked "unknown" in the manifest. Verify against live GHL before syncing.`,
+    );
+  }
+
+  // call_events is a derived table: rows are written as a side effect
+  // of backfillPerParent when entity.table === "messages". Don't offer
+  // a direct backfill path for it — redirect the caller to messages.
+  if (entityTable === "call_events") {
+    return unsupportedResult(
+      started,
+      entityTable,
+      connectionId,
+      connection.location_id,
+      "call_events is derived automatically while syncing messages; run /sync/backfill?entity=messages instead.",
     );
   }
 
@@ -521,6 +541,166 @@ function parseCursor(stored: string): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// callEventFromMessage — normalize a raw GHL message into a call_events row.
+//
+// GHL's call fields are inconsistently placed across endpoints:
+//   - duration: sometimes `duration`, sometimes `call.duration`,
+//     `meta.duration`, `meta.call.duration`, `metadata.duration`
+//   - voicemail/missed: sometimes booleans, sometimes strings, sometimes
+//     inferred from status = "voicemail"
+//   - recording: `recordingUrl`, `call.recordingUrl`, `meta.call.recordingUrl`
+//
+// We try every candidate path once per field. When upstream doesn't
+// supply a value we leave NULL and the LLM can fall back to checking
+// status / duration heuristics.
+// ---------------------------------------------------------------------------
+
+const CALL_MESSAGE_TYPES = new Set([
+  "TYPE_CALL",
+  "TYPE_IVR_CALL",
+  "TYPE_CUSTOM_CALL",
+  "TYPE_CAMPAIGN_CALL",
+]);
+
+function callEventFromMessage(
+  raw: Record<string, unknown>,
+  locationId: string,
+  parentConversationId: string,
+): Record<string, unknown> | null {
+  const messageType = firstString(raw, ["messageType", "type"]);
+  if (!messageType || !CALL_MESSAGE_TYPES.has(messageType)) return null;
+
+  const messageId = firstString(raw, ["id", "_id", "messageId"]);
+  if (!messageId) return null;
+
+  const duration = firstNumber(raw, [
+    "duration",
+    "durationSeconds",
+    "call.duration",
+    "meta.call.duration",
+    "meta.duration",
+    "metadata.duration",
+  ]);
+  const callStatus = firstString(raw, [
+    "callStatus",
+    "call.status",
+    "meta.call.status",
+    "meta.callStatus",
+    "metadata.callStatus",
+  ]);
+  const recordingUrl = firstString(raw, [
+    "recordingUrl",
+    "call.recordingUrl",
+    "meta.call.recordingUrl",
+    "meta.recordingUrl",
+    "metadata.recordingUrl",
+  ]);
+  const transcriptionUrl = firstString(raw, [
+    "transcriptionUrl",
+    "call.transcriptionUrl",
+    "meta.call.transcriptionUrl",
+  ]);
+  const voicemail = firstBooleanish(raw, [
+    "voicemail",
+    "isVoicemail",
+    "call.voicemail",
+    "meta.call.voicemail",
+  ]);
+  const missed = firstBooleanish(raw, [
+    "missed",
+    "isMissed",
+    "call.missed",
+    "meta.call.missed",
+  ]);
+
+  return {
+    id: messageId,
+    location_id: locationId,
+    message_id: messageId,
+    conversation_id:
+      firstString(raw, ["conversationId", "conversation_id"]) ?? parentConversationId,
+    contact_id: firstString(raw, ["contactId", "contact_id"]),
+    direction: firstString(raw, ["direction"]),
+    call_type: messageType,
+    event_at: normalizeTimestamp(firstValue(raw, ["dateAdded", "createdAt", "timestamp"])),
+    status: firstString(raw, ["status"]),
+    call_status: callStatus,
+    duration_seconds: duration,
+    recording_url: recordingUrl,
+    transcription_url: transcriptionUrl,
+    voicemail,
+    missed,
+    user_id: firstString(raw, ["userId", "user_id", "assignedTo", "assigned_to"]),
+    from_number: firstString(raw, ["from", "fromNumber", "from_number"]),
+    to_number: firstString(raw, ["to", "toNumber", "to_number"]),
+    raw_payload: raw,
+  };
+}
+
+function firstValue(raw: Record<string, unknown>, paths: readonly string[]): unknown {
+  for (const path of paths) {
+    const value = getByPath(raw, path);
+    if (value !== null && value !== undefined && value !== "") return value;
+  }
+  return null;
+}
+
+function firstString(raw: Record<string, unknown>, paths: readonly string[]): string | null {
+  const v = firstValue(raw, paths);
+  return v === null || v === undefined ? null : String(v);
+}
+
+function firstNumber(raw: Record<string, unknown>, paths: readonly string[]): number | null {
+  const v = firstValue(raw, paths);
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+function firstBooleanish(raw: Record<string, unknown>, paths: readonly string[]): number | null {
+  const v = firstValue(raw, paths);
+  if (typeof v === "boolean") return v ? 1 : 0;
+  if (typeof v === "number") return v ? 1 : 0;
+  if (typeof v === "string") {
+    const n = v.toLowerCase();
+    if (["true", "yes", "1", "voicemail", "missed"].includes(n)) return 1;
+    if (["false", "no", "0"].includes(n)) return 0;
+  }
+  return null;
+}
+
+function normalizeTimestamp(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return new Date(value).toISOString();
+  }
+  if (typeof value === "string" && value.length > 0) {
+    const n = Number(value);
+    if (Number.isFinite(n) && value.length >= 10) return new Date(n).toISOString();
+    return value;
+  }
+  return null;
+}
+
+/**
+ * Pick the set of parent-table columns whose advance indicates "this
+ * parent has new children we should re-visit." For messages/call_events
+ * it's conversations.last_message_date; for tasks/notes on contacts
+ * it's contacts.updated_at.
+ */
+function parentFreshnessColumns(parent: EntityManifest): readonly string[] {
+  const available = new Set(parent.columns.map((c) => c.name));
+  const candidates = [
+    parent.incremental.cursor_column,
+    "updated_at",
+    "last_message_date",
+  ].filter((c): c is string => typeof c === "string" && available.has(c));
+  return Array.from(new Set(candidates));
+}
+
+// ---------------------------------------------------------------------------
 // Structured cursor helpers (BackfillDescriptor.cursor).
 //
 // GHL's cursor shapes vary per endpoint; these helpers normalize the mess:
@@ -646,34 +826,37 @@ function unsupportedResult(
 }
 
 // ---------------------------------------------------------------------------
-// per_parent — messages. Walks every parent row (conversations) and
-// paginates its children. Runs in two modes off the `backfill_complete`
-// flag in _sync_state:
+// per_parent — messages, call_events (derived), tasks, notes, and any
+// future entity whose upstream shape is "one endpoint per parent id".
 //
-//   fresh drain   (backfill_complete = false)
-//     Iterate every parent in id-ASC order starting from the persisted
-//     parent-id resume cursor. Fully paginate each parent's children
-//     within the invocation's subrequest budget. Advance the cursor to
-//     the last fully-processed parent id after every parent. When the
-//     next parent query returns zero rows we've walked the whole list
-//     → mark backfill_complete = 1 and clear the cursor.
+// Progress lives in _parent_sync_state (entity, parent_id) — one row
+// per parent, not one row per entity. Each parent tracks its own
+// cursor + backfill_complete flag. That means:
 //
-//   steady state  (backfill_complete = true)
-//     Iterate parents whose cursor_column (conversations.last_message_
-//     date for messages) has advanced past the child's watermark —
-//     i.e. parents that received new messages since last tick. Re-fetch
-//     page 1 of each; upserts dedupe by id. Advance the watermark to
-//     the max cursor_column processed this tick. Cost: one subrequest
-//     per active parent, not thousands of idle ones.
+//   - Mid-parent subrequest-cap errors don't lose progress; the next
+//     invocation resumes the same parent from the persisted cursor.
+//   - A re-activated parent (conversation with a new message, contact
+//     with a new task) gets revisited automatically because the
+//     `getNextParentsForChild` RPC prioritizes parents whose freshness
+//     column has advanced past last_sync_at.
+//   - Empty parents flip complete on their first pass instead of being
+//     re-probed forever.
+//
+// Supports two endpoint shapes via the manifest:
+//   (a) path template: endpoint "/contacts/{parent}/tasks"
+//   (b) query param:   endpoint "/forms/submissions",
+//                      per_parent.request_param "formId"
+//
+// Dual-write: when entity.table === "messages" we also extract
+// call-event rows via callEventFromMessage and upsert them into
+// call_events in the same cycle. This keeps the typed call_events
+// table always consistent with its source messages.
 // ---------------------------------------------------------------------------
 
 // Paid-plan-friendly sizing. Each parent typically costs 1–3 GHL
 // subrequests + 1 DO upsert RPC, so 200 parents × ~4 calls = ~800
-// under the 1000-subrequest Cloudflare cap. Steady-state walks only
-// parents whose activity has advanced, so the higher cap rarely
-// matters — but keeps headroom for bursty re-polls.
-const MAX_PARENTS_PER_INVOCATION_FRESH = 200;
-const MAX_PARENTS_PER_INVOCATION_STEADY = 200;
+// under the 1000-subrequest Cloudflare cap.
+const MAX_PARENTS_PER_INVOCATION = 200;
 
 async function backfillPerParent(
   env: SyncEnv,
@@ -692,13 +875,19 @@ async function backfillPerParent(
       `per_parent entity ${entity.table} has no per_parent descriptor.`,
     );
   }
-  if (!backfill.cursor_request_param || !backfill.cursor_response_field) {
+  // Cursor metadata is only required for paginated children. Tasks /
+  // notes use pagination: "none" (one page per parent is all GHL
+  // gives you), so those don't need cursor_request_param.
+  if (
+    backfill.pagination === "cursor" &&
+    (!backfill.cursor_request_param || !backfill.cursor_response_field)
+  ) {
     return unsupportedResult(
       started,
       entity.table,
       connectionId,
       connection.location_id,
-      `per_parent entity ${entity.table} is missing cursor metadata.`,
+      `per_parent entity ${entity.table} with pagination=cursor is missing cursor metadata.`,
     );
   }
 
@@ -713,57 +902,39 @@ async function backfillPerParent(
     );
   }
 
-  const stub = locationStub(env.LOCATION_DO, connection.location_id);
-  const priorState = await stub.getSyncState();
-  const stateRow = priorState[entity.table];
-  const isFresh = !stateRow?.backfill_complete;
-
-  const fkColumn = backfill.per_parent.parent_fk_column;
   const endpointTemplate = backfill.endpoint;
-  if (!endpointTemplate.includes("{parent}")) {
+  const usesPathTemplate = endpointTemplate.includes("{parent}");
+  if (!usesPathTemplate && !backfill.per_parent.request_param) {
     return unsupportedResult(
       started,
       entity.table,
       connectionId,
       connection.location_id,
-      `per_parent endpoint ${endpointTemplate} must contain {parent}.`,
+      `per_parent endpoint ${endpointTemplate} must contain {parent} or set per_parent.request_param.`,
     );
   }
 
-  // Parent selection differs by mode.
-  //
-  // Fresh drain: resume after the last fully-processed parent id. Order
-  // by id ASC so iteration is deterministic and monotonic across runs
-  // even if new conversations arrive mid-drain (they'd have ids after
-  // the resume pointer, which is fine — they'll be picked up eventually).
-  //
-  // Steady state: find parents whose activity has advanced past our
-  // child watermark. conversations.last_message_date bumps on every
-  // new message, so joining by (last_message_date > child_watermark)
-  // hits exactly the set that might carry unsynced children.
-  const parentQuery = await resolveParentBatch(
-    stub,
-    entity,
+  const stub = locationStub(env.LOCATION_DO, connection.location_id);
+  const fkColumn = backfill.per_parent.parent_fk_column;
+
+  // Pull the next batch of parents to process. The DO RPC prioritizes
+  // parents that aren't complete yet, then parents whose freshness
+  // column has advanced since their last sync.
+  const parentIds = await stub.getNextParentsForChild(
+    entity.table,
     parentEntity.table,
-    isFresh,
-    stateRow?.cursor ?? null,
-    stateRow?.watermark ?? null,
+    MAX_PARENTS_PER_INVOCATION,
+    parentFreshnessColumns(parentEntity),
   );
 
-  if (parentQuery.rows.length === 0) {
-    // Fresh drain with no remaining parents → we've walked them all.
-    // Flip backfill_complete so the next run switches to steady state.
-    if (isFresh) {
-      try {
-        await stub.clearSyncCursor(entity.table);
-      } catch {
-        // non-fatal
-      }
-      try {
-        await stub.markBackfillComplete(entity.table);
-      } catch {
-        // non-fatal
-      }
+  if (parentIds.length === 0) {
+    // No remaining parents needing work this tick. Flip the entity-
+    // level backfill_complete so the cron's freshness signals know
+    // every parent has been visited at least once.
+    try {
+      await stub.markBackfillComplete(entity.table);
+    } catch {
+      // non-fatal
     }
     return {
       entity: entity.table,
@@ -771,54 +942,63 @@ async function backfillPerParent(
       location_id: connection.location_id,
       pages: 0,
       rows_upserted: 0,
-      row_count_after: stateRow?.row_count ?? 0,
+      row_count_after: 0,
       final_cursor: null,
       duration_ms: Date.now() - started,
       stopped_reason: "empty_page",
-      ...(isFresh ? {} : { error: "No active parents since watermark; nothing to refresh this tick." }),
     };
   }
 
   let totalPages = 0;
   let rowsUpserted = 0;
-  let lastRowCount = stateRow?.row_count ?? 0;
-  let lastProcessedParentId: string | null = null;
-  let maxParentCursor: string | null = null;
+  let callEventsUpserted = 0; // diagnostic only; logged on completion
+  let lastRowCount = 0;
   let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
 
   try {
     await runInContext(connection, async () => {
-      parentLoop: for (const parentRow of parentQuery.rows) {
-        const parentId = String(parentRow.id);
-        const parentCursorValue = parentRow.parent_cursor as string | null | undefined;
-
-        let cursorValue: unknown = null;
-        let cursorSerialized: string | null = null;
+      parentLoop: for (const parentId of parentIds) {
+        const priorParentCursor = await stub.getParentSyncCursor(entity.table, parentId);
+        let cursorValue: unknown = priorParentCursor
+          ? parseCursor(priorParentCursor)
+          : null;
+        let cursorSerialized: string | null = priorParentCursor;
         let pagesForParent = 0;
-        // Steady-state mode limits pages-per-parent to 1 by default so
-        // we don't burn budget re-paging conversations that already
-        // have their history in the DO.
-        const perParentPageCap = isFresh ? MAX_PAGES_PER_INVOCATION : 1;
+        let parentCompleted = false;
 
-        while (pagesForParent < perParentPageCap) {
+        while (pagesForParent < MAX_PAGES_PER_INVOCATION) {
           if (totalPages >= MAX_PAGES_PER_INVOCATION) {
             stoppedReason = "page_cap_hit";
             break parentLoop;
           }
 
-          const query: Record<string, string | number | boolean | undefined> = {
-            limit: DEFAULT_PAGE_LIMIT,
-          };
+          const query: Record<string, string | number | boolean | undefined> = {};
+          // Only set `limit` on cursor-paginated endpoints. Some
+          // single-page per-parent endpoints (/contacts/{id}/notes)
+          // 422 on any `limit` param at all.
+          if (backfill.pagination === "cursor") {
+            query.limit = DEFAULT_PAGE_LIMIT;
+          }
           if (backfill.query_extras) {
             for (const [k, v] of Object.entries(backfill.query_extras)) {
               query[k] = v;
             }
           }
-          if (cursorValue !== null && cursorValue !== undefined) {
-            query[backfill.cursor_request_param!] = String(cursorValue);
+          if (
+            backfill.cursor_request_param &&
+            cursorValue !== null &&
+            cursorValue !== undefined
+          ) {
+            query[backfill.cursor_request_param] = String(cursorValue);
           }
-          const endpoint = endpointTemplate.replace("{parent}", parentId);
+          if (backfill.per_parent!.request_param) {
+            query[backfill.per_parent!.request_param!] = parentId;
+          }
+          const endpoint = resolveEndpoint(
+            usesPathTemplate ? endpointTemplate.replace("{parent}", parentId) : endpointTemplate,
+            connection.location_id,
+          );
 
           const response = await toplineFetch<Record<string, unknown>>(endpoint, {
             method: backfill.method,
@@ -827,39 +1007,70 @@ async function backfillPerParent(
 
           const itemsField = backfill.items_field ?? entity.table;
           const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-          if (!Array.isArray(items) || items.length === 0) break;
+          if (!Array.isArray(items) || items.length === 0) {
+            parentCompleted = true;
+            break;
+          }
 
-          // Denormalize: stamp the parent FK onto each row before mapping.
           const rows = items.map((raw) => {
             const row = mapRow(entity, raw);
             if (row[fkColumn] === null || row[fkColumn] === undefined) {
               row[fkColumn] = parentId;
+            }
+            if (row.location_id === null || row.location_id === undefined) {
+              row.location_id = connection.location_id;
             }
             return row;
           });
           const result: UpsertResult = await stub.upsertRows(entity.table, rows);
           rowsUpserted += result.upserted;
           lastRowCount = result.row_count_after;
+
+          // Dual-write call_events from messages. Each TYPE_CALL /
+          // TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL
+          // message becomes a call_events row with duration + status
+          // + voicemail/missed flags normalized across GHL's varied
+          // shapes.
+          if (entity.table === "messages") {
+            const callRows: Record<string, unknown>[] = [];
+            for (const raw of items) {
+              const ce = callEventFromMessage(raw, connection.location_id, parentId);
+              if (ce) callRows.push(ce);
+            }
+            if (callRows.length > 0) {
+              const ceResult = await stub.upsertRows("call_events", callRows);
+              callEventsUpserted += ceResult.upserted;
+            }
+          }
+
           totalPages += 1;
           pagesForParent += 1;
 
+          // Non-cursor pagination (tasks, notes): first page is all we
+          // get. Mark parent complete.
+          if (backfill.pagination !== "cursor") {
+            parentCompleted = true;
+            break;
+          }
           const nextCursor = getByPath(response, backfill.cursor_response_field!);
-          if (nextCursor === null || nextCursor === undefined) break;
+          if (nextCursor === null || nextCursor === undefined) {
+            parentCompleted = true;
+            break;
+          }
           const nextSerialized = serializeCursor(nextCursor);
-          if (nextSerialized === cursorSerialized) break;
+          if (nextSerialized === cursorSerialized) {
+            parentCompleted = true;
+            break;
+          }
           cursorValue = nextCursor;
           cursorSerialized = nextSerialized;
+          // Persist mid-parent cursor so a subrequest-cap failure on
+          // the next page can resume from here.
+          await stub.setParentSyncCursor(entity.table, parentId, nextSerialized);
         }
 
-        // Advance per-mode progress markers AFTER a parent's pagination
-        // completes — never mid-parent — so resuming later doesn't skip
-        // half-processed parents.
-        lastProcessedParentId = parentId;
-        if (parentCursorValue !== null && parentCursorValue !== undefined) {
-          const s = String(parentCursorValue);
-          if (maxParentCursor === null || s > maxParentCursor) {
-            maxParentCursor = s;
-          }
+        if (parentCompleted) {
+          await stub.markParentBackfillComplete(entity.table, parentId);
         }
       }
     });
@@ -872,21 +1083,10 @@ async function backfillPerParent(
       : String(err);
   }
 
-  // Persist mode-specific progress so the next invocation picks up where
-  // this one left off.
-  if (isFresh && lastProcessedParentId !== null) {
-    try {
-      await stub.setSyncCursor(entity.table, lastProcessedParentId);
-    } catch {
-      // non-fatal
-    }
-  }
-  if (!isFresh && maxParentCursor !== null) {
-    try {
-      await stub.setSyncWatermark(entity.table, maxParentCursor);
-    } catch {
-      // non-fatal
-    }
+  if (callEventsUpserted > 0) {
+    console.log(
+      `[per_parent:${entity.table}] dual-wrote ${callEventsUpserted} call_events rows`,
+    );
   }
 
   return {
@@ -896,68 +1096,11 @@ async function backfillPerParent(
     pages: totalPages,
     rows_upserted: rowsUpserted,
     row_count_after: lastRowCount,
-    final_cursor: lastProcessedParentId,
+    final_cursor: null,
     duration_ms: Date.now() - started,
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
   };
-}
-
-/**
- * Select the next batch of parent rows to walk. Returns a uniform shape
- * of { id, parent_cursor } regardless of mode so the caller doesn't have
- * to special-case steady vs fresh in the loop body.
- *
- * Fresh: `SELECT id, NULL FROM <parent> WHERE id > ? ORDER BY id ASC`
- * Steady: `SELECT id, <cursor_col> FROM <parent>
- *             WHERE <cursor_col> > ? ORDER BY <cursor_col> ASC`
- *
- * The steady-state cursor_col comes from the child entity's
- * incremental.cursor_column setting mapped into the parent's schema.
- * For messages → conversations, that's last_message_date.
- */
-async function resolveParentBatch(
-  stub: LocationDOStub,
-  entity: EntityManifest,
-  parentTable: string,
-  isFresh: boolean,
-  resumeCursor: string | null,
-  watermark: string | null,
-): Promise<QueryResult> {
-  if (isFresh) {
-    const limit = MAX_PARENTS_PER_INVOCATION_FRESH;
-    if (resumeCursor) {
-      return stub.executeQuery(
-        `SELECT id, NULL AS parent_cursor FROM ${parentTable} WHERE id > ? ORDER BY id ASC LIMIT ${limit}`,
-        [resumeCursor],
-      );
-    }
-    return stub.executeQuery(
-      `SELECT id, NULL AS parent_cursor FROM ${parentTable} ORDER BY id ASC LIMIT ${limit}`,
-      [],
-    );
-  }
-  // Steady-state: activity-driven parent selection. The parent table
-  // should carry a column whose value bumps when any child mutates.
-  // For messages this is conversations.last_message_date (always
-  // updated by the platform when a new message lands).
-  const parentCursorCol = parentTable === "conversations" ? "last_message_date" : "updated_at";
-  const limit = MAX_PARENTS_PER_INVOCATION_STEADY;
-  if (watermark) {
-    return stub.executeQuery(
-      `SELECT id, ${parentCursorCol} AS parent_cursor FROM ${parentTable}
-       WHERE ${parentCursorCol} > ? ORDER BY ${parentCursorCol} ASC LIMIT ${limit}`,
-      [watermark],
-    );
-  }
-  // No watermark yet → first steady-state tick. Refresh the N most
-  // recently active parents to prime. Subsequent ticks will only see
-  // forward deltas.
-  return stub.executeQuery(
-    `SELECT id, ${parentCursorCol} AS parent_cursor FROM ${parentTable}
-     WHERE ${parentCursorCol} IS NOT NULL ORDER BY ${parentCursorCol} DESC LIMIT ${limit}`,
-    [],
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1352,6 +1495,25 @@ export async function incrementalEntity(
   const state = await stub.getSyncState();
   const stateRow = state[entity.table];
 
+  // call_events rides along with messages. Trying to run its incremental
+  // independently would double-fetch or error confusingly — short-circuit.
+  if (entityTable === "call_events") {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "unsupported_mode",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: stateRow?.watermark ?? null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: "call_events is derived alongside messages; run incremental/backfill for messages.",
+    };
+  }
+
   // Poll-full entities: re-run the poll_full backfill. Cheap, idempotent.
   if (entity.incremental.type === "poll_full") {
     const res = await backfillPollFull(env, connection, entity, started, connectionId);
@@ -1638,6 +1800,8 @@ export const DEFAULT_INCREMENTAL_ORDER: readonly string[] = [
   "tags",
   "custom_fields",
   "custom_values",
+  "forms",
+  "surveys",
   "pipelines",
   "pipeline_stages",
   "contacts",
@@ -1646,7 +1810,11 @@ export const DEFAULT_INCREMENTAL_ORDER: readonly string[] = [
   // selector in backfillPerParent sees the freshest last_message_date
   // values and fans out to the right conversations.
   "conversations",
-  "messages",
+  "messages", // dual-writes to call_events
+  "form_submissions",
+  "survey_submissions",
+  "tasks", // per-parent over contacts
+  "notes", // per-parent over contacts
 ];
 
 export async function incrementalAll(
@@ -1689,12 +1857,18 @@ export const DEFAULT_BACKFILL_ORDER: readonly string[] = [
   "tags",
   "custom_fields",
   "custom_values",
+  "forms",
+  "surveys",
   "pipelines",
   "pipeline_stages",
   "contacts",
   "opportunities",
   "conversations",
   "messages",
+  "form_submissions",
+  "survey_submissions",
+  "tasks",
+  "notes",
   "appointments",
 ];
 

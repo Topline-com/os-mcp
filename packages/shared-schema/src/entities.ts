@@ -410,6 +410,83 @@ export const MESSAGES: EntityManifest = {
   exposed: true,
 };
 
+/**
+ * CALL_EVENTS — a real synced table, NOT a view.
+ *
+ * The view version of this (views.ts, pre-merge) read json_extract
+ * from messages.raw_payload and depended on GHL putting call data
+ * consistently under `meta.call.duration`. In practice GHL's shape
+ * varies per message (some rows have `duration`, some `call.duration`,
+ * some `meta.call.duration`, some `metadata.duration`). Extracting
+ * once at sync time — with a multi-path normalizer — gets consistent
+ * typed columns and avoids JSON extraction overhead on every query.
+ *
+ * Populated by sync's callEventFromMessage() during backfillPerParent
+ * of messages. Has its own stable row id (the source message's id),
+ * its own indexes, and its own stream of updates via the messages
+ * per-parent sync cycle.
+ */
+export const CALL_EVENTS: EntityManifest = {
+  table: "call_events",
+  description: "Individual phone call events (inbound + outbound + IVR). One row per call message, with duration / status / voicemail flag normalized out of the varied GHL shapes. Use this for callback-time, voicemail-rate, per-rep call volume. Subset of messages — every call_event row has a matching messages row.",
+  phase: 1,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable call-event ID (matches the source message's id)." },
+    LOCATION_ID,
+    { name: "message_id", sqlite_type: "TEXT", nullable: false, description: "Source messages.id this event was derived from.", indexed: true, references: "messages.id" },
+    { name: "conversation_id", sqlite_type: "TEXT", nullable: true, description: "Parent conversation.", indexed: true, references: "conversations.id" },
+    { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "Contact the call was with.", indexed: true, references: "contacts.id" },
+    { name: "direction", sqlite_type: "TEXT", nullable: true, description: "", enum: ["inbound", "outbound"], indexed: true },
+    { name: "call_type", sqlite_type: "TEXT", nullable: true, description: "TYPE_CALL / TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL" },
+    { name: "event_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the call.", indexed: true },
+    { name: "status", sqlite_type: "TEXT", nullable: true, description: "Delivery status as the message carried it." },
+    { name: "call_status", sqlite_type: "TEXT", nullable: true, description: "Call disposition (completed / no-answer / busy / failed / voicemail) when upstream provides one." },
+    { name: "duration_seconds", sqlite_type: "REAL", nullable: true, description: "Call length in seconds. NULL for unknown. ≤ 5 + direction='inbound' is a reliable voicemail/missed heuristic." },
+    { name: "recording_url", sqlite_type: "TEXT", nullable: true, description: "Recording URL if captured by upstream." },
+    { name: "transcription_url", sqlite_type: "TEXT", nullable: true, description: "Transcription URL if captured." },
+    { name: "voicemail", sqlite_type: "INTEGER", nullable: true, description: "1 when upstream marks this as voicemail; NULL when unknown." },
+    { name: "missed", sqlite_type: "INTEGER", nullable: true, description: "1 when upstream marks no-answer/missed; NULL when unknown." },
+    { name: "user_id", sqlite_type: "TEXT", nullable: true, description: "User/agent handling the call.", indexed: true, references: "users.id" },
+    { name: "from_number", sqlite_type: "TEXT", nullable: true, description: "Caller phone number when captured." },
+    { name: "to_number", sqlite_type: "TEXT", nullable: true, description: "Destination phone number when captured." },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    // Derived from messages during its per-parent sync — no direct
+    // endpoint of our own. The dispatcher refuses calls for this table
+    // and points at /sync/backfill?entity=messages instead.
+    endpoint: "/conversations/{parent}/messages",
+    method: "GET",
+    pagination: "cursor",
+    items_field: "messages.messages",
+    cursor_response_field: "messages.lastMessageId",
+    cursor_request_param: "lastMessageId",
+    query_extras: { limit: 100 },
+    per_parent: { parent_entity: "conversations", parent_fk_column: "conversation_id" },
+  },
+  incremental: {
+    type: "per_parent",
+    cursor_column: "event_at",
+    poll_interval_minutes: 15,
+    filter_ready: true,
+  },
+  webhooks: [
+    { ghl_event: "InboundMessage", kind: "upsert" },
+    { ghl_event: "OutboundMessage", kind: "upsert" },
+  ],
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Dual-written during messages backfill by callEventFromMessage. Freshness follows messages' active-parent cycle. Queryable alongside messages for richer typed fields.",
+  },
+  exposed: true,
+};
+
 export const APPOINTMENTS: EntityManifest = {
   table: "appointments",
   description: "Scheduled calendar appointments. Join to contacts (contact_id), calendars (calendar_id).",
@@ -738,6 +815,244 @@ export const CALENDAR_GROUPS: EntityManifest = {
   exposed: true,
 };
 
+export const FORMS: EntityManifest = {
+  table: "forms",
+  description: "Form definitions (title, embed URL). Join target for form_submissions.form_id.",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable form ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Display name.", indexed: true },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/forms/",
+    method: "GET",
+    pagination: "none",
+    items_field: "forms",
+  },
+  incremental: { type: "poll_full", poll_interval_minutes: 60, filter_ready: true },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Tiny table; hourly poll is plenty.",
+  },
+  exposed: true,
+};
+
+export const FORM_SUBMISSIONS: EntityManifest = {
+  table: "form_submissions",
+  description: "Form submissions (one row per submit event). Join form_id → forms.id and contact_id → contacts.id for funnel analysis. 'others' carries the raw per-field answers.",
+  phase: 1,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable submission ID." },
+    LOCATION_ID,
+    { name: "form_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "forms.id", source_path: "formId" },
+    { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Submitter name as captured on the form." },
+    { name: "email", sqlite_type: "TEXT", nullable: true, description: "Submitter email.", indexed: true },
+    { name: "phone", sqlite_type: "TEXT", nullable: true, description: "Submitter phone." },
+    { name: "others", sqlite_type: "TEXT", nullable: true, json: true, description: "Full per-field JSON object GHL returns (includes the form's custom fields)." },
+    { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "createdAt", timestamp_format: "iso8601" },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    // Location-scoped endpoint; GHL returns {submissions[], meta:{total,
+    // currentPage, nextPage, prevPage}}. Page-number pagination.
+    endpoint: "/forms/submissions",
+    method: "GET",
+    pagination: "cursor",
+    items_field: "submissions",
+    cursor: {
+      source: "meta",
+      fields: [
+        { request_param: "page", response_path: "nextPage" },
+      ],
+    },
+    query_extras: { limit: 100 },
+  },
+  incremental: {
+    type: "poll_full",
+    cursor_column: "created_at",
+    poll_interval_minutes: 30,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Page-number paginated. In steady state, walk-to-watermark only re-pulls recent submissions.",
+  },
+  exposed: true,
+};
+
+export const SURVEYS: EntityManifest = {
+  table: "surveys",
+  description: "Survey definitions. Parent of survey_submissions.",
+  phase: 3,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable survey ID." },
+    LOCATION_ID,
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Display name.", indexed: true },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/surveys/",
+    method: "GET",
+    pagination: "none",
+    items_field: "surveys",
+  },
+  incremental: { type: "poll_full", poll_interval_minutes: 60, filter_ready: true },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
+export const SURVEY_SUBMISSIONS: EntityManifest = {
+  table: "survey_submissions",
+  description: "Survey responses. One row per submit. Join survey_id → surveys.id and contact_id → contacts.id.",
+  phase: 2,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable submission ID." },
+    LOCATION_ID,
+    { name: "survey_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "surveys.id", source_path: "surveyId" },
+    { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
+    { name: "name", sqlite_type: "TEXT", nullable: true, description: "Submitter name." },
+    { name: "email", sqlite_type: "TEXT", nullable: true, description: "Submitter email.", indexed: true },
+    { name: "phone", sqlite_type: "TEXT", nullable: true, description: "Submitter phone." },
+    { name: "others", sqlite_type: "TEXT", nullable: true, json: true, description: "Full per-field JSON." },
+    { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "createdAt", timestamp_format: "iso8601" },
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/surveys/submissions",
+    method: "GET",
+    pagination: "cursor",
+    items_field: "submissions",
+    cursor: {
+      source: "meta",
+      fields: [
+        { request_param: "page", response_path: "nextPage" },
+      ],
+    },
+    query_extras: { limit: 100 },
+  },
+  incremental: {
+    type: "poll_full",
+    cursor_column: "created_at",
+    poll_interval_minutes: 30,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
+export const TASKS: EntityManifest = {
+  table: "tasks",
+  description: "Tasks attached to contacts (title, dueDate, completed). Useful for stale-follow-up / workload analytics per rep.",
+  phase: 2,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable task ID." },
+    LOCATION_ID,
+    { name: "contact_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
+    { name: "title", sqlite_type: "TEXT", nullable: true, description: "" },
+    { name: "body", sqlite_type: "TEXT", nullable: true, description: "Task details." },
+    { name: "assigned_to", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "users.id", source_path: "assignedTo" },
+    { name: "due_date", sqlite_type: "TEXT", nullable: true, description: "Due date/time.", indexed: true, source_path: "dueDate", timestamp_format: "iso8601" },
+    { name: "completed", sqlite_type: "INTEGER", nullable: true, description: "0 or 1." },
+    CREATED_AT,
+    UPDATED_AT,
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/contacts/{parent}/tasks",
+    method: "GET",
+    pagination: "none",
+    items_field: "tasks",
+    per_parent: { parent_entity: "contacts", parent_fk_column: "contact_id" },
+  },
+  incremental: {
+    type: "per_parent",
+    cursor_column: "updated_at",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+    notes: "Per-contact fanout. Uses durable _parent_sync_state so drains resume across subrequest-cap hits.",
+  },
+  exposed: true,
+};
+
+export const NOTES: EntityManifest = {
+  table: "notes",
+  description: "Free-form notes attached to contacts. Useful for context mining ('find contacts whose notes mention X').",
+  phase: 2,
+  primary_key: "id",
+  columns: [
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable note ID." },
+    LOCATION_ID,
+    { name: "contact_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
+    { name: "body", sqlite_type: "TEXT", nullable: true, description: "Note text." },
+    { name: "user_id", sqlite_type: "TEXT", nullable: true, description: "Author user id when set.", indexed: true, references: "users.id", source_path: "userId" },
+    CREATED_AT,
+    UPDATED_AT,
+    RAW_PAYLOAD,
+    SYNCED_AT,
+  ],
+  backfill: {
+    endpoint: "/contacts/{parent}/notes",
+    method: "GET",
+    pagination: "none",
+    items_field: "notes",
+    per_parent: { parent_entity: "contacts", parent_fk_column: "contact_id" },
+  },
+  incremental: {
+    type: "per_parent",
+    cursor_column: "updated_at",
+    poll_interval_minutes: 60,
+    filter_ready: true,
+  },
+  audit: {
+    live_tested: true,
+    stable_pk: true,
+    backfill_path: true,
+    incremental_path: true,
+    update_cursor: false,
+  },
+  exposed: true,
+};
+
 /** Every entity defined in this manifest. Order matters for table creation
  * (metadata tables first so FK hints resolve). */
 export const ALL_ENTITIES: readonly EntityManifest[] = [
@@ -748,11 +1063,18 @@ export const ALL_ENTITIES: readonly EntityManifest[] = [
   TAGS,
   CUSTOM_FIELDS,
   CUSTOM_VALUES,
+  FORMS,
+  SURVEYS,
   CONTACTS,
   OPPORTUNITIES,
   CONVERSATIONS,
   MESSAGES,
+  CALL_EVENTS,
   APPOINTMENTS,
+  FORM_SUBMISSIONS,
+  SURVEY_SUBMISSIONS,
+  TASKS,
+  NOTES,
 ];
 
 /** Lookup by table name. */
