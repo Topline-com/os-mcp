@@ -195,9 +195,12 @@ export const OPPORTUNITIES: EntityManifest = {
     // dateAdded, startAfter=<epoch_ms>) — live-tested 2026-04-23 against
     // ucNDNXi…. And PITs can't register webhooks in GHL v2 (probed the
     // /webhooks, /hooks, /locations/{id}/webhooks endpoints — all 404).
-    // Every 15 min, re-pull the full paginated stream. Idempotent upserts
-    // make this cheap regardless of volume.
+    // Every 15 min, re-pull; in steady-state the page loop walks only
+    // until it hits a row whose cursor_column <= watermark (i.e. a row
+    // we've already seen), so high-volume updates aren't truncated at
+    // page 1.
     type: "poll_full",
+    cursor_column: "updated_at",
     poll_interval_minutes: 15,
     filter_ready: true,
   },
@@ -266,12 +269,21 @@ export const CONVERSATIONS: EntityManifest = {
     query_extras: { limit: 100 },
   },
   incremental: {
-    // poll_full: GHL's /conversations/search silently ignores every
-    // date-filter query param we probed (lastMessageDate, startAfterDate)
-    // — live-tested 2026-04-23. PITs can't register webhooks in GHL v2
-    // either (probed /webhooks, /hooks, /locations/{id}/webhooks — all
-    // 404). Every 15 min, re-pull the full paginated stream.
+    // poll_full: /conversations/search silently ignores date filters,
+    // PITs can't register webhooks. Steady-state cron uses the
+    // walk-to-watermark page loop: fetch newest-first pages only until
+    // a row's last_message_date <= the watermark (i.e. already synced).
+    //
+    // KNOWN LIMITATION: /conversations/search's cursor is single-field
+    // (lastMessageDate only). If two conversations share the same
+    // lastMessageDate at a page boundary, the cursor can skip one. GHL
+    // doesn't expose a documented tie-breaker (startAfterId is silently
+    // accepted but doesn't split ties). In a 14k-conversation live test
+    // this cost 4 rows (~0.03%). If exactness ever matters for a
+    // workload, either expose conversations with an explicit analytics
+    // disclaimer or drop pageLimit to 1 at suspected collision points.
     type: "poll_full",
+    cursor_column: "last_message_date",
     poll_interval_minutes: 15,
     filter_ready: true,
   },

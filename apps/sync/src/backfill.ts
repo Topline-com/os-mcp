@@ -47,6 +47,11 @@ type LocationDOStub = {
   clearSyncCursor(entity: string): Promise<void>;
   setSyncWatermark(entity: string, watermark: string): Promise<void>;
   markBackfillComplete(entity: string): Promise<void>;
+  resetBackfill(entity: string): Promise<void>;
+  startDrainIfUnset(entity: string): Promise<string>;
+  setUpstreamTotal(entity: string, total: number): Promise<void>;
+  pruneStaleRows(table: string, drainStartedAt: string): Promise<number>;
+  clearDrainMarker(entity: string): Promise<void>;
 };
 
 function locationStub(
@@ -78,6 +83,17 @@ export interface BackfillResult {
     | "error"
     | "unsupported";
   error?: string;
+  /**
+   * Rows deleted by the end-of-drain snapshot-and-swap (i.e. rows that
+   * existed in the DO but weren't re-observed this drain — upstream
+   * deleted them). Omitted from the response when 0.
+   */
+  pruned_stale_rows?: number;
+  /**
+   * Denormalized stage rows when this BackfillResult represents a
+   * pipelines → pipeline_stages expansion. Omitted otherwise.
+   */
+  denormalized_stage_rows?: number;
 }
 
 // Upper bound on pages for a single invocation. Sync workers have a
@@ -182,6 +198,7 @@ async function backfillStandardCursor(
 
   let pages = 0;
   let rowsUpserted = 0;
+  let prunedStale = 0;
   let lastRowCount = priorState[entity.table]?.row_count ?? 0;
   // Widening cast — inner assignments live inside an async closure that
   // TS flow analysis doesn't peek into, so without the cast the post-try
@@ -189,6 +206,12 @@ async function backfillStandardCursor(
   // "cursor_stalled" check below becomes "unintentional".
   let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
+
+  // Drain marker: stamped on first page of a multi-tick drain and
+  // cleared when we reach empty_page/cursor_stalled. Rows that weren't
+  // re-observed during this drain get snapshot-and-swap-pruned at the
+  // end. Survives across ticks via _sync_state.drain_started_at.
+  let drainStartedAt: string | null = priorState[entity.table]?.drain_started_at ?? null;
 
   try {
     await runInContext(connection, async () => {
@@ -199,11 +222,32 @@ async function backfillStandardCursor(
           buildFetchOptions(entity, query, body),
         );
 
+        // Capture upstream `total` whenever it shows up. Drives the
+        // self-heal drift detection on subsequent runs.
+        const upstreamTotal = extractUpstreamTotal(response);
+        if (upstreamTotal !== null) {
+          try {
+            await stub.setUpstreamTotal(entity.table, upstreamTotal);
+          } catch {
+            // non-fatal
+          }
+        }
+
         const itemsField = backfill.items_field ?? entity.table;
         const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
         if (!Array.isArray(items) || items.length === 0) {
           stoppedReason = "empty_page";
           break;
+        }
+
+        // First page of a fresh drain → stamp drain marker so the
+        // end-of-drain prune can delete rows that disappeared upstream.
+        if (pages === 0 && drainStartedAt === null) {
+          try {
+            drainStartedAt = await stub.startDrainIfUnset(entity.table);
+          } catch {
+            // non-fatal — no prune this drain; rows stay until next drain
+          }
         }
 
         const rows = items.map((raw) => mapRow(entity, raw));
@@ -240,15 +284,34 @@ async function backfillStandardCursor(
   }
 
   // Post-run bookkeeping: if we walked to end-of-stream (empty_page OR
-  // cursor_stalled), we've seen every row upstream. Capture the max
-  // cursor_column value as the watermark and flip backfill_complete so
-  // incremental polling can start. cursor_stalled is a legitimate EOF
-  // signal when GHL echoes the last-row-id back on the final page.
-  if (
-    (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") &&
-    entity.incremental.cursor_column
-  ) {
-    await setWatermarkAndComplete(stub, entity);
+  // cursor_stalled), we've seen every row upstream. Prune any that
+  // didn't get touched in this drain (deleted upstream), then capture
+  // the max cursor_column value as the watermark and flip
+  // backfill_complete so incremental polling can start. cursor_stalled
+  // is a legitimate EOF signal when GHL echoes the last-row-id back on
+  // the final page.
+  if (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") {
+    if (drainStartedAt !== null) {
+      try {
+        prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
+        if (prunedStale > 0) {
+          console.log(
+            `[backfill:${entity.table}] pruned ${prunedStale} stale rows (deleted upstream)`,
+          );
+          lastRowCount = Math.max(0, lastRowCount - prunedStale);
+        }
+      } catch {
+        // non-fatal
+      }
+    }
+    try {
+      await stub.clearDrainMarker(entity.table);
+    } catch {
+      // non-fatal
+    }
+    if (entity.incremental.cursor_column) {
+      await setWatermarkAndComplete(stub, entity);
+    }
   }
 
   return {
@@ -262,6 +325,7 @@ async function backfillStandardCursor(
     duration_ms: Date.now() - started,
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
+    ...(prunedStale > 0 ? ({ pruned_stale_rows: prunedStale } as Record<string, number>) : {}),
   };
 }
 
@@ -402,6 +466,28 @@ function runInContext<T>(
 
 function serializeCursor(value: unknown): string {
   return JSON.stringify(value);
+}
+
+/**
+ * Extract the upstream row-count estimate from a GHL list response.
+ * Endpoints are inconsistent about where they put this:
+ *   contacts / conversations (POST search) → top-level `total`
+ *   opportunities / appointments (GET search) → `meta.total`
+ * Returns null when neither path has a non-negative number; the caller
+ * treats that as "no signal" and skips the setUpstreamTotal call.
+ */
+function extractUpstreamTotal(response: unknown): number | null {
+  if (response === null || response === undefined || typeof response !== "object") {
+    return null;
+  }
+  const top = (response as { total?: unknown }).total;
+  if (typeof top === "number" && top >= 0) return top;
+  const meta = (response as { meta?: { total?: unknown } }).meta;
+  if (meta && typeof meta === "object") {
+    const metaTotal = (meta as { total?: unknown }).total;
+    if (typeof metaTotal === "number" && metaTotal >= 0) return metaTotal;
+  }
+  return null;
 }
 
 function parseCursor(stored: string): unknown {
@@ -730,6 +816,7 @@ async function backfillPollFull(
   let rowsUpserted = 0;
   let rowCountAfter = 0;
   let pagesProcessed = 0;
+  let prunedStale = 0;
   // Initializer uses a widening annotation cast — the inner assignments
   // happen inside an async closure (runInContext callback) that TS's
   // flow analysis doesn't peek into, so without the cast the post-try
@@ -738,33 +825,91 @@ async function backfillPollFull(
   let errorMsg: string | undefined;
   let denormalizedStageRows = 0;
 
-  // Bi-modal poll_full:
+  // Three-mode poll_full:
   //
-  //   backfill_complete = false  — initial drain. Resume from the
-  //     persisted cursor so a 14k-row table can work through the
-  //     Cloudflare 1000-subrequest-per-invocation cap across many
-  //     cron ticks. Without this, every tick re-fetches page 1 and
-  //     the tail of the table is never reached.
+  //   backfill_complete = false   → FRESH DRAIN. Resume from persisted
+  //     cursor. Walk every page up to the invocation cap. Stamp a
+  //     drain_started_at marker on first page so snapshot-and-swap at
+  //     the end can delete rows that disappeared upstream.
   //
-  //   backfill_complete = true   — steady-state freshness. Fetch only
-  //     page 1 (newest rows) and upsert. GHL's /conversations/search
-  //     and /opportunities/search both return newest-first, so page 1
-  //     naturally carries every freshly-updated row. Cheaper than
-  //     re-walking the entire history every 15 min.
+  //   complete + drift detected   → SELF-HEAL. Our row_count is
+  //     materially smaller than the last-seen upstream total (symptom
+  //     of an older broken-cursor run that marked us complete with
+  //     partial data). Reset the flag and fall through to fresh-drain
+  //     mode in the same invocation.
   //
-  // Pipelines / pipeline_stages hit the backfill_complete branch after
-  // their first (single-page) run and stay fresh off page 1, same as
-  // conversations. Their small row counts make either mode equivalent.
+  //   complete + no drift         → STEADY STATE. Walk newest-first
+  //     pages until we hit a row whose cursor_column value is older
+  //     than the DO's recorded watermark — everything past that point
+  //     is already in our table. This replaces the old single-page
+  //     freshness mode, which could miss rows when more than one page
+  //     of updates happened between cron ticks.
+  //
+  // Pipelines / pipeline_stages are single-page endpoints (pagination
+  // != "cursor"); both the fresh and steady-state paths collapse to
+  // one fetch for them.
+  const DRIFT_THRESHOLD = 0.9; // row_count < 90% of upstream → reassume broken
   const priorState = await stub.getSyncState();
   const priorStateRow = priorState[entity.table];
-  const isFresh = !priorStateRow?.backfill_complete;
+  let isFresh = !priorStateRow?.backfill_complete;
+
+  // Self-heal: detect a stale `backfill_complete=1` alongside data that's
+  // materially smaller than upstream. Reset to fresh-drain mode.
+  if (
+    !isFresh &&
+    priorStateRow?.upstream_total != null &&
+    priorStateRow.upstream_total > 0 &&
+    priorStateRow.row_count / priorStateRow.upstream_total < DRIFT_THRESHOLD
+  ) {
+    console.log(
+      `[poll_full:${entity.table}] drift detected row_count=${priorStateRow.row_count} ` +
+        `< ${DRIFT_THRESHOLD * 100}% of upstream_total=${priorStateRow.upstream_total}; ` +
+        `resetting backfill_complete`,
+    );
+    try {
+      await stub.resetBackfill(entity.table);
+    } catch {
+      // non-fatal — if the reset fails we'll stay in steady-state but
+      // correctness is eventually consistent once upstream_total re-compares
+    }
+    isFresh = true;
+  }
+
   const resumeCursor = isFresh && priorStateRow?.cursor ? parseCursor(priorStateRow.cursor) : null;
-  const maxPagesThisRun = isFresh ? MAX_PAGES_PER_INVOCATION : 1;
+  const maxPagesThisRun = isFresh
+    ? MAX_PAGES_PER_INVOCATION
+    : backfill.pagination === "cursor"
+    ? MAX_PAGES_PER_INVOCATION
+    : 1;
+
+  // Steady-state watermark: lets the page loop stop the moment it's
+  // caught up to what we already have. Resolved once per invocation so
+  // concurrent upserts during the drain don't move the goalpost.
+  let steadyWatermark: string | null = null;
+  if (!isFresh && entity.incremental.cursor_column && backfill.pagination === "cursor") {
+    try {
+      const wm = await stub.executeQuery(
+        `SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`,
+        [],
+      );
+      const w = (wm.rows[0] as { w: string | null } | undefined)?.w;
+      steadyWatermark = w == null ? null : String(w);
+    } catch {
+      steadyWatermark = null;
+    }
+  }
+
+  // Stamp a drain marker on the first page of a fresh drain. The return
+  // value survives across multi-tick drains so snapshot-and-swap at the
+  // end knows exactly which rows were refreshed during THIS drain.
+  let drainStartedAt: string | null =
+    isFresh ? priorStateRow?.drain_started_at ?? null : null;
 
   try {
     await runInContext(connection, async () => {
       let cursorValue: unknown = resumeCursor;
       let cursorSerialized: string | null = resumeCursor ? serializeCursor(resumeCursor) : null;
+      let caughtUpToWatermark = false;
 
       while (pagesProcessed < maxPagesThisRun) {
         const { query, body } = buildRequest(entity, connection.location_id, cursorValue);
@@ -772,6 +917,18 @@ async function backfillPollFull(
           backfill.endpoint,
           buildFetchOptions(entity, query, body),
         );
+
+        // GHL returns `total` on the top-level of many list responses.
+        // Persist whichever one we see so the next run's drift check has
+        // something to compare against.
+        const upstreamTotal = extractUpstreamTotal(response);
+        if (upstreamTotal !== null) {
+          try {
+            await stub.setUpstreamTotal(entity.table, upstreamTotal);
+          } catch {
+            // non-fatal
+          }
+        }
 
         // Primary table: resolve items_field (or default to entity.table).
         // Pipeline's primary items live at "pipelines"; pipeline_stages
@@ -782,6 +939,17 @@ async function backfillPollFull(
         if (!Array.isArray(items) || items.length === 0) {
           stoppedReason = "empty_page";
           break;
+        }
+
+        // First page of a fresh drain → stamp the drain marker so
+        // snapshot-and-swap at the end can identify stale rows.
+        if (isFresh && pagesProcessed === 0 && drainStartedAt === null) {
+          try {
+            drainStartedAt = await stub.startDrainIfUnset(entity.table);
+          } catch {
+            // non-fatal — missing marker means we can't prune, but the
+            // drain itself still completes correctly
+          }
         }
 
         if (entity.table === "pipeline_stages") {
@@ -818,13 +986,38 @@ async function backfillPollFull(
           const result = await stub.upsertRows(entity.table, rows);
           rowsUpserted += result.upserted;
           rowCountAfter = result.row_count_after;
+
+          // Steady-state watermark check: if ANY row on this page is
+          // older than our watermark, we've reached previously-synced
+          // territory. Subsequent pages are by construction older, so
+          // stop. The current page's older rows are harmlessly
+          // re-upserted — cheaper than splitting the page.
+          if (
+            !isFresh &&
+            steadyWatermark !== null &&
+            entity.incremental.cursor_column
+          ) {
+            const col = entity.incremental.cursor_column;
+            for (const r of rows) {
+              const v = r[col];
+              if (v !== null && v !== undefined && String(v) <= steadyWatermark) {
+                caughtUpToWatermark = true;
+                break;
+              }
+            }
+          }
         }
         pagesProcessed += 1;
 
+        // Steady-state short-circuit: we saw a row at-or-older-than the
+        // watermark, so we're caught up.
+        if (caughtUpToWatermark) {
+          stoppedReason = "empty_page";
+          break;
+        }
+
         // Single-page endpoints (pagination: "none") → we're done.
-        // Cursor-paginated endpoints → route through nextCursorFrom,
-        // which handles both structured multi-field cursors and legacy
-        // scalar cursor_response_field configs.
+        // Cursor-paginated endpoints → route through nextCursorFrom.
         if (backfill.pagination !== "cursor") {
           stoppedReason = "empty_page";
           break;
@@ -862,12 +1055,31 @@ async function backfillPollFull(
       : String(err);
   }
 
-  // End-of-stream markers. Only mark the backfill complete when we've
-  // actually walked every page (empty_page or cursor_stalled). page_cap_hit
-  // and error leave backfill_complete untouched so the NEXT run resumes.
-  // Once complete, steady-state freshness runs (maxPagesThisRun=1) don't
-  // need to re-flip this.
+  // End-of-stream bookkeeping. A fresh drain that reached empty_page /
+  // cursor_stalled has observed every upstream row — this is where we:
+  //   1. snapshot-and-swap prune stale rows (deleted upstream)
+  //   2. clear the resume cursor
+  //   3. mark backfill_complete = 1
+  //   4. clear the drain marker
+  // Steady-state runs skip all of this — they don't change the
+  // complete flag and their row-level refresh is idempotent.
   if (isFresh && (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled")) {
+    if (drainStartedAt !== null) {
+      try {
+        prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
+        if (prunedStale > 0) {
+          console.log(
+            `[poll_full:${entity.table}] pruned ${prunedStale} stale rows (deleted upstream)`,
+          );
+          // Post-prune: the reported row_count_after should match the
+          // real table, not the pre-prune upsert high-water mark.
+          rowCountAfter = Math.max(0, rowCountAfter - prunedStale);
+        }
+      } catch {
+        // non-fatal — leaving stale rows is better than failing the
+        // whole drain. Next drain will retry the prune.
+      }
+    }
     try {
       await stub.clearSyncCursor(entity.table);
     } catch {
@@ -875,6 +1087,11 @@ async function backfillPollFull(
     }
     try {
       await stub.markBackfillComplete(entity.table);
+    } catch {
+      // non-fatal
+    }
+    try {
+      await stub.clearDrainMarker(entity.table);
     } catch {
       // non-fatal
     }
@@ -892,6 +1109,7 @@ async function backfillPollFull(
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
     ...(denormalizedStageRows > 0 ? ({ denormalized_stage_rows: denormalizedStageRows } as Record<string, number>) : {}),
+    ...(prunedStale > 0 ? ({ pruned_stale_rows: prunedStale } as Record<string, number>) : {}),
   };
 }
 
@@ -931,6 +1149,8 @@ export interface IncrementalResult {
     | "error"
     | "skipped";
   error?: string;
+  /** Forwarded from the underlying BackfillResult when > 0. */
+  pruned_stale_rows?: number;
 }
 
 export async function incrementalEntity(
@@ -986,6 +1206,9 @@ export async function incrementalEntity(
       duration_ms: res.duration_ms,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
+      ...(res.pruned_stale_rows != null && res.pruned_stale_rows > 0
+        ? { pruned_stale_rows: res.pruned_stale_rows }
+        : {}),
     };
   }
 
@@ -1033,6 +1256,9 @@ export async function incrementalEntity(
       duration_ms: res.duration_ms,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
+      ...(res.pruned_stale_rows != null && res.pruned_stale_rows > 0
+        ? { pruned_stale_rows: res.pruned_stale_rows }
+        : {}),
     };
   }
 

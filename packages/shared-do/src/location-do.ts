@@ -65,6 +65,20 @@ export interface SyncState {
     backfill_complete: boolean;
     last_sync_at: string | null;
     row_count: number;
+    /**
+     * ISO 8601 stamp when the current drain started. NULL once the
+     * drain completes. Used by the snapshot-and-swap reconciliation
+     * to distinguish rows refreshed during this drain from stale ones
+     * that disappeared upstream.
+     */
+    drain_started_at: string | null;
+    /**
+     * Most recent upstream `total` GHL returned on a response that
+     * carried one. NULL if we've never seen one. Compared against
+     * row_count to detect stale backfill_complete states from older
+     * broken-cursor runs and trigger a self-heal re-drain.
+     */
+    upstream_total: number | null;
   };
 }
 
@@ -197,6 +211,19 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // were introduced. Both are nullable/defaulted so ADD COLUMN is safe.
     this.ensureSyncStateColumn("watermark", "TEXT");
     this.ensureSyncStateColumn("backfill_complete", "INTEGER NOT NULL DEFAULT 0");
+    // ISO 8601 stamp of when THIS drain started. Set on the first page of
+    // a fresh backfill (when cursor was null AND backfill_complete was 0)
+    // and cleared when the drain completes. Used by the snapshot-and-swap
+    // reconciliation at drain end: any row whose _synced_at predates
+    // drain_started_at was not re-observed, so the upstream deleted it.
+    this.ensureSyncStateColumn("drain_started_at", "TEXT");
+    // Upstream row total captured on the most recent response that
+    // carried one (GHL puts `total` at the top level on some endpoints).
+    // The cron's drift-detection compares this against row_count to catch
+    // stale `backfill_complete=1` states left by older broken cursor
+    // code; when the gap exceeds ~10% the cron resets the complete flag
+    // and re-drains from scratch.
+    this.ensureSyncStateColumn("upstream_total", "INTEGER");
 
     for (const entity of ALL_ENTITIES) {
       this.reconcileTable(entity);
@@ -453,8 +480,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         backfill_complete: number;
         last_sync_at: string | null;
         row_count: number;
+        drain_started_at: string | null;
+        upstream_total: number | null;
       }>(
-        "SELECT entity, cursor, watermark, backfill_complete, last_sync_at, row_count FROM _sync_state",
+        "SELECT entity, cursor, watermark, backfill_complete, last_sync_at, row_count, drain_started_at, upstream_total FROM _sync_state",
       )
       .toArray();
     const out: SyncState = {};
@@ -465,6 +494,8 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         backfill_complete: r.backfill_complete === 1,
         last_sync_at: r.last_sync_at,
         row_count: r.row_count,
+        drain_started_at: r.drain_started_at,
+        upstream_total: r.upstream_total,
       };
     }
     return out;
@@ -502,6 +533,134 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
        ON CONFLICT(entity) DO UPDATE SET backfill_complete = 1, last_sync_at = excluded.last_sync_at`,
       entity,
       now,
+    );
+  }
+
+  /**
+   * Reset an entity's backfill state so the next invocation drains from
+   * scratch. Used by the self-heal path when we detect row_count drift
+   * vs. upstream total — typically a sign an older broken-cursor run
+   * left us with `backfill_complete = 1` alongside partial data.
+   * Does NOT delete existing rows; the re-drain will refresh them in
+   * place and the post-drain snapshot-and-swap will prune any that
+   * disappeared upstream.
+   */
+  async resetBackfill(entity: string): Promise<void> {
+    this.ensureInitialized();
+    this.ctx.storage.sql.exec(
+      `UPDATE _sync_state
+         SET backfill_complete = 0, cursor = NULL, drain_started_at = NULL
+       WHERE entity = ?`,
+      entity,
+    );
+  }
+
+  /**
+   * Stamp the start of a fresh drain on an entity's sync state. Called
+   * by the backfill loops the first time they run with cursor=null AND
+   * backfill_complete=0. Every row upserted from this point forward
+   * carries a `_synced_at >= drain_started_at`; rows that were never
+   * touched keep their stale `_synced_at` from a previous drain.
+   * Idempotent — only sets when currently NULL, so a multi-tick drain
+   * doesn't keep bumping the marker forward.
+   */
+  async startDrainIfUnset(entity: string): Promise<string> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _sync_state(entity, drain_started_at, last_sync_at) VALUES (?, ?, ?)
+       ON CONFLICT(entity) DO UPDATE
+         SET drain_started_at = COALESCE(_sync_state.drain_started_at, excluded.drain_started_at),
+             last_sync_at = excluded.last_sync_at`,
+      entity,
+      now,
+      now,
+    );
+    const row = this.ctx.storage.sql
+      .exec<{ drain_started_at: string | null }>(
+        `SELECT drain_started_at FROM _sync_state WHERE entity = ?`,
+        entity,
+      )
+      .one();
+    return row.drain_started_at ?? now;
+  }
+
+  /**
+   * Persist the most recent upstream `total` seen in a response. Used
+   * by the self-heal path to compare against row_count and detect stale
+   * backfill_complete flags left over from older broken-cursor runs.
+   */
+  async setUpstreamTotal(entity: string, total: number): Promise<void> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _sync_state(entity, upstream_total, last_sync_at) VALUES (?, ?, ?)
+       ON CONFLICT(entity) DO UPDATE SET upstream_total = excluded.upstream_total, last_sync_at = excluded.last_sync_at`,
+      entity,
+      total,
+      now,
+    );
+  }
+
+  /**
+   * Snapshot-and-swap: delete rows whose _synced_at predates the
+   * provided drain_started_at. Called at the end of a full drain to
+   * prune rows that were not re-observed — i.e. upstream deleted them.
+   * Returns the number of rows removed so the caller can log / meter.
+   *
+   * Safe because:
+   *   - upsertRows stamps _synced_at = now() on every write;
+   *   - drain_started_at is captured once at drain start and doesn't
+   *     advance across the multi-tick drain (see startDrainIfUnset);
+   *   - any row not touched during the drain keeps its old _synced_at.
+   *
+   * Caller is responsible for only invoking this when a drain has
+   * actually walked the entire upstream (stopped_reason = empty_page
+   * or cursor_stalled) — calling it on a page_cap_hit / error run
+   * would delete legitimately-pending rows.
+   */
+  async pruneStaleRows(table: string, drainStartedAt: string): Promise<number> {
+    this.ensureInitialized();
+    // Validate the table name before interpolating it into SQL. Every
+    // caller today is the sync worker passing entity.table from the
+    // manifest, but the identifier still gets a defense-in-depth check.
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
+      throw new Error(`Invalid table identifier: ${table}`);
+    }
+    const cursor = this.ctx.storage.sql.exec(
+      `DELETE FROM ${table} WHERE _synced_at < ?`,
+      drainStartedAt,
+    );
+    for (const _ of cursor) {
+      // discarded — DELETE returns no rows, but iterating forces execution
+    }
+    const removed = cursor.rowsWritten ?? 0;
+    if (removed > 0) {
+      // Row count cache in _sync_state drifts after a prune; refresh it
+      // so getSyncState and describe_schema reflect reality immediately
+      // instead of waiting for the next upsert.
+      const fresh = this.ctx.storage.sql
+        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)
+        .one().n;
+      this.ctx.storage.sql.exec(
+        `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
+        fresh,
+        table,
+      );
+    }
+    return removed;
+  }
+
+  /**
+   * Clear the drain marker. Called by the backfill loops after
+   * markBackfillComplete + pruneStaleRows so the NEXT fresh drain
+   * (if resetBackfill is ever called) starts its own generation.
+   */
+  async clearDrainMarker(entity: string): Promise<void> {
+    this.ensureInitialized();
+    this.ctx.storage.sql.exec(
+      `UPDATE _sync_state SET drain_started_at = NULL WHERE entity = ?`,
+      entity,
     );
   }
 
@@ -590,6 +749,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         "Timestamps are ISO 8601 strings. Compare lexicographically or parse with strftime.",
         "JSON columns (e.g. contacts.tags, contacts.custom_fields) — query with json_extract() and json_each().",
         "Tenant isolation is physical; every row you see is already scoped to your sub-account.",
+        "Counts are eventually consistent: the sync worker polls upstream every 15 min, and a small sampling gap (~0.03% on conversations) exists because the upstream cursor uses a single timestamp field with no tie-breaker. For questions sensitive to single-row exactness, prefer SUM/COUNT over ranges to smooth the variance.",
       ],
       query_rules: [
         "SELECT and WITH only. DDL, DML, PRAGMA, ATTACH, and script-loading are rejected.",
