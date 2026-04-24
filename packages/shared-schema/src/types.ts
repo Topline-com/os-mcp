@@ -75,6 +75,13 @@ export interface BackfillDescriptor {
   endpoint: string;
   method: "GET" | "POST";
   /**
+   * Parameter name used to scope the request to a location.
+   * Defaults to "locationId" (camelCase, what most GHL v2 endpoints use).
+   * Override to "location_id" for the snake_case stragglers like
+   * /opportunities/search.
+   */
+  location_param_name?: string;
+  /**
    * Pagination strategy.
    *   cursor   — keyset pagination via a cursor field
    *   page     — numeric page number (rare in GHL)

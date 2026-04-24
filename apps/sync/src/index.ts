@@ -12,7 +12,7 @@
 // webhook queue consumer come in phase 1 step 3b. Every route is gated
 // by Authorization: Bearer <ADMIN_TOKEN>.
 
-import { backfillContacts, type SyncEnv, type BackfillResult } from "./backfill.js";
+import { backfillEntity, type SyncEnv, type BackfillResult } from "./backfill.js";
 
 interface Env extends SyncEnv {
   ADMIN_TOKEN?: string;
@@ -77,7 +77,12 @@ async function handleClearCursor(request: Request, env: Env): Promise<Response> 
 }
 
 // ---------------------------------------------------------------------------
-// POST /sync/backfill?connection_id=<uuid>&entity=contacts
+// POST /sync/backfill?connection_id=<uuid>&entity=<table>
+//
+// Accepts any entity declared in @topline/shared-schema. Unsupported sync
+// modes (per_parent, poll_full, pagination=unknown) return a 200 with
+// stopped_reason: "unsupported" rather than a 4xx — callers batching over
+// many entities keep going, and the result payload explains why.
 // ---------------------------------------------------------------------------
 async function handleBackfill(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
@@ -86,13 +91,10 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   const entity = url.searchParams.get("entity") ?? "contacts";
 
   if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
-  if (entity !== "contacts") {
-    return plain(400, `Entity "${entity}" not yet supported. MVP covers: contacts.`);
-  }
 
   let result: BackfillResult;
   try {
-    result = await backfillContacts(env, connectionId);
+    result = await backfillEntity(env, connectionId, entity);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return json(500, { error: message });

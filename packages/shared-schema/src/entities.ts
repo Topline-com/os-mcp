@@ -140,8 +140,11 @@ export const OPPORTUNITIES: EntityManifest = {
   backfill: {
     // Matches apps/edge/src/tools/opportunities.ts `topline_search_opportunities`:
     // GET /opportunities/search with query startAfterId (not POST, not `page`).
+    // Note: this endpoint uses snake_case `location_id` where most GHL v2
+    // endpoints use camelCase `locationId`. The live edge tool confirms it.
     endpoint: "/opportunities/search",
     method: "GET",
+    location_param_name: "location_id",
     pagination: "cursor",
     items_field: "opportunities",
     cursor_response_field: "meta.startAfterId",
