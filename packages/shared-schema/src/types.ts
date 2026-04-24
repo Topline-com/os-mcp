@@ -120,10 +120,24 @@ export interface IncrementalDescriptor {
   type: "updated_after" | "poll_full" | "per_parent";
   /** Column in our table holding the cursor timestamp. */
   cursor_column?: string;
-  /** Query param name for "fetch records updated after X". */
+  /** Query param / filter field name for "fetch records updated after X". */
   cursor_query_param?: string;
   /** Polling interval hint in minutes (sync worker reads this). */
   poll_interval_minutes: number;
+  /**
+   * Explicit flag that the filter contract has been verified against
+   * live GHL. Only when true will the sync worker run an incremental
+   * poll against this entity. When false, the entity stays synced via
+   * periodic full backfills (triggered manually today, cron later).
+   *
+   * GHL's filter grammar varies per-endpoint: /contacts/search uses
+   * a filters[] array with short operator codes (eq/gt/lte/contains/
+   * range/etc.), while other endpoints take top-level query params.
+   * This flag gates incremental sync until a maintainer has confirmed
+   * the exact shape for the endpoint works. For `poll_full` this is
+   * always true — no filter is sent.
+   */
+  filter_ready: boolean;
 }
 
 export interface WebhookEvent {

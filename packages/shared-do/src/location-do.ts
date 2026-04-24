@@ -59,6 +59,10 @@ export interface QueryResult {
 export interface SyncState {
   [entity: string]: {
     cursor: string | null;
+    /** Max cursor_column value seen; drives incremental polling. */
+    watermark: string | null;
+    /** 1 once backfill has walked the last page; 0 during partial backfill. */
+    backfill_complete: boolean;
     last_sync_at: string | null;
     row_count: number;
   };
@@ -183,10 +187,16 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       CREATE TABLE IF NOT EXISTS _sync_state (
         entity TEXT PRIMARY KEY,
         cursor TEXT,
+        watermark TEXT,
+        backfill_complete INTEGER NOT NULL DEFAULT 0,
         last_sync_at TEXT,
         row_count INTEGER NOT NULL DEFAULT 0
       )
     `);
+    // Additive migration for DOs created before watermark / backfill_complete
+    // were introduced. Both are nullable/defaulted so ADD COLUMN is safe.
+    this.ensureSyncStateColumn("watermark", "TEXT");
+    this.ensureSyncStateColumn("backfill_complete", "INTEGER NOT NULL DEFAULT 0");
 
     for (const entity of ALL_ENTITIES) {
       this.reconcileTable(entity);
@@ -330,6 +340,22 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     );
   }
 
+  /**
+   * Ensure a column exists on _sync_state. Used for additive migrations of
+   * the bookkeeping table itself (the entity tables go through the
+   * manifest-driven reconcileTable path instead).
+   */
+  private ensureSyncStateColumn(column: string, decl: string): void {
+    const sql = this.ctx.storage.sql;
+    const cols = sql
+      .exec<{ name: string }>("PRAGMA table_info(_sync_state)")
+      .toArray();
+    if (cols.some((c) => c.name === column)) return;
+    const stmt = `ALTER TABLE _sync_state ADD COLUMN ${column} ${decl}`;
+    sql.exec(stmt);
+    this.logMigration("ADD COLUMN", `_sync_state.${column}`, stmt);
+  }
+
   // -------------------------------------------------------------------------
   // RPC: sync-side writes
   // -------------------------------------------------------------------------
@@ -420,19 +446,63 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   async getSyncState(): Promise<SyncState> {
     this.ensureInitialized();
     const rows = this.ctx.storage.sql
-      .exec<{ entity: string; cursor: string | null; last_sync_at: string | null; row_count: number }>(
-        "SELECT entity, cursor, last_sync_at, row_count FROM _sync_state",
+      .exec<{
+        entity: string;
+        cursor: string | null;
+        watermark: string | null;
+        backfill_complete: number;
+        last_sync_at: string | null;
+        row_count: number;
+      }>(
+        "SELECT entity, cursor, watermark, backfill_complete, last_sync_at, row_count FROM _sync_state",
       )
       .toArray();
     const out: SyncState = {};
     for (const r of rows) {
       out[r.entity] = {
         cursor: r.cursor,
+        watermark: r.watermark,
+        backfill_complete: r.backfill_complete === 1,
         last_sync_at: r.last_sync_at,
         row_count: r.row_count,
       };
     }
     return out;
+  }
+
+  /**
+   * Advance the incremental watermark for an entity. The watermark is the
+   * max cursor_column value (typically updated_at) the worker has seen for
+   * this entity — the next incremental poll uses it to filter GHL to only
+   * newly-updated rows.
+   */
+  async setSyncWatermark(entity: string, watermark: string): Promise<void> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _sync_state(entity, watermark, last_sync_at) VALUES (?, ?, ?)
+       ON CONFLICT(entity) DO UPDATE SET watermark = excluded.watermark, last_sync_at = excluded.last_sync_at`,
+      entity,
+      watermark,
+      now,
+    );
+  }
+
+  /**
+   * Mark an entity's initial backfill as complete. This is the gate that
+   * allows incremental polling to run — without it, the sync worker
+   * refuses to incremental-sync (we'd miss rows with updated_at values
+   * earlier than the partial-backfill watermark).
+   */
+  async markBackfillComplete(entity: string): Promise<void> {
+    this.ensureInitialized();
+    const now = new Date().toISOString();
+    this.ctx.storage.sql.exec(
+      `INSERT INTO _sync_state(entity, backfill_complete, last_sync_at) VALUES (?, 1, ?)
+       ON CONFLICT(entity) DO UPDATE SET backfill_complete = 1, last_sync_at = excluded.last_sync_at`,
+      entity,
+      now,
+    );
   }
 
   // -------------------------------------------------------------------------

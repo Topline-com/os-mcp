@@ -45,6 +45,8 @@ type LocationDOStub = {
   getSyncState(): Promise<SyncState>;
   setSyncCursor(entity: string, cursor: string): Promise<void>;
   clearSyncCursor(entity: string): Promise<void>;
+  setSyncWatermark(entity: string, watermark: string): Promise<void>;
+  markBackfillComplete(entity: string): Promise<void>;
 };
 
 function locationStub(
@@ -234,6 +236,13 @@ async function backfillStandardCursor(
       : String(err);
   }
 
+  // Post-run bookkeeping: if we walked to an empty page, we've seen every
+  // row upstream. Capture the max cursor_column value as the watermark and
+  // flip backfill_complete so incremental polling can start.
+  if (stoppedReason === "empty_page" && entity.incremental.cursor_column) {
+    await setWatermarkAndComplete(stub, entity);
+  }
+
   return {
     entity: entity.table,
     connection_id: connectionId,
@@ -246,6 +255,32 @@ async function backfillStandardCursor(
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
   };
+}
+
+/**
+ * After a complete backfill, compute the max cursor_column value from
+ * actual rows in the DO and persist it as the incremental watermark.
+ * Then flip backfill_complete. Skipped if cursor_column is missing or
+ * MAX returns null (table is empty).
+ */
+async function setWatermarkAndComplete(
+  stub: LocationDOStub,
+  entity: EntityManifest,
+): Promise<void> {
+  const col = entity.incremental.cursor_column;
+  if (!col) return;
+  try {
+    const result = await stub.executeQuery(
+      `SELECT MAX(${col}) AS w FROM ${entity.table}`,
+    );
+    const row = result.rows[0] as { w: string | null } | undefined;
+    if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
+      await stub.setSyncWatermark(entity.table, String(row.w));
+    }
+    await stub.markBackfillComplete(entity.table);
+  } catch {
+    // Non-fatal — watermark will be retried on the next empty_page.
+  }
 }
 
 /**
@@ -623,6 +658,17 @@ async function backfillPollFull(
       : String(err);
   }
 
+  // poll_full tables are always "complete" after a successful run — the
+  // whole table's been refreshed in one shot. Mark so the cron knows to
+  // just re-invoke (no watermark filter for poll_full).
+  if (stoppedReason === "empty_page") {
+    try {
+      await stub.markBackfillComplete(entity.table);
+    } catch {
+      // non-fatal
+    }
+  }
+
   return {
     entity: entity.table,
     connection_id: connectionId,
@@ -636,6 +682,336 @@ async function backfillPollFull(
     ...(errorMsg ? { error: errorMsg } : {}),
     ...(denormalizedStageRows > 0 ? ({ denormalized_stage_rows: denormalizedStageRows } as Record<string, number>) : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Incremental sync — called by cron every 15 min per entity.
+//
+// For updated_after entities:
+//   Require backfill_complete = 1 (else the watermark would miss rows).
+//   Inject cursor_query_param=<watermark> into the request. Paginate any
+//   matching rows. At end, advance the watermark to max(cursor_column)
+//   in the DO.
+//
+// For poll_full entities:
+//   Just re-run the poll_full backfill. It refreshes everything in one
+//   shot; idempotent on unchanged rows.
+//
+// For per_parent entities:
+//   Not supported in this commit. Webhooks (phase 1 step 5) are the
+//   primary freshness mechanism for messages.
+// ---------------------------------------------------------------------------
+
+export interface IncrementalResult {
+  entity: string;
+  connection_id: string;
+  location_id: string;
+  skipped?: "not_complete" | "unsupported_mode" | "no_watermark_source";
+  pages: number;
+  rows_upserted: number;
+  row_count_after: number;
+  watermark_before: string | null;
+  watermark_after: string | null;
+  duration_ms: number;
+  stopped_reason:
+    | "empty_page"
+    | "cursor_stalled"
+    | "page_cap_hit"
+    | "error"
+    | "skipped";
+  error?: string;
+}
+
+export async function incrementalEntity(
+  env: SyncEnv,
+  connectionId: string,
+  entityTable: string,
+): Promise<IncrementalResult> {
+  const started = Date.now();
+  const entity = ENTITY_BY_TABLE.get(entityTable);
+  if (!entity) {
+    return {
+      entity: entityTable,
+      connection_id: connectionId,
+      location_id: "",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: 0,
+      watermark_before: null,
+      watermark_after: null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "error",
+      error: `Unknown entity: ${entityTable}`,
+    };
+  }
+
+  const connection = await loadAndDecryptConnection(
+    env.CONNECTIONS,
+    connectionId,
+    env.TOKEN_SIGNING_SECRET,
+  );
+  if (!connection) {
+    throw new Error(`Unknown or revoked connection: ${connectionId}`);
+  }
+
+  const stub = locationStub(env.LOCATION_DO, connection.location_id);
+  const state = await stub.getSyncState();
+  const stateRow = state[entity.table];
+
+  // Poll-full entities: re-run the poll_full backfill. Cheap, idempotent.
+  if (entity.incremental.type === "poll_full") {
+    const res = await backfillPollFull(env, connection, entity, started, connectionId);
+    const stopped: IncrementalResult["stopped_reason"] =
+      res.stopped_reason === "unsupported" ? "error" : res.stopped_reason;
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      pages: res.pages,
+      rows_upserted: res.rows_upserted,
+      row_count_after: res.row_count_after,
+      watermark_before: null,
+      watermark_after: null,
+      duration_ms: res.duration_ms,
+      stopped_reason: stopped,
+      ...(res.error ? { error: res.error } : {}),
+    };
+  }
+
+  if (entity.incremental.type !== "updated_after") {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "unsupported_mode",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: stateRow?.watermark ?? null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: `Incremental sync for ${entity.incremental.type} entities not implemented; use webhooks (phase 1 step 5).`,
+    };
+  }
+
+  // Gate: refuse to incremental-sync if backfill isn't complete. The
+  // watermark would miss records upstream from the partial-sync point.
+  if (!stateRow?.backfill_complete) {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "not_complete",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: stateRow?.watermark ?? null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: `Initial backfill not complete for ${entity.table}. Run /sync/backfill?entity=${entity.table} until stopped_reason=empty_page.`,
+    };
+  }
+
+  // Require an entity cursor_query_param and current watermark. If either
+  // is missing, we have no way to filter — skip with a clear reason.
+  if (!entity.incremental.cursor_query_param || !entity.incremental.cursor_column) {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "no_watermark_source",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: stateRow?.watermark ?? null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: `Entity ${entity.table} has no cursor_query_param / cursor_column configured for incremental sync.`,
+    };
+  }
+
+  // Filter contract not yet verified for this entity. GHL's filter grammar
+  // varies per-endpoint (see notes on IncrementalDescriptor.filter_ready);
+  // running an unverified filter burns API budget for likely 422s. When a
+  // maintainer confirms the shape, they flip this flag in the manifest.
+  if (!entity.incremental.filter_ready) {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "no_watermark_source",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow?.row_count ?? 0,
+      watermark_before: stateRow?.watermark ?? null,
+      watermark_after: stateRow?.watermark ?? null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: `Entity ${entity.table} has filter_ready: false. Its incremental filter contract against GHL has not been verified; stick to manual /sync/backfill until the manifest entry is updated.`,
+    };
+  }
+
+  const watermarkBefore = stateRow.watermark;
+  if (!watermarkBefore) {
+    return {
+      entity: entity.table,
+      connection_id: connectionId,
+      location_id: connection.location_id,
+      skipped: "no_watermark_source",
+      pages: 0,
+      rows_upserted: 0,
+      row_count_after: stateRow.row_count,
+      watermark_before: null,
+      watermark_after: null,
+      duration_ms: Date.now() - started,
+      stopped_reason: "skipped",
+      error: `No watermark recorded yet (likely because MAX(${entity.incremental.cursor_column}) is NULL — check that the column is populated).`,
+    };
+  }
+
+  // Run a cursor-paginated fetch with cursor_query_param=<watermark>
+  // injected. Mirror backfillStandardCursor's pagination loop.
+  let pages = 0;
+  let rowsUpserted = 0;
+  let lastRowCount = stateRow.row_count;
+  let stoppedReason: IncrementalResult["stopped_reason"] = "empty_page";
+  let errorMsg: string | undefined;
+  let paginationCursor: unknown = null;
+  let paginationCursorSerialized: string | null = null;
+
+  try {
+    await runInContext(connection, async () => {
+      while (pages < MAX_PAGES_PER_INVOCATION) {
+        const { query, body } = buildRequest(entity, connection.location_id, paginationCursor);
+        // Inject the incremental filter. Shape depends on method:
+        //   GET   → query[<cursor_query_param>] = <watermark>
+        //   POST  → body.filters = [...existing, { field, operator: "greater_than", value: watermark }]
+        // GHL's POST search endpoints use a structured filter array; a
+        // top-level body.dateUpdated returns 422 "property should not exist".
+        if (entity.backfill.method === "GET") {
+          query[entity.incremental.cursor_query_param!] = watermarkBefore;
+        } else if (body) {
+          const existingFilters = Array.isArray(body.filters) ? body.filters : [];
+          body.filters = [
+            ...existingFilters,
+            {
+              field: entity.incremental.cursor_query_param,
+              // GHL's search operators are short codes: gt, gte, lt, lte,
+              // eq, contains, etc. Use gt (strict >) since the watermark
+              // itself was already captured in the previous run's data.
+              operator: "gt",
+              value: watermarkBefore,
+            },
+          ];
+        }
+
+        const response = await toplineFetch<Record<string, unknown>>(
+          entity.backfill.endpoint,
+          buildFetchOptions(entity, query, body),
+        );
+
+        const itemsField = entity.backfill.items_field ?? entity.table;
+        const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
+        if (!Array.isArray(items) || items.length === 0) {
+          stoppedReason = "empty_page";
+          break;
+        }
+
+        const rows = items.map((raw) => mapRow(entity, raw));
+        const result: UpsertResult = await stub.upsertRows(entity.table, rows);
+        rowsUpserted += result.upserted;
+        lastRowCount = result.row_count_after;
+        pages += 1;
+
+        const cursorPath = entity.backfill.cursor_response_field;
+        const nextCursor = cursorPath ? getByPath(response, cursorPath) : undefined;
+        if (nextCursor === null || nextCursor === undefined) {
+          stoppedReason = "empty_page";
+          break;
+        }
+        const nextSerialized = serializeCursor(nextCursor);
+        if (nextSerialized === paginationCursorSerialized) {
+          stoppedReason = "cursor_stalled";
+          break;
+        }
+        paginationCursor = nextCursor;
+        paginationCursorSerialized = nextSerialized;
+      }
+      if (pages >= MAX_PAGES_PER_INVOCATION) {
+        stoppedReason = "page_cap_hit";
+      }
+    });
+  } catch (err) {
+    stoppedReason = "error";
+    errorMsg = err instanceof ToplineApiError
+      ? `GHL ${err.statusCode}: ${err.message}`
+      : err instanceof Error
+      ? err.message
+      : String(err);
+  }
+
+  // Advance the watermark from whatever the DO now reports as MAX.
+  let watermarkAfter: string | null = watermarkBefore;
+  if (rowsUpserted > 0) {
+    try {
+      const result = await stub.executeQuery(
+        `SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`,
+      );
+      const row = result.rows[0] as { w: string | null } | undefined;
+      if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
+        watermarkAfter = String(row.w);
+        if (watermarkAfter !== watermarkBefore) {
+          await stub.setSyncWatermark(entity.table, watermarkAfter);
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  return {
+    entity: entity.table,
+    connection_id: connectionId,
+    location_id: connection.location_id,
+    pages,
+    rows_upserted: rowsUpserted,
+    row_count_after: lastRowCount,
+    watermark_before: watermarkBefore,
+    watermark_after: watermarkAfter,
+    duration_ms: Date.now() - started,
+    stopped_reason: stoppedReason,
+    ...(errorMsg ? { error: errorMsg } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Batch incremental — for the scheduled handler. Runs every entity in
+// dependency order, failures isolated per-entity.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_INCREMENTAL_ORDER: readonly string[] = [
+  "pipelines",
+  "pipeline_stages",
+  "contacts",
+  "opportunities",
+  "conversations",
+  // messages: webhooks handle freshness; incremental stub returns skipped
+  "messages",
+];
+
+export async function incrementalAll(
+  env: SyncEnv,
+  connectionId: string,
+  order: readonly string[] = DEFAULT_INCREMENTAL_ORDER,
+): Promise<Record<string, IncrementalResult>> {
+  const out: Record<string, IncrementalResult> = {};
+  for (const table of order) {
+    out[table] = await incrementalEntity(env, connectionId, table);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

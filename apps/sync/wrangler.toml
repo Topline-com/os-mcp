@@ -26,5 +26,11 @@ script_name = "topline-os-mcp"
 #   wrangler secret put ADMIN_TOKEN            # gates the manual trigger
 #                                              # endpoints in this worker
 
+# Cron trigger — runs scheduled() every 15 minutes. Enumerates every
+# connection in CONNECTIONS KV and runs incrementalAll on each one.
+# Change the schedule here if you need a different cadence.
+[triggers]
+crons = ["*/15 * * * *"]
+
 [observability]
 enabled = true

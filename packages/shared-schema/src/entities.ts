@@ -99,6 +99,7 @@ export const CONTACTS: EntityManifest = {
     cursor_column: "updated_at",
     cursor_query_param: "dateUpdated",
     poll_interval_minutes: 15,
+    filter_ready: false,
   },
   webhooks: [
     { ghl_event: "ContactCreate", kind: "upsert" },
@@ -156,6 +157,7 @@ export const OPPORTUNITIES: EntityManifest = {
     cursor_column: "updated_at",
     cursor_query_param: "date_updated",
     poll_interval_minutes: 15,
+    filter_ready: false,
   },
   webhooks: [
     { ghl_event: "OpportunityCreate", kind: "upsert" },
@@ -209,6 +211,7 @@ export const CONVERSATIONS: EntityManifest = {
     cursor_column: "last_message_date",
     cursor_query_param: "lastMessageDate",
     poll_interval_minutes: 15,
+    filter_ready: false,
   },
   webhooks: [
     { ghl_event: "ConversationCreate", kind: "upsert" },
@@ -260,6 +263,7 @@ export const MESSAGES: EntityManifest = {
   incremental: {
     type: "per_parent",
     poll_interval_minutes: 15,
+    filter_ready: false,
   },
   webhooks: [
     { ghl_event: "InboundMessage", kind: "upsert" },
@@ -316,6 +320,7 @@ export const APPOINTMENTS: EntityManifest = {
     cursor_column: "updated_at",
     cursor_query_param: "updatedAfter",
     poll_interval_minutes: 15,
+    filter_ready: false,
   },
   webhooks: [
     { ghl_event: "AppointmentCreate", kind: "upsert" },
@@ -356,7 +361,9 @@ export const PIPELINES: EntityManifest = {
   },
   incremental: {
     type: "poll_full",
-    poll_interval_minutes: 60 * 24, // daily
+    // daily
+    poll_interval_minutes: 60 * 24,
+    filter_ready: true,
   },
   audit: {
     live_tested: false,
@@ -394,6 +401,7 @@ export const PIPELINE_STAGES: EntityManifest = {
   incremental: {
     type: "poll_full",
     poll_interval_minutes: 60 * 24,
+    filter_ready: true,
   },
   audit: {
     live_tested: false,

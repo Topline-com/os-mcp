@@ -16,8 +16,11 @@ import {
   backfillEntity,
   backfillAll,
   DEFAULT_BACKFILL_ORDER,
+  incrementalEntity,
+  incrementalAll,
   type SyncEnv,
   type BackfillResult,
+  type IncrementalResult,
 } from "./backfill.js";
 
 interface Env extends SyncEnv {
@@ -26,6 +29,19 @@ interface Env extends SyncEnv {
 }
 
 export default {
+  /**
+   * Cron trigger — fires on the schedule in wrangler.toml (every 15 min).
+   * Enumerates every connection in the CONNECTIONS KV and runs
+   * incrementalAll on each. Per-entity failures are isolated; one
+   * tenant's bad day doesn't stop the rest.
+   *
+   * Logging only — no response is visible. Tail with `wrangler tail
+   * topline-os-sync` to watch a run.
+   */
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runIncrementalForAllConnections(env));
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     if (!env.ADMIN_TOKEN) {
       return plain(503, "ADMIN_TOKEN not configured. Run: wrangler secret put ADMIN_TOKEN");
@@ -48,6 +64,10 @@ export default {
         return handleBackfill(request, env);
       case "/sync/backfill-all":
         return handleBackfillAll(request, env);
+      case "/sync/incremental":
+        return handleIncremental(request, env);
+      case "/sync/incremental-all":
+        return handleIncrementalAll(request, env);
       case "/sync/clear-cursor":
         return handleClearCursor(request, env);
       default:
@@ -55,6 +75,51 @@ export default {
     }
   },
 };
+
+// ---------------------------------------------------------------------------
+// POST /sync/incremental?connection_id=<uuid>&entity=<table>
+//
+// Fetches only records with cursor_column > watermark from GHL and upserts
+// them. Refuses with `skipped: "not_complete"` if the entity's initial
+// backfill hasn't finished — see index.ts handleBackfill for that flow.
+// ---------------------------------------------------------------------------
+async function handleIncremental(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  const url = new URL(request.url);
+  const connectionId = url.searchParams.get("connection_id") ?? "";
+  const entity = url.searchParams.get("entity") ?? "";
+  if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
+  if (!entity) return plain(400, "Missing ?entity=<table>");
+
+  let result: IncrementalResult;
+  try {
+    result = await incrementalEntity(env, connectionId, entity);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return json(500, { error: message });
+  }
+  return json(200, result);
+}
+
+// ---------------------------------------------------------------------------
+// POST /sync/incremental-all?connection_id=<uuid>
+// Same as /sync/backfill-all but runs the incremental path for each entity.
+// Failures per-entity don't stop the others.
+// ---------------------------------------------------------------------------
+async function handleIncrementalAll(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return plain(405, "Method not allowed");
+  const url = new URL(request.url);
+  const connectionId = url.searchParams.get("connection_id") ?? "";
+  if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
+
+  try {
+    const results = await incrementalAll(env, connectionId);
+    return json(200, { results });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return json(500, { error: message });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // POST /sync/backfill-all?connection_id=<uuid>
@@ -136,6 +201,47 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   // payload carries the error detail. A 500 is reserved for infra failures
   // (missing connection, DO binding broken, etc.) where retrying won't help.
   return json(200, result);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled entry — enumerates CONNECTIONS KV and runs incrementalAll for
+// each one. Sequential today because our customer count is small; when
+// it grows we'll fan out via Cloudflare Queues.
+// ---------------------------------------------------------------------------
+async function runIncrementalForAllConnections(env: Env): Promise<void> {
+  let cursor: string | undefined = undefined;
+  let totalConnections = 0;
+  const runStartedAt = new Date().toISOString();
+
+  while (true) {
+    const list: KVNamespaceListResult<unknown, string> = await env.CONNECTIONS.list({ cursor });
+    for (const entry of list.keys) {
+      totalConnections += 1;
+      try {
+        const results = await incrementalAll(env, entry.name);
+        // Log a compact one-line summary per entity for observability.
+        for (const [table, r] of Object.entries(results)) {
+          console.log(
+            `[sync/cron ${runStartedAt}] connection=${entry.name} entity=${table} ` +
+              `stopped=${r.stopped_reason} rows_upserted=${r.rows_upserted} ` +
+              `row_count=${r.row_count_after}` +
+              (r.error ? ` error=${r.error.slice(0, 120)}` : ""),
+          );
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(
+          `[sync/cron ${runStartedAt}] connection=${entry.name} FATAL ${msg.slice(0, 200)}`,
+        );
+      }
+    }
+    if (list.list_complete) break;
+    cursor = list.cursor;
+  }
+
+  console.log(
+    `[sync/cron ${runStartedAt}] completed, processed ${totalConnections} connections`,
+  );
 }
 
 // ---------------------------------------------------------------------------
