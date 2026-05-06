@@ -372,7 +372,7 @@ export const tools: ToolDef[] = [
     description:
       "Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. " +
       "Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. " +
-      "WORKFLOWS are NOT supported: GHL's public API does not expose workflow internals, so we cannot know which workflows reference any given object. " +
+      "WORKFLOWS are NOT supported: the upstream platform's public API does not expose workflow internals, so we cannot know which workflows reference any given object. " +
       "kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. " +
       "Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.",
     inputSchema: obj(
@@ -388,7 +388,7 @@ export const tools: ToolDef[] = [
       if (!SUPPORTED_KINDS.includes(kind)) {
         throw new Error(
           `Unsupported kind: ${kind}. Valid: ${SUPPORTED_KINDS.join(", ")}. ` +
-            `For workflows, GHL's API doesn't expose internals — not queryable here.`,
+            `For workflows, the upstream API doesn't expose internals — not queryable here.`,
         );
       }
       const queries = queryFor(kind, id);

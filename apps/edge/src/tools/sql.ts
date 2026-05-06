@@ -32,7 +32,7 @@ export const tools: ToolDef[] = [
   {
     name: "topline_describe_data_catalog",
     description:
-      "COMPLETE catalog of every GHL/Topline object that exists upstream — including objects we sync (queryable via SQL), objects we've catalogued but haven't built sync for yet, objects that require OAuth/agency scopes our PIT auth can't reach, and objects we've declined to sync. Call this when topline_describe_schema doesn't show something the user is asking about — it will tell you whether the data lives on disk (queryable now), is pending (answer will lag a sync cycle), or is inaccessible (tell the user to request it instead of inventing a workaround). Contrast with topline_describe_schema, which is SCHEMA-only and hides everything not currently exposed. Returns { entries: [{ name, category, status, description, sql_table?, endpoint?, notes? }...] } with status in {exposed, syncing, catalogued, requires_oauth, inaccessible, declined}.",
+      "COMPLETE catalog of every Topline object that exists upstream — including objects we sync (queryable via SQL), objects we've catalogued but haven't built sync for yet, objects that require OAuth/agency scopes our PIT auth can't reach, and objects we've declined to sync. Call this when topline_describe_schema doesn't show something the user is asking about — it will tell you whether the data lives on disk (queryable now), is pending (answer will lag a sync cycle), or is inaccessible (tell the user to request it instead of inventing a workaround). Contrast with topline_describe_schema, which is SCHEMA-only and hides everything not currently exposed. Returns { entries: [{ name, category, status, description, sql_table?, endpoint?, notes? }...] } with status in {exposed, syncing, catalogued, requires_oauth, inaccessible, declined}.",
     inputSchema: obj({}, []),
     handler: async () => {
       return { entries: buildCatalog() };
@@ -142,7 +142,7 @@ export const tools: ToolDef[] = [
           {
             path: "GET /query/api/catalog",
             description:
-              "Same payload as topline_describe_data_catalog. Full inventory of every known GHL object plus our current sync/exposure status for each.",
+              "Same payload as topline_describe_data_catalog. Full inventory of every known Topline object plus our current sync/exposure status for each.",
             example:
               'curl -H "Authorization: Bearer $TOKEN" https://os-mcp.topline.com/query/api/catalog',
           },

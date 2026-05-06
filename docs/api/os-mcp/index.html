@@ -2613,7 +2613,7 @@
         <h3><code>topline_describe_data_catalog</code></h3>
         <a class="anchor" href="#topline_describe_data_catalog">#</a>
       </header>
-      <p class="tool-desc">COMPLETE catalog of every GHL/Topline object that exists upstream — including objects we sync (queryable via SQL), objects we've catalogued but haven't built sync for yet, objects that require OAuth/agency scopes our PIT auth can't reach, and objects we've declined to sync. Call this when topline_describe_schema doesn't show something the user is asking about — it will tell you whether the data lives on disk (queryable now), is pending (answer will lag a sync cycle), or is inaccessible (tell the user to request it instead of inventing a workaround). Contrast with topline_describe_schema, which is SCHEMA-only and hides everything not currently exposed. Returns { entries: [{ name, category, status, description, sql_table?, endpoint?, notes? }...] } with status in {exposed, syncing, catalogued, requires_oauth, inaccessible, declined}.</p>
+      <p class="tool-desc">COMPLETE catalog of every Topline object that exists upstream — including objects we sync (queryable via SQL), objects we've catalogued but haven't built sync for yet, objects that require OAuth/agency scopes our PIT auth can't reach, and objects we've declined to sync. Call this when topline_describe_schema doesn't show something the user is asking about — it will tell you whether the data lives on disk (queryable now), is pending (answer will lag a sync cycle), or is inaccessible (tell the user to request it instead of inventing a workaround). Contrast with topline_describe_schema, which is SCHEMA-only and hides everything not currently exposed. Returns { entries: [{ name, category, status, description, sql_table?, endpoint?, notes? }...] } with status in {exposed, syncing, catalogued, requires_oauth, inaccessible, declined}.</p>
       <p class="no-params">No parameters.</p>
       <h4>Example call</h4>
       <pre><code>{
@@ -2724,7 +2724,7 @@
         <h3><code>topline_find_references</code></h3>
         <a class="anchor" href="#topline_find_references">#</a>
       </header>
-      <p class="tool-desc">Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. WORKFLOWS are NOT supported: GHL's public API does not expose workflow internals, so we cannot know which workflows reference any given object. kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.</p>
+      <p class="tool-desc">Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. WORKFLOWS are NOT supported: the upstream platform's public API does not expose workflow internals, so we cannot know which workflows reference any given object. kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.</p>
       <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
       <tr>
         <td><code>kind</code> <span class="req">required</span></td>
@@ -2753,7 +2753,7 @@
   
       </section>
       <footer style="margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px;">
-        Generated from <code>apps/edge/src/registry.ts</code>. To regenerate: <code>npx tsx scripts/gen-docs.ts &gt; docs/index.html</code>.
+        Generated from <code>apps/edge/src/registry.ts</code>. To regenerate: <code>npx tsx scripts/gen-docs.ts &gt; docs/api/os-mcp/index.html</code>.
       </footer>
     </main>
   </div>
