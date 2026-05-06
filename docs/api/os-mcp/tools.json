@@ -1,0 +1,1925 @@
+{
+  "tools": [
+    {
+      "name": "topline_ping",
+      "description": "Verify the Topline Private Integration Token works and return basic location info. Call this first to confirm setup.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_setup_check",
+      "description": "End-to-end setup verification for Topline MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_request",
+      "description": "Generic passthrough to any Topline API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. \"/contacts/\" or \"/opportunities/pipelines\") and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE"
+            ],
+            "description": "HTTP method"
+          },
+          "path": {
+            "type": "string",
+            "description": "API path, starting with '/'. Example: '/contacts/' or '/opportunities/123'"
+          },
+          "query": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "body": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "injectLocationId": {
+            "type": "boolean",
+            "description": "If true (default), auto-inject locationId into the query string when absent. Set false for endpoints that don't accept it."
+          }
+        },
+        "required": [
+          "method",
+          "path"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_search_contacts",
+      "description": "Search contacts by free-text query (name, email, phone) and/or tag. Returns up to 100 per call with a cursor for pagination.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Free-text search: name, email, or phone"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Filter to contacts with ALL of these tags"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAfterId": {
+            "type": "string",
+            "description": "Cursor from a previous page"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_contact",
+      "description": "Fetch a single contact by ID. Returns all standard fields and custom fields.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_contact",
+      "description": "Create a new contact. At minimum provide a name or email or phone. Custom fields go in customFields as {id, value} pairs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "Full name (use instead of firstName+lastName if you prefer)"
+          },
+          "email": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string",
+            "description": "E.164 format preferred, e.g. +14155551212"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source": {
+            "type": "string",
+            "description": "Attribution source (e.g. 'claude', 'website')"
+          },
+          "customFields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "value": {}
+              },
+              "required": []
+            }
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_contact",
+      "description": "Update fields on an existing contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "REPLACES the tag list. Use add/remove tag tools for incremental changes."
+          },
+          "customFields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "value": {}
+              },
+              "required": []
+            }
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_contact",
+      "description": "Permanently delete a contact. Irreversible.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_add_contact_tags",
+      "description": "Add one or more tags to a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tag names to add"
+          }
+        },
+        "required": [
+          "contactId",
+          "tags"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_remove_contact_tags",
+      "description": "Remove one or more tags from a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "contactId",
+          "tags"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_upsert_contact",
+      "description": "Create a contact, or update the existing one if email/phone matches. Use this when you're not sure whether the contact already exists.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "firstName": {
+            "type": "string"
+          },
+          "lastName": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "source": {
+            "type": "string"
+          },
+          "customFields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "value": {}
+              },
+              "required": []
+            }
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_add_contact_to_workflow",
+      "description": "Enroll a contact in a workflow.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "workflowId": {
+            "type": "string",
+            "description": "Workflow ID"
+          }
+        },
+        "required": [
+          "contactId",
+          "workflowId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_remove_contact_from_workflow",
+      "description": "Remove a contact from a workflow.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "workflowId": {
+            "type": "string",
+            "description": "Workflow ID"
+          }
+        },
+        "required": [
+          "contactId",
+          "workflowId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_search_conversations",
+      "description": "Search conversations for the sub-account. Filter by contact, status, or query.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Only return conversations with this contact"
+          },
+          "query": {
+            "type": "string",
+            "description": "Free-text search"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "all",
+              "read",
+              "unread",
+              "starred",
+              "recents"
+            ]
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAfterId": {
+            "type": "string",
+            "description": "Cursor from a previous page"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_conversation",
+      "description": "Fetch a single conversation thread including recent messages.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "description": "Conversation ID"
+          }
+        },
+        "required": [
+          "conversationId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_messages",
+      "description": "List messages in a conversation.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "description": "Conversation ID"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "lastMessageId": {
+            "type": "string",
+            "description": "Cursor for pagination"
+          }
+        },
+        "required": [
+          "conversationId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_send_message",
+      "description": "Send a message (SMS, Email, WhatsApp, or Facebook/Instagram DM) to a contact. The contact must already exist.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "SMS",
+              "Email",
+              "WhatsApp",
+              "IG",
+              "FB",
+              "Custom",
+              "Live_Chat"
+            ],
+            "description": "Channel to send through"
+          },
+          "message": {
+            "type": "string",
+            "description": "Plain-text message body (for SMS/chat channels)"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Subject line (Email only)"
+          },
+          "html": {
+            "type": "string",
+            "description": "HTML body (Email only, takes precedence over message)"
+          },
+          "attachments": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Public URLs to attach"
+          },
+          "fromNumber": {
+            "type": "string",
+            "description": "Sender phone number (SMS only, must be a number on the sub-account)"
+          },
+          "toNumber": {
+            "type": "string",
+            "description": "Override destination number (SMS only)"
+          },
+          "emailFrom": {
+            "type": "string",
+            "description": "Email from-address override"
+          },
+          "emailTo": {
+            "type": "string",
+            "description": "Email to-address override"
+          }
+        },
+        "required": [
+          "contactId",
+          "type"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_conversation",
+      "description": "Create a new conversation with a contact (rarely needed — send_message usually creates one implicitly).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_pipelines",
+      "description": "List all opportunity pipelines in the sub-account with their stages.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_search_opportunities",
+      "description": "Search opportunities. Filter by pipeline, stage, status, contact, or free text.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Free-text search"
+          },
+          "pipelineId": {
+            "type": "string",
+            "description": "Restrict to one pipeline"
+          },
+          "pipelineStageId": {
+            "type": "string",
+            "description": "Restrict to one stage"
+          },
+          "assignedTo": {
+            "type": "string",
+            "description": "User ID"
+          },
+          "contactId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "won",
+              "lost",
+              "abandoned",
+              "all"
+            ]
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAfterId": {
+            "type": "string",
+            "description": "Cursor from a previous page"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_opportunity",
+      "description": "Fetch a single opportunity by ID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "opportunityId": {
+            "type": "string",
+            "description": "Opportunity ID"
+          }
+        },
+        "required": [
+          "opportunityId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_opportunity",
+      "description": "Create a new opportunity in a pipeline stage, associated with a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pipelineId": {
+            "type": "string",
+            "description": "Pipeline ID"
+          },
+          "pipelineStageId": {
+            "type": "string",
+            "description": "Pipeline stage ID"
+          },
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "Opportunity name / title"
+          },
+          "monetaryValue": {
+            "type": "number",
+            "description": "Deal value in USD"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "won",
+              "lost",
+              "abandoned"
+            ]
+          },
+          "assignedTo": {
+            "type": "string",
+            "description": "User ID to assign to"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "pipelineId",
+          "pipelineStageId",
+          "contactId",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_opportunity",
+      "description": "Update an opportunity — move stages, change value, mark won/lost, etc.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "opportunityId": {
+            "type": "string",
+            "description": "Opportunity ID"
+          },
+          "name": {
+            "type": "string"
+          },
+          "pipelineStageId": {
+            "type": "string"
+          },
+          "monetaryValue": {
+            "type": "number"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "won",
+              "lost",
+              "abandoned"
+            ]
+          },
+          "assignedTo": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "opportunityId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_opportunity",
+      "description": "Delete an opportunity.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "opportunityId": {
+            "type": "string",
+            "description": "Opportunity ID"
+          }
+        },
+        "required": [
+          "opportunityId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_calendars",
+      "description": "List all calendars configured on the sub-account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_calendar_slots",
+      "description": "Get available time slots for a calendar within a date range (ms epoch).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendarId": {
+            "type": "string",
+            "description": "Calendar ID"
+          },
+          "startDate": {
+            "type": "number",
+            "description": "Start timestamp (ms since epoch)"
+          },
+          "endDate": {
+            "type": "number",
+            "description": "End timestamp (ms since epoch)"
+          },
+          "timezone": {
+            "type": "string",
+            "description": "IANA timezone (e.g. 'America/New_York')"
+          }
+        },
+        "required": [
+          "calendarId",
+          "startDate",
+          "endDate"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_appointment",
+      "description": "Book an appointment on a calendar for a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendarId": {
+            "type": "string",
+            "description": "Calendar ID"
+          },
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "startTime": {
+            "type": "string",
+            "description": "ISO 8601 start time, e.g. '2026-04-20T15:00:00-04:00'"
+          },
+          "endTime": {
+            "type": "string",
+            "description": "ISO 8601 end time (optional — inferred from calendar if omitted)"
+          },
+          "title": {
+            "type": "string",
+            "description": "Appointment title"
+          },
+          "appointmentStatus": {
+            "type": "string",
+            "enum": [
+              "new",
+              "confirmed",
+              "cancelled",
+              "showed",
+              "noshow",
+              "invalid"
+            ]
+          },
+          "assignedUserId": {
+            "type": "string",
+            "description": "User ID to assign"
+          },
+          "address": {
+            "type": "string",
+            "description": "Location or meeting link"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "calendarId",
+          "contactId",
+          "startTime"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_appointment",
+      "description": "Update an appointment (reschedule, change status, reassign).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "appointmentId": {
+            "type": "string",
+            "description": "Appointment ID"
+          },
+          "startTime": {
+            "type": "string",
+            "description": "ISO 8601"
+          },
+          "endTime": {
+            "type": "string",
+            "description": "ISO 8601"
+          },
+          "title": {
+            "type": "string"
+          },
+          "appointmentStatus": {
+            "type": "string",
+            "enum": [
+              "new",
+              "confirmed",
+              "cancelled",
+              "showed",
+              "noshow",
+              "invalid"
+            ]
+          },
+          "assignedUserId": {
+            "type": "string"
+          },
+          "address": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "appointmentId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_appointment",
+      "description": "Cancel and delete an appointment.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "appointmentId": {
+            "type": "string",
+            "description": "Appointment ID"
+          }
+        },
+        "required": [
+          "appointmentId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_calendar",
+      "description": "Get the full calendar definition (availability rules, team members, slot duration, etc.).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendarId": {
+            "type": "string",
+            "description": "Calendar ID"
+          }
+        },
+        "required": [
+          "calendarId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_calendar",
+      "description": "Update a calendar's name, description, slot duration, availability, team members, or event title. Pass only the fields you want to change. The calendar must already exist — calendar CREATE is not available under PIT (marketplace OAuth only).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendarId": {
+            "type": "string",
+            "description": "Calendar ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "New calendar name"
+          },
+          "description": {
+            "type": "string",
+            "description": "New description"
+          },
+          "slug": {
+            "type": "string",
+            "description": "URL slug (shows in public booking URLs)"
+          },
+          "isActive": {
+            "type": "boolean",
+            "description": "Enable / disable the calendar"
+          },
+          "slotDuration": {
+            "type": "number",
+            "description": "Appointment length in minutes"
+          },
+          "slotBuffer": {
+            "type": "number",
+            "description": "Buffer (minutes) between appointments"
+          },
+          "eventTitle": {
+            "type": "string",
+            "description": "Default event title template"
+          },
+          "eventColor": {
+            "type": "string",
+            "description": "Hex color shown in the UI"
+          },
+          "appoinmentPerSlot": {
+            "type": "number",
+            "description": "Max concurrent bookings per slot"
+          },
+          "allowReschedule": {
+            "type": "boolean"
+          },
+          "allowCancellation": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "calendarId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_calendar",
+      "description": "Delete a calendar. All future appointments on this calendar are cancelled. Past appointments are retained as historical records.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "calendarId": {
+            "type": "string",
+            "description": "Calendar ID"
+          }
+        },
+        "required": [
+          "calendarId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_contact_tasks",
+      "description": "List all tasks for a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_task",
+      "description": "Create a task associated with a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "title": {
+            "type": "string",
+            "description": "Task title"
+          },
+          "body": {
+            "type": "string",
+            "description": "Task description / notes"
+          },
+          "dueDate": {
+            "type": "string",
+            "description": "ISO 8601 due date"
+          },
+          "assignedTo": {
+            "type": "string",
+            "description": "User ID"
+          },
+          "completed": {
+            "type": "boolean",
+            "description": "Mark already-completed"
+          }
+        },
+        "required": [
+          "contactId",
+          "title",
+          "dueDate"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_task",
+      "description": "Update a task — change title, body, due date, completion status.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "taskId": {
+            "type": "string",
+            "description": "Task ID"
+          },
+          "title": {
+            "type": "string"
+          },
+          "body": {
+            "type": "string"
+          },
+          "dueDate": {
+            "type": "string"
+          },
+          "completed": {
+            "type": "boolean"
+          },
+          "assignedTo": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "contactId",
+          "taskId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_task",
+      "description": "Delete a task.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "taskId": {
+            "type": "string",
+            "description": "Task ID"
+          }
+        },
+        "required": [
+          "contactId",
+          "taskId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_contact_notes",
+      "description": "List all notes on a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          }
+        },
+        "required": [
+          "contactId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_note",
+      "description": "Create a note on a contact.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "body": {
+            "type": "string",
+            "description": "Note text"
+          },
+          "userId": {
+            "type": "string",
+            "description": "User ID to attribute the note to"
+          }
+        },
+        "required": [
+          "contactId",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_note",
+      "description": "Update the body of a note.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "noteId": {
+            "type": "string",
+            "description": "Note ID"
+          },
+          "body": {
+            "type": "string",
+            "description": "New note text"
+          }
+        },
+        "required": [
+          "contactId",
+          "noteId",
+          "body"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_note",
+      "description": "Delete a note.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contactId": {
+            "type": "string",
+            "description": "Contact ID"
+          },
+          "noteId": {
+            "type": "string",
+            "description": "Note ID"
+          }
+        },
+        "required": [
+          "contactId",
+          "noteId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_custom_fields",
+      "description": "List all custom fields configured on the sub-account (for contacts and opportunities). Useful before creating/updating contacts with custom data.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_custom_field",
+      "description": "Get details of a single custom field.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customFieldId": {
+            "type": "string",
+            "description": "Custom field ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customFieldId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_custom_field",
+      "description": "Create a new custom field on the sub-account. After creation, the returned `id` can be referenced when setting custom-field values on contacts or opportunities. For SINGLE_OPTIONS / MULTIPLE_OPTIONS / RADIO / CHECKBOX fields, supply `options` as an array of {label, value} pairs.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Display name (e.g. 'Deal Priority')"
+          },
+          "dataType": {
+            "type": "string",
+            "description": "Field data type. One of: TEXT | LARGE_TEXT | NUMERICAL | PHONE | MONETORY | CHECKBOX | SINGLE_OPTIONS | MULTIPLE_OPTIONS | DATE | TEXTBOX_LIST | RADIO | FILE_UPLOAD | SIGNATURE."
+          },
+          "model": {
+            "type": "string",
+            "description": "Object this field applies to: 'contact' or 'opportunity'. Default 'contact'."
+          },
+          "placeholder": {
+            "type": "string",
+            "description": "Placeholder text shown on the field UI"
+          },
+          "position": {
+            "type": "string",
+            "description": "Render order (integer-as-string)"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "Option label"
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Option value (slug)"
+                }
+              },
+              "required": [
+                "label",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "description": "For SINGLE_OPTIONS / MULTIPLE_OPTIONS / RADIO / CHECKBOX: list of pickable values."
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "name",
+          "dataType"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_custom_field",
+      "description": "Update a custom field's name / options / placeholder. Pass only the fields you want to change.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customFieldId": {
+            "type": "string",
+            "description": "Custom field ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "New display name"
+          },
+          "placeholder": {
+            "type": "string",
+            "description": "New placeholder"
+          },
+          "position": {
+            "type": "string",
+            "description": "New render order"
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "Option label"
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Option value (slug)"
+                }
+              },
+              "required": [
+                "label",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Full replacement list for option-typed fields."
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customFieldId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_custom_field",
+      "description": "Delete a custom field. This removes the field definition but does not affect contact/opportunity rows that already have a value stored — those become orphaned data accessible only via raw_payload.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customFieldId": {
+            "type": "string",
+            "description": "Custom field ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customFieldId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_custom_values",
+      "description": "List all sub-account custom values. Use before setting workflow merge tags or composing messages that reference {{custom_values.X}}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_custom_value",
+      "description": "Get details of one custom value by id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customValueId": {
+            "type": "string",
+            "description": "Custom value ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customValueId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_custom_value",
+      "description": "Create a new sub-account custom value. Returns the created record including its id and the auto-generated merge-tag key ({{custom_values.<slug>}}).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Display name (e.g. 'Review Request Link')"
+          },
+          "value": {
+            "type": "string",
+            "description": "The value to store. Used verbatim when merge tags are expanded."
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_custom_value",
+      "description": "Update an existing custom value's name and/or value. Pass only the fields you want to change.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customValueId": {
+            "type": "string",
+            "description": "Custom value ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "New display name"
+          },
+          "value": {
+            "type": "string",
+            "description": "New stored value"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customValueId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_custom_value",
+      "description": "Delete a sub-account custom value. Any merge tags referencing the deleted key will render empty in workflows/messages.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "customValueId": {
+            "type": "string",
+            "description": "Custom value ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "customValueId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_workflows",
+      "description": "List all workflows in the sub-account. Returns workflow IDs, names, and status.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_tags",
+      "description": "List all tags available on the sub-account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_create_tag",
+      "description": "Create a new tag on the sub-account. Tags are referenced by NAME from contact.tags JSON arrays, so use a concise human-readable name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Tag display name, e.g. 'VIP' or 'needs-followup'"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_update_tag",
+      "description": "Rename a tag. Existing contacts tagged with the old name get the rename transitively.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tagId": {
+            "type": "string",
+            "description": "Tag ID"
+          },
+          "name": {
+            "type": "string",
+            "description": "New tag name"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "tagId",
+          "name"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_delete_tag",
+      "description": "Delete a tag from the sub-account. Contacts that were tagged lose the tag reference; contact records themselves are not touched.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tagId": {
+            "type": "string",
+            "description": "Tag ID"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "tagId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_location",
+      "description": "Fetch full details of the current sub-account (location) — name, address, timezone, business info.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_users",
+      "description": "List users on the sub-account. Useful for finding user IDs to assign tasks, opportunities, or appointments.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_get_user",
+      "description": "Fetch a single user by ID.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "userId": {
+            "type": "string",
+            "description": "User ID"
+          }
+        },
+        "required": [
+          "userId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_forms",
+      "description": "List all forms on the sub-account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAfterId": {
+            "type": "string",
+            "description": "Cursor from a previous page"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_form_submissions",
+      "description": "List submissions for a specific form.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "formId": {
+            "type": "string",
+            "description": "Form ID"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAt": {
+            "type": "string",
+            "description": "ISO date — only submissions after this date"
+          },
+          "endAt": {
+            "type": "string",
+            "description": "ISO date — only submissions before this date"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "formId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_surveys",
+      "description": "List all surveys on the sub-account.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAfterId": {
+            "type": "string",
+            "description": "Cursor from a previous page"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_list_survey_submissions",
+      "description": "List submissions for a specific survey.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "surveyId": {
+            "type": "string",
+            "description": "Survey ID"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Results per page (max 100, default 25)"
+          },
+          "startAt": {
+            "type": "string",
+            "description": "ISO date"
+          },
+          "endAt": {
+            "type": "string",
+            "description": "ISO date"
+          },
+          "locationId": {
+            "type": "string",
+            "description": "Location (sub-account) ID. Defaults to TOPLINE_LOCATION_ID env var if omitted."
+          }
+        },
+        "required": [
+          "surveyId"
+        ],
+        "additionalProperties": false
+      },
+      "category": "action"
+    },
+    {
+      "name": "topline_describe_data_catalog",
+      "description": "COMPLETE catalog of every GHL/Topline object that exists upstream — including objects we sync (queryable via SQL), objects we've catalogued but haven't built sync for yet, objects that require OAuth/agency scopes our PIT auth can't reach, and objects we've declined to sync. Call this when topline_describe_schema doesn't show something the user is asking about — it will tell you whether the data lives on disk (queryable now), is pending (answer will lag a sync cycle), or is inaccessible (tell the user to request it instead of inventing a workaround). Contrast with topline_describe_schema, which is SCHEMA-only and hides everything not currently exposed. Returns { entries: [{ name, category, status, description, sql_table?, endpoint?, notes? }...] } with status in {exposed, syncing, catalogued, requires_oauth, inaccessible, declined}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_describe_schema",
+      "description": "Overview of every table currently exposed to SQL queries in this sub-account's data warehouse. Returns table names, one-line descriptions, row counts, and a short SQLite-dialect cheat sheet. Call this FIRST when the user asks anything analytics-flavored ('how many', 'group by', 'trend', 'compare', 'duplicate'). It's cheap and tells you what's queryable. Follow up with topline_explain_tables on the ones you want to use, then topline_execute_query with the SQL.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_explain_tables",
+      "description": "Per-column detail for one or more tables returned by topline_describe_schema. Gives column names, SQLite types, nullability, JSON-column flags, enum values for closed-set text columns, foreign-key hints for joins, and approximate row counts. Call this before writing a SELECT so your WHERE / JOIN clauses use real column names and valid enum values. Rejects tables that aren't in the exposed set.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tables": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "Table name, e.g. 'contacts'"
+            },
+            "description": "One or more table names to explain"
+          }
+        },
+        "required": [
+          "tables"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_execute_query",
+      "description": "Run a read-only SQL query against this sub-account's SQLite warehouse. ONE SELECT or WITH...SELECT statement at a time. DDL, DML, PRAGMA, ATTACH, and admin commands are rejected by the parser before they reach the database. Results are capped at 5000 rows; larger result sets come back with truncated: true. Returns { columns, rows, elapsed_ms, truncated, effective_limit, rewritten_sql }. SQLite dialect — no DATE_TRUNC (use strftime), JSON columns need json_extract / json_each, timestamps are ISO 8601 strings that compare lexicographically.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A single SELECT or WITH ... SELECT statement. Example: \"SELECT status, COUNT(*) AS n FROM opportunities GROUP BY status ORDER BY n DESC\""
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_utilize_api",
+      "description": "Describes the HTTP query API you can point Looker Studio, Retool, Lovable, Claude Code, n8n, or curl at for live-data dashboards. Returns URL shapes, auth format, example curl commands, and guidance for wiring up a dashboard. Use this when the user asks about building dashboards, embedding the data in another tool, or when a query is too complex for chat and they'd rather save it as a saved view.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_find_references",
+      "description": "Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. WORKFLOWS are NOT supported: GHL's public API does not expose workflow internals, so we cannot know which workflows reference any given object. kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "tag",
+              "custom_field",
+              "custom_value",
+              "pipeline",
+              "pipeline_stage",
+              "calendar",
+              "user",
+              "contact",
+              "opportunity",
+              "form",
+              "survey"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "ID of the object to search references for (or name, for tags)"
+          }
+        },
+        "required": [
+          "kind",
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    }
+  ],
+  "count": 68
+}
