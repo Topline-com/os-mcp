@@ -161,6 +161,12 @@ export class LocationDOMigrationError extends Error {
 
 export class LocationDO extends DurableObject<LocationDOEnv> {
   private initialized = false;
+  /**
+   * Views whose CREATE failed during the last ensureSchema pass. Empty
+   * in the happy path. Surfaced for operator visibility; the SQL endpoint
+   * stays serving from the views that did create successfully.
+   */
+  private failedViews: Array<{ name: string; error: string }> = [];
 
   /**
    * Lazy init. Every RPC method calls this first. Migrations are idempotent
@@ -294,9 +300,28 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // we DROP first so reshapes in code take effect on the next DO
     // restart. Views are read-only aliases over the base tables; no
     // storage cost, always consistent with the current data.
+    //
+    // Isolate each view's CREATE in its own try/catch. Workers DO SQLite
+    // enforces a tight SQLITE_LIMIT_COMPOUND_SELECT — a single
+    // mis-authored view (too many UNION ALL terms, unknown column, etc.)
+    // used to throw inside this loop and the unhandled exception killed
+    // the whole ensureSchema call, which made describeSchema /
+    // executeQuery fail wholesale ("too many terms in compound SELECT"
+    // returned for unrelated queries). Now a bad view drops itself and
+    // its name is collected for explicit operator visibility while the
+    // remaining views — and the rest of the warehouse — stay queryable.
+    this.failedViews = [];
     for (const v of ANALYTICS_VIEWS) {
       sql.exec(`DROP VIEW IF EXISTS ${v.name}`);
-      sql.exec(v.ddl);
+      try {
+        sql.exec(v.ddl);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.failedViews.push({ name: v.name, error: message });
+        console.error(
+          `[LocationDO] CREATE VIEW ${v.name} failed during ensureSchema; view will be unavailable until the definition is fixed: ${message}`,
+        );
+      }
     }
   }
 
