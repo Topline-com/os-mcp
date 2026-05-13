@@ -1137,7 +1137,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         "Timestamps are ISO 8601 strings. Compare lexicographically or parse with strftime.",
         "JSON columns (e.g. contacts.tags, contacts.custom_fields, every table's raw_payload) — query with json_extract() and json_each().",
         "Every table has a `raw_payload` TEXT/JSON column holding the full upstream GHL object — use json_extract(raw_payload, '$.meta.call.duration') etc. for fields that aren't surfaced as their own columns.",
-        "Derived views (call_events, email_events, sms_events, lead_response_metrics, contact_timeline, opportunity_funnel) are READ-ONLY virtual tables — cheaper to query than re-deriving from messages yourself.",
+        "Derived views (email_events, sms_events, lead_response_metrics, contact_timeline, opportunity_funnel, pipeline_activity_window, pipeline_snapshot, pipeline_movement_window, warehouse_freshness) are READ-ONLY virtual tables — cheaper to query than re-deriving from base tables yourself. call_events is a typed synced table, not a view.",
         "Tenant isolation is physical; every row you see is already scoped to your sub-account.",
         "Counts are eventually consistent: the sync worker polls upstream every 15 min, and a small sampling gap (~0.03% on conversations) exists because the upstream cursor uses a single timestamp field with no tie-breaker. For questions sensitive to single-row exactness, prefer SUM/COUNT over ranges to smooth the variance.",
         "When a question asks about an object that doesn't appear here (calls, transcripts, forms, invoices, etc.), call topline_describe_data_catalog to see whether it's synced, pending, or requires OAuth — don't assume it doesn't exist.",

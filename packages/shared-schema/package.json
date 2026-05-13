@@ -15,7 +15,8 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "node --no-warnings --experimental-sqlite --import tsx --test src/views.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.12.0",
