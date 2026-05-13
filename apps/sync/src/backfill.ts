@@ -117,6 +117,16 @@ export interface BackfillResult {
    * pipelines → pipeline_stages expansion. Omitted otherwise.
    */
   denormalized_stage_rows?: number;
+  /**
+   * Per-parent failures observed during a per_parent backfill. Only
+   * present when at least one parent threw — populated even when
+   * `stopped_reason` is not "error" (i.e. some parents succeeded and
+   * some failed). This is what surfaces a stuck calendar in cron logs
+   * instead of silently halting the whole tick on the first failure.
+   *
+   * Omitted from the response when empty.
+   */
+  failed_parents?: Array<{ parent_id: string; error: string }>;
 }
 
 // Upper bound on pages for a single invocation. Sync workers have a
@@ -996,10 +1006,22 @@ async function backfillPerParent(
   let lastRowCount = 0;
   let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
   let errorMsg: string | undefined;
+  let parentsAttempted = 0;
+  let parentsSucceeded = 0;
+  const failedParents: Array<{ parent_id: string; error: string }> = [];
 
   try {
     await runInContext(connection, async () => {
       parentLoop: for (const parentId of parentIds) {
+        parentsAttempted += 1;
+        // Per-parent try/catch: a single bad calendar (or contact, or
+        // conversation) used to throw out of runInContext and halt the
+        // entire tick. Now we isolate the failure, record it on
+        // failedParents, and keep walking the remaining parents.
+        // stopped_reason still flips to "error" — but only when *every*
+        // attempted parent failed; partial success keeps the original
+        // reason so cron freshness signals don't regress.
+        try {
         const priorParentCursor = await stub.getParentSyncCursor(entity.table, parentId);
         let cursorValue: unknown = priorParentCursor
           ? parseCursor(priorParentCursor)
@@ -1155,15 +1177,43 @@ async function backfillPerParent(
           );
           childrenPruned += pruned;
         }
+        parentsSucceeded += 1;
+        } catch (parentErr) {
+          const parentMsg = parentErr instanceof ToplineApiError
+            ? `GHL ${parentErr.statusCode}: ${parentErr.message}`
+            : parentErr instanceof Error
+            ? parentErr.message
+            : String(parentErr);
+          failedParents.push({ parent_id: parentId, error: parentMsg });
+          // Continue to the next parent — partial progress beats halting
+          // the whole tick on the first bad calendar / conversation.
+        }
       }
     });
   } catch (err) {
+    // Catastrophic failure outside any parent's try/catch (e.g. the
+    // runInContext setup itself blew up). Preserve the legacy behavior.
     stoppedReason = "error";
     errorMsg = err instanceof ToplineApiError
       ? `GHL ${err.statusCode}: ${err.message}`
       : err instanceof Error
       ? err.message
       : String(err);
+  }
+
+  // If every attempted parent failed and none succeeded, surface that
+  // as stopped_reason="error" so cron treats this tick as a failure.
+  // Partial success leaves the reason intact (empty_page / page_cap_hit)
+  // so freshness signals still advance for the parents that worked.
+  if (
+    stoppedReason !== "error" &&
+    stoppedReason !== "page_cap_hit" &&
+    parentsAttempted > 0 &&
+    parentsSucceeded === 0 &&
+    failedParents.length > 0
+  ) {
+    stoppedReason = "error";
+    errorMsg = `all ${failedParents.length} attempted parents failed; first: ${failedParents[0]!.error}`;
   }
 
   if (callEventsUpserted > 0) {
@@ -1174,6 +1224,16 @@ async function backfillPerParent(
   if (childrenPruned > 0) {
     console.log(
       `[per_parent:${entity.table}] snapshot-and-swap pruned ${childrenPruned} stale children (deleted upstream)`,
+    );
+  }
+  if (failedParents.length > 0) {
+    // Compact, log-friendly: count + first 3 IDs + first error. Full
+    // list is on the returned BackfillResult.failed_parents for any
+    // caller that wants it (cron logger, /sync/backfill response).
+    const sampleIds = failedParents.slice(0, 3).map((f) => f.parent_id).join(",");
+    console.log(
+      `[per_parent:${entity.table}] ${failedParents.length}/${parentsAttempted} parents failed ` +
+        `sample=[${sampleIds}] first_error=${failedParents[0]!.error.slice(0, 200)}`,
     );
   }
 
@@ -1188,6 +1248,7 @@ async function backfillPerParent(
     duration_ms: Date.now() - started,
     stopped_reason: stoppedReason,
     ...(errorMsg ? { error: errorMsg } : {}),
+    ...(failedParents.length > 0 ? { failed_parents: failedParents } : {}),
   };
 }
 
@@ -1545,6 +1606,11 @@ export interface IncrementalResult {
   error?: string;
   /** Forwarded from the underlying BackfillResult when > 0. */
   pruned_stale_rows?: number;
+  /**
+   * Forwarded from the underlying per_parent BackfillResult. Present
+   * only when at least one parent threw. Omitted otherwise.
+   */
+  failed_parents?: Array<{ parent_id: string; error: string }>;
 }
 
 export async function incrementalEntity(
@@ -1646,6 +1712,9 @@ export async function incrementalEntity(
       duration_ms: res.duration_ms,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
+      ...(res.failed_parents && res.failed_parents.length > 0
+        ? { failed_parents: res.failed_parents }
+        : {}),
     };
   }
 
