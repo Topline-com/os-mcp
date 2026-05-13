@@ -256,6 +256,10 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       FROM opportunities o
       JOIN messages m ON m.contact_id = o.contact_id
       WHERE o.contact_id IS NOT NULL
+        -- Calls are represented by the typed call_events table below. Excluding
+        -- call-shaped message rows here prevents every phone call from being
+        -- counted twice (once as a message, once as a call).
+        AND COALESCE(m.type, '') NOT IN ('TYPE_CALL', 'TYPE_IVR_CALL', 'TYPE_CUSTOM_CALL', 'TYPE_CAMPAIGN_CALL')
       UNION ALL
       SELECT
         o.id AS opportunity_id,
@@ -318,8 +322,8 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         COUNT(*) AS opportunity_count,
         COALESCE(SUM(o.monetary_value), 0) AS pipeline_value,
         CAST(AVG(
-          julianday(COALESCE(o.last_stage_change_at, o.updated_at, o.created_at))
-          - julianday(COALESCE(o.last_stage_change_at, o.created_at))
+          julianday('now')
+          - julianday(COALESCE(o.last_stage_change_at, o.created_at, o.updated_at))
         ) AS REAL) AS avg_days_in_stage
       FROM opportunities o
       LEFT JOIN pipelines p ON p.id = o.pipeline_id
@@ -352,12 +356,24 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         o.updated_at,
         o.last_status_change_at,
         o.last_stage_change_at,
-        COALESCE(o.last_stage_change_at, o.last_status_change_at, o.updated_at) AS last_movement_at,
         CASE
           WHEN o.last_stage_change_at IS NOT NULL
            AND (o.last_status_change_at IS NULL OR o.last_stage_change_at >= o.last_status_change_at)
+           AND (o.updated_at IS NULL OR o.last_stage_change_at >= o.updated_at)
+          THEN o.last_stage_change_at
+          WHEN o.last_status_change_at IS NOT NULL
+           AND (o.updated_at IS NULL OR o.last_status_change_at >= o.updated_at)
+          THEN o.last_status_change_at
+          ELSE o.updated_at
+        END AS last_movement_at,
+        CASE
+          WHEN o.last_stage_change_at IS NOT NULL
+           AND (o.last_status_change_at IS NULL OR o.last_stage_change_at >= o.last_status_change_at)
+           AND (o.updated_at IS NULL OR o.last_stage_change_at >= o.updated_at)
           THEN 'stage_change'
-          WHEN o.last_status_change_at IS NOT NULL THEN 'status_change'
+          WHEN o.last_status_change_at IS NOT NULL
+           AND (o.updated_at IS NULL OR o.last_status_change_at >= o.updated_at)
+          THEN 'status_change'
           WHEN o.updated_at IS NOT NULL THEN 'record_update'
           ELSE NULL
         END AS last_movement_kind
