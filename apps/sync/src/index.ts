@@ -221,10 +221,22 @@ async function runIncrementalForAllConnections(env: Env): Promise<void> {
         const results = await incrementalAll(env, entry.name);
         // Log a compact one-line summary per entity for observability.
         for (const [table, r] of Object.entries(results)) {
+          // failed_parents only present on per_parent entities where at
+          // least one parent threw — surface count + first 3 IDs inline
+          // so a stuck calendar / contact / conversation shows up in the
+          // cron log instead of being silently swallowed.
+          const failedSuffix =
+            r.failed_parents && r.failed_parents.length > 0
+              ? ` failed_parents=${r.failed_parents.length} sample=[${r.failed_parents
+                  .slice(0, 3)
+                  .map((f) => f.parent_id)
+                  .join(",")}]`
+              : "";
           console.log(
             `[sync/cron ${runStartedAt}] connection=${entry.name} entity=${table} ` +
               `stopped=${r.stopped_reason} rows_upserted=${r.rows_upserted} ` +
               `row_count=${r.row_count_after}` +
+              failedSuffix +
               (r.error ? ` error=${r.error.slice(0, 120)}` : ""),
           );
         }
