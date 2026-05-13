@@ -147,13 +147,16 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "contact_timeline",
     description:
-      "Unified chronological stream of everything that happened to a contact — messages (calls, SMS, email) and opportunities created. One row per event, ordered by event_at. Use this for 'show me the full history of contact X' or 'what touches happened in the 48 hours after form submission'. Appointments will join this view once their backfill contract ships.",
-    base_tables: ["messages", "opportunities"],
-    // Intentionally does NOT UNION appointments: that table is still
-    // hidden (pagination: "unknown") so the exposure gate rejects
-    // direct reads. Including it here would leak the same rows through
-    // the view, bypassing the policy. When appointments ships, add
-    // a third UNION branch and bump base_tables.
+      "Unified chronological stream of everything that happened to a contact — messages (calls, SMS, email), opportunities created, and appointments scheduled. One row per event, ordered by event_at. Use this for 'show me the full history of contact X' or 'what touches happened in the 48 hours after form submission'.",
+    base_tables: ["messages", "opportunities", "appointments"],
+    // Rollforward 2026-05-13: appointments now ship and are exposed, so
+    // the third UNION branch foreshadowed by the original DDL is added.
+    // call_events is INTENTIONALLY skipped here — every call_events row
+    // already has a matching messages row (call_events is dual-written
+    // out of messages during sync), so unioning it would double-count
+    // calls in the timeline. Drilldown into call disposition / duration
+    // is still available by joining contact_timeline.source_id back to
+    // call_events.id when event_subtype LIKE 'TYPE_%CALL%'.
     ddl: `
       CREATE VIEW contact_timeline AS
       SELECT
@@ -180,6 +183,20 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         o.assigned_to AS user_id
       FROM opportunities o
       WHERE o.created_at IS NOT NULL
+      UNION ALL
+      SELECT
+        a.contact_id,
+        a.location_id,
+        'appointment' AS event_kind,
+        a.status AS event_subtype,
+        NULL AS direction,
+        a.start_time AS event_at,
+        a.title AS summary,
+        a.id AS source_id,
+        a.assigned_user_id AS user_id
+      FROM appointments a
+      WHERE a.contact_id IS NOT NULL
+        AND a.start_time IS NOT NULL
     `,
   },
 
@@ -210,6 +227,255 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       FROM opportunities o
       LEFT JOIN pipelines p ON p.id = o.pipeline_id
       LEFT JOIN pipeline_stages ps ON ps.id = o.pipeline_stage_id
+    `,
+  },
+
+  {
+    name: "pipeline_activity_window",
+    description:
+      "One row per activity touch (message, call, appointment) tied to an opportunity through its contact. Filter to a window with WHERE event_at >= ? AND event_at < ? AND pipeline_id = ?. activity_class is one of 'message' | 'call' | 'appointment'. NOTE on fan-out: when a contact has multiple opportunities in the same pipeline, a single touch maps to multiple rows (one per opportunity). Use COUNT(DISTINCT source_id) when summing unique touches across opportunities; per-deal totals (GROUP BY opportunity_id, source_id) are exact.",
+    base_tables: ["opportunities", "messages", "call_events", "appointments"],
+    ddl: `
+      CREATE VIEW pipeline_activity_window AS
+      SELECT
+        o.id AS opportunity_id,
+        o.location_id,
+        o.contact_id,
+        o.name AS opportunity_name,
+        o.status AS opportunity_status,
+        o.monetary_value,
+        o.pipeline_id,
+        o.pipeline_stage_id,
+        o.assigned_to AS owner_user_id,
+        'message' AS activity_class,
+        m.type AS activity_subtype,
+        m.direction,
+        m.date_added AS event_at,
+        m.id AS source_id,
+        m.user_id
+      FROM opportunities o
+      JOIN messages m ON m.contact_id = o.contact_id
+      WHERE o.contact_id IS NOT NULL
+      UNION ALL
+      SELECT
+        o.id AS opportunity_id,
+        o.location_id,
+        o.contact_id,
+        o.name AS opportunity_name,
+        o.status AS opportunity_status,
+        o.monetary_value,
+        o.pipeline_id,
+        o.pipeline_stage_id,
+        o.assigned_to AS owner_user_id,
+        'call' AS activity_class,
+        ce.call_type AS activity_subtype,
+        ce.direction,
+        ce.event_at AS event_at,
+        ce.id AS source_id,
+        ce.user_id
+      FROM opportunities o
+      JOIN call_events ce ON ce.contact_id = o.contact_id
+      WHERE o.contact_id IS NOT NULL
+      UNION ALL
+      SELECT
+        o.id AS opportunity_id,
+        o.location_id,
+        o.contact_id,
+        o.name AS opportunity_name,
+        o.status AS opportunity_status,
+        o.monetary_value,
+        o.pipeline_id,
+        o.pipeline_stage_id,
+        o.assigned_to AS owner_user_id,
+        'appointment' AS activity_class,
+        a.status AS activity_subtype,
+        NULL AS direction,
+        a.start_time AS event_at,
+        a.id AS source_id,
+        a.assigned_user_id AS user_id
+      FROM opportunities o
+      JOIN appointments a ON a.contact_id = o.contact_id
+      WHERE o.contact_id IS NOT NULL
+        AND a.start_time IS NOT NULL
+    `,
+  },
+
+  {
+    name: "pipeline_snapshot",
+    description:
+      "Per-stage rollup of every pipeline: opportunity_count, pipeline_value (SUM of monetary_value), and avg_days_in_stage. One row per (pipeline_id, pipeline_stage_id, opportunity status). Filter with WHERE pipeline_id = ? AND opportunity_status = 'open' for the standard 'pipeline snapshot' shape, or GROUP BY pipeline_id for an all-pipelines rollup.",
+    base_tables: ["opportunities", "pipelines", "pipeline_stages"],
+    ddl: `
+      CREATE VIEW pipeline_snapshot AS
+      SELECT
+        o.location_id,
+        o.pipeline_id,
+        p.name AS pipeline_name,
+        o.pipeline_stage_id,
+        ps.name AS stage_name,
+        ps.position AS stage_position,
+        o.status AS opportunity_status,
+        COUNT(*) AS opportunity_count,
+        COALESCE(SUM(o.monetary_value), 0) AS pipeline_value,
+        CAST(AVG(
+          julianday(COALESCE(o.last_stage_change_at, o.updated_at, o.created_at))
+          - julianday(COALESCE(o.last_stage_change_at, o.created_at))
+        ) AS REAL) AS avg_days_in_stage
+      FROM opportunities o
+      LEFT JOIN pipelines p ON p.id = o.pipeline_id
+      LEFT JOIN pipeline_stages ps ON ps.id = o.pipeline_stage_id
+      GROUP BY o.location_id, o.pipeline_id, p.name, o.pipeline_stage_id, ps.name, ps.position, o.status
+    `,
+  },
+
+  {
+    name: "pipeline_movement_window",
+    description:
+      "One row per opportunity with stage/status/record movement timestamps surfaced as last_movement_at = MAX(last_stage_change_at, last_status_change_at, updated_at). Filter with WHERE last_movement_at >= ? AND last_movement_at < ? AND pipeline_id = ? to find moved deals in a window. Includes pipeline_name and stage_name so the result is readable without further joins.",
+    base_tables: ["opportunities", "pipelines", "pipeline_stages"],
+    ddl: `
+      CREATE VIEW pipeline_movement_window AS
+      SELECT
+        o.id AS opportunity_id,
+        o.location_id,
+        o.contact_id,
+        o.name AS opportunity_name,
+        o.status AS opportunity_status,
+        o.monetary_value,
+        o.assigned_to AS owner_user_id,
+        o.pipeline_id,
+        p.name AS pipeline_name,
+        o.pipeline_stage_id,
+        ps.name AS stage_name,
+        ps.position AS stage_position,
+        o.created_at,
+        o.updated_at,
+        o.last_status_change_at,
+        o.last_stage_change_at,
+        COALESCE(o.last_stage_change_at, o.last_status_change_at, o.updated_at) AS last_movement_at,
+        CASE
+          WHEN o.last_stage_change_at IS NOT NULL
+           AND (o.last_status_change_at IS NULL OR o.last_stage_change_at >= o.last_status_change_at)
+          THEN 'stage_change'
+          WHEN o.last_status_change_at IS NOT NULL THEN 'status_change'
+          WHEN o.updated_at IS NOT NULL THEN 'record_update'
+          ELSE NULL
+        END AS last_movement_kind
+      FROM opportunities o
+      LEFT JOIN pipelines p ON p.id = o.pipeline_id
+      LEFT JOIN pipeline_stages ps ON ps.id = o.pipeline_stage_id
+    `,
+  },
+
+  {
+    name: "warehouse_freshness",
+    description:
+      "Per-table sync freshness snapshot: row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. One row per synced base table. Use this as a deterministic readiness probe before running analytics — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Avoids guessing at warehouse staleness from indirect signals.",
+    base_tables: [
+      "contacts",
+      "opportunities",
+      "conversations",
+      "messages",
+      "call_events",
+      "appointments",
+      "pipelines",
+      "pipeline_stages",
+      "calendars",
+      "calendar_groups",
+      "tasks",
+      "notes",
+      "tags",
+      "custom_fields",
+      "custom_values",
+      "workflows",
+      "forms",
+      "form_submissions",
+      "surveys",
+      "survey_submissions",
+    ],
+    ddl: `
+      CREATE VIEW warehouse_freshness AS
+      SELECT 'contacts' AS table_name,
+             COUNT(*) AS row_count,
+             MAX(_synced_at) AS last_synced_at,
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER) AS lag_seconds
+        FROM contacts
+      UNION ALL
+      SELECT 'opportunities', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM opportunities
+      UNION ALL
+      SELECT 'conversations', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM conversations
+      UNION ALL
+      SELECT 'messages', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM messages
+      UNION ALL
+      SELECT 'call_events', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM call_events
+      UNION ALL
+      SELECT 'appointments', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM appointments
+      UNION ALL
+      SELECT 'pipelines', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM pipelines
+      UNION ALL
+      SELECT 'pipeline_stages', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM pipeline_stages
+      UNION ALL
+      SELECT 'calendars', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM calendars
+      UNION ALL
+      SELECT 'calendar_groups', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM calendar_groups
+      UNION ALL
+      SELECT 'tasks', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM tasks
+      UNION ALL
+      SELECT 'notes', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM notes
+      UNION ALL
+      SELECT 'tags', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM tags
+      UNION ALL
+      SELECT 'custom_fields', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM custom_fields
+      UNION ALL
+      SELECT 'custom_values', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM custom_values
+      UNION ALL
+      SELECT 'workflows', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM workflows
+      UNION ALL
+      SELECT 'forms', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM forms
+      UNION ALL
+      SELECT 'form_submissions', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM form_submissions
+      UNION ALL
+      SELECT 'surveys', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM surveys
+      UNION ALL
+      SELECT 'survey_submissions', COUNT(*), MAX(_synced_at),
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+        FROM survey_submissions
     `,
   },
 ];
