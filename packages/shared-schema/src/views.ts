@@ -370,44 +370,20 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "warehouse_freshness",
     description:
-      "Per-table sync freshness snapshot: row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. One row per synced base table. Use this as a deterministic readiness probe before running analytics — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Avoids guessing at warehouse staleness from indirect signals.",
+      "Per-table sync freshness snapshot for the activity-critical tables that drive pipeline audits: row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. Use this as a deterministic readiness probe — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Scoped to the 4 activity tables on purpose: Workers DO SQLite enforces a tight SQLITE_LIMIT_COMPOUND_SELECT (CREATE VIEW with > 4 UNION ALL terms fails at warmup with 'too many terms in compound SELECT' and rolls back the entire ANALYTICS_VIEWS batch). For freshness of contacts / pipeline_stages / etc., query MAX(_synced_at) on those tables directly.",
     base_tables: [
-      "contacts",
       "opportunities",
-      "conversations",
       "messages",
       "call_events",
       "appointments",
-      "pipelines",
-      "pipeline_stages",
-      "calendars",
-      "calendar_groups",
-      "tasks",
-      "notes",
-      "tags",
-      "custom_fields",
-      "custom_values",
-      "workflows",
-      "forms",
-      "form_submissions",
-      "surveys",
-      "survey_submissions",
     ],
     ddl: `
       CREATE VIEW warehouse_freshness AS
-      SELECT 'contacts' AS table_name,
+      SELECT 'opportunities' AS table_name,
              COUNT(*) AS row_count,
              MAX(_synced_at) AS last_synced_at,
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER) AS lag_seconds
-        FROM contacts
-      UNION ALL
-      SELECT 'opportunities', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM opportunities
-      UNION ALL
-      SELECT 'conversations', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM conversations
       UNION ALL
       SELECT 'messages', COUNT(*), MAX(_synced_at),
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
@@ -420,62 +396,6 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       SELECT 'appointments', COUNT(*), MAX(_synced_at),
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM appointments
-      UNION ALL
-      SELECT 'pipelines', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM pipelines
-      UNION ALL
-      SELECT 'pipeline_stages', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM pipeline_stages
-      UNION ALL
-      SELECT 'calendars', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM calendars
-      UNION ALL
-      SELECT 'calendar_groups', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM calendar_groups
-      UNION ALL
-      SELECT 'tasks', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM tasks
-      UNION ALL
-      SELECT 'notes', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM notes
-      UNION ALL
-      SELECT 'tags', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM tags
-      UNION ALL
-      SELECT 'custom_fields', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM custom_fields
-      UNION ALL
-      SELECT 'custom_values', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM custom_values
-      UNION ALL
-      SELECT 'workflows', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM workflows
-      UNION ALL
-      SELECT 'forms', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM forms
-      UNION ALL
-      SELECT 'form_submissions', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM form_submissions
-      UNION ALL
-      SELECT 'surveys', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM surveys
-      UNION ALL
-      SELECT 'survey_submissions', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM survey_submissions
     `,
   },
 ];
