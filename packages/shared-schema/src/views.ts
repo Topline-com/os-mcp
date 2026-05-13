@@ -367,10 +367,31 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
     `,
   },
 
+  /*
+   * Warehouse freshness — SPLIT INTO MULTIPLE VIEWS, DO NOT MERGE.
+   *
+   * Cloudflare Workers DO SQLite caps SQLITE_LIMIT_COMPOUND_SELECT at 6
+   * terms, so any compound SELECT (UNION / UNION ALL chain) may contain
+   * at most 6 SELECTs. A single 20-branch warehouse_freshness view fails
+   * to CREATE during LocationDO warmup, and because warmup applies all
+   * ANALYTICS_VIEWS in a single batch one failure rolls the entire batch
+   * back — taking every analytics view offline and returning 500 from
+   * every topline query call.
+   *
+   * The freshness probe is therefore partitioned across several views,
+   * each ≤6 base tables (≤6 UNION ALL branches). Do NOT collapse these
+   * back into one view to "tidy up" — the cap is a Workers DO platform
+   * limit, not a stylistic choice. If callers want a single unified
+   * freshness result, write the UNION at query time on the tool side
+   * (SELECT * FROM warehouse_freshness_core UNION ALL SELECT * FROM
+   * warehouse_freshness_meta UNION ALL ...): SQLite supports the wider
+   * compound there because the limit applies per-statement at parse
+   * time, and tool-side SQL is gated independently.
+   */
   {
-    name: "warehouse_freshness",
+    name: "warehouse_freshness_core",
     description:
-      "Per-table sync freshness snapshot: row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. One row per synced base table. Use this as a deterministic readiness probe before running analytics — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Avoids guessing at warehouse staleness from indirect signals.",
+      "Per-table sync freshness snapshot for the core CRM tables (contacts, opportunities, conversations, messages, call_events, appointments): row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. Use this as a deterministic readiness probe before running analytics — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Companion views warehouse_freshness_meta, warehouse_freshness_extras, and warehouse_freshness_forms cover the remaining synced tables; UNION them at query time for an all-table view.",
     base_tables: [
       "contacts",
       "opportunities",
@@ -378,23 +399,9 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       "messages",
       "call_events",
       "appointments",
-      "pipelines",
-      "pipeline_stages",
-      "calendars",
-      "calendar_groups",
-      "tasks",
-      "notes",
-      "tags",
-      "custom_fields",
-      "custom_values",
-      "workflows",
-      "forms",
-      "form_submissions",
-      "surveys",
-      "survey_submissions",
     ],
     ddl: `
-      CREATE VIEW warehouse_freshness AS
+      CREATE VIEW warehouse_freshness_core AS
       SELECT 'contacts' AS table_name,
              COUNT(*) AS row_count,
              MAX(_synced_at) AS last_synced_at,
@@ -420,9 +427,27 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       SELECT 'appointments', COUNT(*), MAX(_synced_at),
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM appointments
-      UNION ALL
-      SELECT 'pipelines', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+    `,
+  },
+
+  {
+    name: "warehouse_freshness_meta",
+    description:
+      "Per-table sync freshness snapshot for the pipeline / calendar / task / note metadata tables (pipelines, pipeline_stages, calendars, calendar_groups, tasks, notes): row_count, last_synced_at, lag_seconds. Companion to warehouse_freshness_core / warehouse_freshness_extras / warehouse_freshness_forms.",
+    base_tables: [
+      "pipelines",
+      "pipeline_stages",
+      "calendars",
+      "calendar_groups",
+      "tasks",
+      "notes",
+    ],
+    ddl: `
+      CREATE VIEW warehouse_freshness_meta AS
+      SELECT 'pipelines' AS table_name,
+             COUNT(*) AS row_count,
+             MAX(_synced_at) AS last_synced_at,
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER) AS lag_seconds
         FROM pipelines
       UNION ALL
       SELECT 'pipeline_stages', COUNT(*), MAX(_synced_at),
@@ -444,9 +469,25 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       SELECT 'notes', COUNT(*), MAX(_synced_at),
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM notes
-      UNION ALL
-      SELECT 'tags', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+    `,
+  },
+
+  {
+    name: "warehouse_freshness_extras",
+    description:
+      "Per-table sync freshness snapshot for the tag / custom field / custom value / workflow tables: row_count, last_synced_at, lag_seconds. Companion to warehouse_freshness_core / warehouse_freshness_meta / warehouse_freshness_forms.",
+    base_tables: [
+      "tags",
+      "custom_fields",
+      "custom_values",
+      "workflows",
+    ],
+    ddl: `
+      CREATE VIEW warehouse_freshness_extras AS
+      SELECT 'tags' AS table_name,
+             COUNT(*) AS row_count,
+             MAX(_synced_at) AS last_synced_at,
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER) AS lag_seconds
         FROM tags
       UNION ALL
       SELECT 'custom_fields', COUNT(*), MAX(_synced_at),
@@ -460,9 +501,25 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
       SELECT 'workflows', COUNT(*), MAX(_synced_at),
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM workflows
-      UNION ALL
-      SELECT 'forms', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
+    `,
+  },
+
+  {
+    name: "warehouse_freshness_forms",
+    description:
+      "Per-table sync freshness snapshot for the forms / surveys families (forms, form_submissions, surveys, survey_submissions): row_count, last_synced_at, lag_seconds. Companion to warehouse_freshness_core / warehouse_freshness_meta / warehouse_freshness_extras.",
+    base_tables: [
+      "forms",
+      "form_submissions",
+      "surveys",
+      "survey_submissions",
+    ],
+    ddl: `
+      CREATE VIEW warehouse_freshness_forms AS
+      SELECT 'forms' AS table_name,
+             COUNT(*) AS row_count,
+             MAX(_synced_at) AS last_synced_at,
+             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER) AS lag_seconds
         FROM forms
       UNION ALL
       SELECT 'form_submissions', COUNT(*), MAX(_synced_at),
