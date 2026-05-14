@@ -442,4 +442,254 @@ const auditTool: ToolDef = {
   },
 };
 
-export const tools: ToolDef[] = [doctorTool, freshnessTool, snapshotTool, auditTool];
+// ---------------------------------------------------------------------------
+// Tool: topline_contact_audit
+// ---------------------------------------------------------------------------
+//
+// Single-call replacement for the legacy "search contacts → get contact → list
+// opportunities → search conversations → get messages → list tasks → list notes"
+// REST fan-out. Resolves a fuzzy contact (name/email/phone) or accepts an opaque
+// contact_id, then returns the full warehouse picture in one shot.
+//
+// Tasks and notes are REST-only (not in the warehouse). Agents that need those
+// drill down with the typed REST tools after this audit; we deliberately avoid
+// fan-out inside this composite so the SQL surface stays the answer surface.
+
+export interface ContactResolution {
+  input: string;
+  matchedId: string;
+  matchedBy: "id" | "email" | "phone" | "name";
+  candidates?: Array<{ id: string; name: string; email?: string; phone?: string }>;
+}
+
+const CONTACT_ID_PATTERN = /^[A-Za-z0-9]{20,32}$/;
+const EMAIL_PATTERN = /@/;
+const PHONE_PATTERN = /^[+\d][\d\s().\-]{5,}$/;
+
+function normalizePhone(input: string): string {
+  return input.replace(/[^\d+]/g, "");
+}
+
+async function resolveContactID(
+  client: SqlClient,
+  input: string,
+): Promise<ContactResolution> {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    throw new Error("contact is required (id, email, phone, or name)");
+  }
+  // Path 1: looks like an opaque contact id.
+  if (CONTACT_ID_PATTERN.test(trimmed) && !EMAIL_PATTERN.test(trimmed)) {
+    const exists = await client.executeQuery(
+      "SELECT id FROM contacts WHERE id = ? LIMIT 1",
+      [trimmed],
+    );
+    if (exists.rows.length === 1) {
+      return { input: trimmed, matchedId: trimmed, matchedBy: "id" };
+    }
+    // Fall through — id-shaped but not found, treat as a search string.
+  }
+  // Path 2: email.
+  if (EMAIL_PATTERN.test(trimmed)) {
+    const matches = await client.executeQuery(
+      "SELECT id, full_name, first_name, last_name, email, phone FROM contacts WHERE LOWER(email) = LOWER(?) ORDER BY updated_at DESC LIMIT 25",
+      [trimmed],
+    );
+    if (matches.rows.length === 1) {
+      const row = matches.rows[0] as Record<string, unknown>;
+      return { input: trimmed, matchedId: String(row.id ?? ""), matchedBy: "email" };
+    }
+    if (matches.rows.length === 0) {
+      throw new Error(`no contact matched email ${JSON.stringify(trimmed)}`);
+    }
+    throw new Error(
+      `email ${JSON.stringify(trimmed)} is ambiguous (${matches.rows.length} contacts). Pass the opaque id. Candidates: ${formatContactCandidates(matches.rows)}`,
+    );
+  }
+  // Path 3: phone.
+  if (PHONE_PATTERN.test(trimmed)) {
+    const normalized = normalizePhone(trimmed);
+    if (normalized.length >= 7) {
+      const matches = await client.executeQuery(
+        // Match against the suffix to handle E.164 vs. local-format mismatches.
+        "SELECT id, full_name, first_name, last_name, email, phone FROM contacts WHERE phone IS NOT NULL AND REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', ''), '.', '') LIKE ? ORDER BY updated_at DESC LIMIT 25",
+        [`%${normalized}%`],
+      );
+      if (matches.rows.length === 1) {
+        const row = matches.rows[0] as Record<string, unknown>;
+        return { input: trimmed, matchedId: String(row.id ?? ""), matchedBy: "phone" };
+      }
+      if (matches.rows.length === 0) {
+        throw new Error(`no contact matched phone ${JSON.stringify(trimmed)}`);
+      }
+      throw new Error(
+        `phone ${JSON.stringify(trimmed)} is ambiguous (${matches.rows.length} contacts). Pass the opaque id. Candidates: ${formatContactCandidates(matches.rows)}`,
+      );
+    }
+  }
+  // Path 4: fuzzy name. Tokenize and AND-match across first/last/full/company.
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    throw new Error("contact value is empty after whitespace trim");
+  }
+  const clauses = tokens
+    .map(
+      () =>
+        "(LOWER(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'') || ' ' || COALESCE(full_name,'') || ' ' || COALESCE(company_name,'') || ' ' || COALESCE(email,'')) LIKE ?)",
+    )
+    .join(" AND ");
+  const params = tokens.map((t) => `%${t}%`);
+  const matches = await client.executeQuery(
+    `SELECT id, full_name, first_name, last_name, email, phone, company_name, updated_at FROM contacts WHERE ${clauses} ORDER BY updated_at DESC LIMIT 25`,
+    params,
+  );
+  if (matches.rows.length === 1) {
+    const row = matches.rows[0] as Record<string, unknown>;
+    return { input: trimmed, matchedId: String(row.id ?? ""), matchedBy: "name" };
+  }
+  if (matches.rows.length === 0) {
+    throw new Error(
+      `no contact matched ${JSON.stringify(trimmed)}. Try the contact's email, phone, or full name.`,
+    );
+  }
+  throw new Error(
+    `contact ${JSON.stringify(trimmed)} is ambiguous (${matches.rows.length} matches). Pass the opaque id or a more specific name/email. Candidates: ${formatContactCandidates(matches.rows)}`,
+  );
+}
+
+function formatContactCandidates(rows: Record<string, unknown>[]): string {
+  if (rows.length === 0) return "(none found)";
+  return rows
+    .slice(0, 10)
+    .map((r) => {
+      const id = String(r.id ?? "");
+      const name = String(
+        r.full_name ??
+          (`${r.first_name ?? ""} ${r.last_name ?? ""}`.trim() ||
+            r.company_name ||
+            "(no name)"),
+      );
+      const email = r.email ? ` <${r.email}>` : "";
+      return `${name}${email} (${id})`;
+    })
+    .join(", ");
+}
+
+const contactAuditTool: ToolDef = {
+  name: "topline_contact_audit",
+  description:
+    "Standard contact activity audit in a single call. Replaces the legacy fan-out of search_contacts → get_contact → search_opportunities → search_conversations → get_messages. Accepts an opaque contact ID OR a fuzzy identifier (email like 'jane@acme.com', phone like '+15551234567', or name like 'Jane Smith'); resolves it internally and echoes how it matched. Accepts since/until as 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or relative shorthand (e.g. '90d', '24h'). Default since = 90d, until = now. Returns { contact, contactResolution, window, freshness, opportunities, activity, timeline, messages } where opportunities lists all deals for the contact with pipeline_name/stage_name/value/status (via opportunity_funnel), activity is a counts rollup by event_kind+direction over the window, timeline is per-event rows from contact_timeline within the window (messages + opportunities-created + appointments), and messages is the last N raw message bodies for context. PREFER THIS over topline_execute_query, topline_search_contacts, topline_search_conversations, or topline_get_messages for any 'what's going on with contact X' / 'what did Y say this month' / 'give me a brief on Z' question — it is faster, cheaper, and prevents the agent from inventing SQL the warehouse views already cover. Tasks and notes are NOT included (they are REST-only); drill down with topline_list_contact_tasks / topline_list_contact_notes if the user asks.",
+  inputSchema: obj(
+    {
+      contact: str(
+        "Contact identifier. Accepts opaque contact ID, email (jane@acme.com), phone (+15551234567 or local-format), or fuzzy name (e.g. 'Jane Smith', 'Acme Corp').",
+      ),
+      since: str(
+        "Window start. Default: 90 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.",
+      ),
+      until: str("Window end. Default: now. Same format as `since`."),
+      message_limit: num(
+        "Max raw messages returned in the `messages` section. Default 20, max 100.",
+      ),
+      timeline_limit: num(
+        "Max timeline events returned. Default 50, max 200.",
+      ),
+    },
+    ["contact"],
+  ),
+  handler: async (args) => {
+    const client = getClient();
+    const contactInput = String(args.contact ?? "");
+    const messageLimitRaw = Number(args.message_limit ?? 20);
+    const messageLimit = Math.max(
+      1,
+      Math.min(100, Number.isFinite(messageLimitRaw) ? Math.trunc(messageLimitRaw) : 20),
+    );
+    const timelineLimitRaw = Number(args.timeline_limit ?? 50);
+    const timelineLimit = Math.max(
+      1,
+      Math.min(200, Number.isFinite(timelineLimitRaw) ? Math.trunc(timelineLimitRaw) : 50),
+    );
+    const now = new Date();
+    const start = parseAuditTime(
+      args.since == null ? undefined : String(args.since),
+      new Date(now.getTime() - 90 * 86_400_000),
+      now,
+    );
+    const end = parseAuditTime(
+      args.until == null ? undefined : String(args.until),
+      now,
+      now,
+    );
+    const since = start.toISOString();
+    const until = end.toISOString();
+    const resolution = await resolveContactID(client, contactInput);
+    const contactId = resolution.matchedId;
+
+    const [contact, freshness, opportunities, activity, timeline, messages] = await Promise.all([
+      client.executeQuery(
+        `SELECT id, first_name, last_name, full_name, email, phone, company_name, source, ` +
+          `assigned_to, type, dnd, timezone, tags, city, state, country, ` +
+          `created_at, updated_at ` +
+          `FROM contacts WHERE id = ? LIMIT 1`,
+        [contactId],
+      ),
+      client.executeQuery(
+        "SELECT table_name, row_count, last_synced_at, lag_seconds FROM warehouse_freshness ORDER BY table_name",
+      ),
+      client.executeQuery(
+        `SELECT id AS opportunity_id, name AS opportunity_name, pipeline_id, pipeline_name, ` +
+          `pipeline_stage_id, stage_name, status, ROUND(COALESCE(monetary_value, 0), 2) AS monetary_value, ` +
+          `assigned_user_id, source, created_at, updated_at, last_status_change_at, last_stage_change_at, ` +
+          `CAST(days_since_created AS INTEGER) AS days_since_created, ` +
+          `CAST(days_in_current_stage AS INTEGER) AS days_in_current_stage ` +
+          `FROM opportunity_funnel WHERE contact_id = ? ORDER BY updated_at DESC LIMIT 100`,
+        [contactId],
+      ),
+      client.executeQuery(
+        `SELECT event_kind, direction, COUNT(*) AS event_count, ` +
+          `COUNT(DISTINCT source_id) AS unique_events, ` +
+          `MIN(event_at) AS first_event, MAX(event_at) AS last_event ` +
+          `FROM contact_timeline WHERE contact_id = ? AND event_at >= ? AND event_at <= ? ` +
+          `GROUP BY event_kind, direction ORDER BY event_count DESC`,
+        [contactId, since, until],
+      ),
+      client.executeQuery(
+        `SELECT event_kind, event_subtype, direction, event_at, ` +
+          `SUBSTR(COALESCE(summary, ''), 1, 240) AS summary, source_id, user_id ` +
+          `FROM contact_timeline WHERE contact_id = ? AND event_at >= ? AND event_at <= ? ` +
+          `ORDER BY event_at DESC LIMIT ?`,
+        [contactId, since, until, timelineLimit],
+      ),
+      client.executeQuery(
+        `SELECT id AS message_id, type, direction, date_added AS event_at, body, user_id ` +
+          `FROM messages WHERE contact_id = ? AND date_added >= ? AND date_added <= ? ` +
+          `ORDER BY date_added DESC LIMIT ?`,
+        [contactId, since, until, messageLimit],
+      ),
+    ]);
+
+    const contactRow =
+      contact.rows.length === 1 ? (contact.rows[0] as Record<string, unknown>) : null;
+
+    return {
+      contactId,
+      contactResolution: resolution,
+      window: { since, until },
+      contact: contactRow,
+      freshness: { columns: freshness.columns, rows: freshness.rows },
+      opportunities: { columns: opportunities.columns, rows: opportunities.rows },
+      activity: { columns: activity.columns, rows: activity.rows },
+      timeline: { columns: timeline.columns, rows: timeline.rows },
+      messages: { columns: messages.columns, rows: messages.rows },
+    };
+  },
+};
+
+export const tools: ToolDef[] = [
+  doctorTool,
+  freshnessTool,
+  snapshotTool,
+  auditTool,
+  contactAuditTool,
+];
