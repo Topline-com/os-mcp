@@ -220,6 +220,8 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
         o.updated_at,
         o.last_status_change_at,
         o.last_stage_change_at,
+        o.pipeline_id,
+        o.pipeline_stage_id,
         p.name AS pipeline_name,
         ps.name AS stage_name,
         CAST((julianday(COALESCE(o.last_status_change_at, o.updated_at)) - julianday(o.created_at)) AS REAL) AS days_since_created,
