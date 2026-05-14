@@ -22,6 +22,7 @@ import { tools as pingTools } from "./tools/ping.js";
 import { tools as setupCheckTools } from "./tools/setup_check.js";
 import { tools as passthroughTools } from "./tools/passthrough.js";
 import { tools as sqlTools } from "./tools/sql.js";
+import { tools as compositeTools } from "./tools/composite.js";
 import { tools as referenceTools } from "./tools/references.js";
 import { tools as contactTools } from "./tools/contacts.js";
 import { tools as conversationTools } from "./tools/conversations.js";
@@ -69,6 +70,7 @@ export const ACTION_TOOLS: ToolDef[] = [
  */
 export const ANALYTICS_TOOLS: ToolDef[] = [
   ...sqlTools,
+  ...compositeTools,
   ...referenceTools,
 ];
 

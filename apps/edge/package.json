@@ -12,7 +12,7 @@
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "pretest": "npm run build --workspace=@topline/shared --workspace=@topline/shared-auth --workspace=@topline/shared-schema --workspace=@topline/shared-do",
-    "test": "tsx --test src/sql-safety.test.ts src/write-tools.test.ts"
+    "test": "tsx --test src/sql-safety.test.ts src/write-tools.test.ts src/composite.test.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
