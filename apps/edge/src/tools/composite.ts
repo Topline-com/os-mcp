@@ -9,7 +9,7 @@
 //
 // Naming follows the rest of the server's `topline_` prefix.
 
-import { peekLocationId } from "@topline/shared";
+import { peekLocationId, toplineFetch, getLocationId } from "@topline/shared";
 import type { ToolDef } from "./types.js";
 import { str, obj, num } from "@topline/shared";
 import { edgeContext } from "../request-context.js";
@@ -686,10 +686,287 @@ const contactAuditTool: ToolDef = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Tool: topline_owner_audit
+// ---------------------------------------------------------------------------
+//
+// Owner-scoped activity audit in a single call. Replaces the fan-out of
+// list_users → search_opportunities(assignedTo=...) → execute_query on
+// pipeline_activity_window for THEIR touches. Two ownership lenses exist
+// and they diverge in real life — surface both:
+//
+//   1. Book  = opportunities.assigned_to    (their deals, regardless of toucher)
+//   2. Touch = messages.user_id / call_events.user_id (touches they logged)
+//
+// The skill should treat these as distinct questions. "Is Joey caught up on
+// his book?" = lens 1. "How many calls did Joey make this week?" = lens 2.
+
+export interface OwnerResolution {
+  input: string;
+  matchedId: string;
+  matchedBy: "id" | "email" | "name";
+  user?: { id: string; firstName?: string; lastName?: string; email?: string };
+  candidates?: Array<{ id: string; name: string; email?: string }>;
+}
+
+const USER_ID_PATTERN = /^[A-Za-z0-9]{20,32}$/;
+
+interface UserApiRecord {
+  id: string;
+  firstName?: string;
+  lastName?: string;
+  email?: string;
+  name?: string;
+}
+
+function userDisplayName(u: UserApiRecord): string {
+  const explicit = (u.name ?? "").trim();
+  if (explicit) return explicit;
+  const composed = `${u.firstName ?? ""} ${u.lastName ?? ""}`.trim();
+  return composed || u.email || "(no name)";
+}
+
+async function fetchAllUsers(): Promise<UserApiRecord[]> {
+  const locationId = getLocationId(undefined);
+  const res = await toplineFetch<{ users?: UserApiRecord[] }>("/users/", {
+    query: { locationId },
+  });
+  const users = Array.isArray(res?.users) ? res.users : [];
+  return users.filter((u): u is UserApiRecord => Boolean(u?.id));
+}
+
+async function resolveOwner(input: string): Promise<OwnerResolution> {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    throw new Error("owner is required (user_id, email, or name)");
+  }
+  // Path 1: opaque user_id — fetch directly to validate.
+  if (USER_ID_PATTERN.test(trimmed) && !trimmed.includes("@") && !trimmed.includes(" ")) {
+    try {
+      const res = await toplineFetch<{ user?: UserApiRecord }>(`/users/${trimmed}`);
+      const user = res?.user;
+      if (user?.id) {
+        return {
+          input: trimmed,
+          matchedId: user.id,
+          matchedBy: "id",
+          user: {
+            id: user.id,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            email: user.email,
+          },
+        };
+      }
+    } catch {
+      // fall through to name/email lookup
+    }
+  }
+  const all = await fetchAllUsers();
+  // Path 2: email exact match.
+  if (trimmed.includes("@")) {
+    const target = trimmed.toLowerCase();
+    const matches = all.filter((u) => (u.email ?? "").toLowerCase() === target);
+    if (matches.length === 1) {
+      const u = matches[0];
+      return {
+        input: trimmed,
+        matchedId: u.id,
+        matchedBy: "email",
+        user: { id: u.id, firstName: u.firstName, lastName: u.lastName, email: u.email },
+      };
+    }
+    if (matches.length === 0) {
+      throw new Error(`no user matched email ${JSON.stringify(trimmed)}`);
+    }
+    throw new Error(
+      `email ${JSON.stringify(trimmed)} is ambiguous (${matches.length} users). Pass the opaque user id.`,
+    );
+  }
+  // Path 3: fuzzy name — AND-match all tokens against firstName+lastName+email.
+  const tokens = trimmed.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) {
+    throw new Error("owner value is empty after whitespace trim");
+  }
+  const matches = all.filter((u) => {
+    const hay = `${u.firstName ?? ""} ${u.lastName ?? ""} ${u.email ?? ""}`.toLowerCase();
+    return tokens.every((t) => hay.includes(t));
+  });
+  if (matches.length === 1) {
+    const u = matches[0];
+    return {
+      input: trimmed,
+      matchedId: u.id,
+      matchedBy: "name",
+      user: { id: u.id, firstName: u.firstName, lastName: u.lastName, email: u.email },
+    };
+  }
+  if (matches.length === 0) {
+    throw new Error(
+      `no user matched ${JSON.stringify(trimmed)}. Available users: ${all
+        .slice(0, 15)
+        .map((u) => `${userDisplayName(u)} (${u.id})`)
+        .join(", ")}${all.length > 15 ? ` ... +${all.length - 15} more` : ""}`,
+    );
+  }
+  const candidates = matches.slice(0, 10).map((u) => ({
+    id: u.id,
+    name: userDisplayName(u),
+    email: u.email,
+  }));
+  throw new Error(
+    `owner ${JSON.stringify(trimmed)} is ambiguous (${matches.length} users). Pass the opaque user id or a more specific name. Candidates: ${candidates
+      .map((c) => `${c.name}${c.email ? ` <${c.email}>` : ""} (${c.id})`)
+      .join(", ")}`,
+  );
+}
+
+const ownerAuditTool: ToolDef = {
+  name: "topline_owner_audit",
+  description:
+    "Owner-scoped activity audit in a single call. Replaces the fan-out of topline_list_users → topline_search_opportunities(assignedTo=...) → topline_execute_query on pipeline_activity_window. Accepts an opaque user_id, email, or fuzzy name; resolves via REST /users/ once and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand. Optional `pipeline` arg (id or fuzzy name) scopes book/activity/deals/movement to one pipeline. Returns { userId, ownerResolution, user, window, pipelineFilter, status, freshness, book, bookByStage, activity, deals, movement }. IMPORTANT — TWO OWNERSHIP LENSES: `book` and `movement` use opportunities.assigned_to (deals owned by this user). `activity` and `deals` use messages.user_id / call_events.user_id (touches THIS USER logged). In Topline these diverge: AI agents, shared SDRs, automated workflows produce touches with NULL or system user_id, and reps often touch each other's books. The skill must surface both lenses; agents must not conflate 'is X caught up on their book' (lens 1) with 'how many calls did X make' (lens 2). PREFER THIS over topline_execute_query for any 'how is rep X doing' / 'what did rep X work on this week' / 'rep X's book' / 'who's most active' question.",
+  inputSchema: obj(
+    {
+      owner: str(
+        "Owner identifier. Accepts opaque user_id, email (jane@topline.com), or fuzzy name (e.g. 'Joey Skatell', 'paul').",
+      ),
+      pipeline: str(
+        "Optional pipeline filter (id or fuzzy name). When set, scopes book/activity/deals/movement to one pipeline.",
+      ),
+      since: str(
+        "Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.",
+      ),
+      until: str("Window end. Default: now. Same format as `since`."),
+      status: str(
+        "Opportunity status filter for book/deals/movement: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.",
+      ),
+      limit: num("Max deals returned in `deals` section. Default 25, max 100."),
+    },
+    ["owner"],
+  ),
+  handler: async (args) => {
+    const client = getClient();
+    const ownerInput = String(args.owner ?? "");
+    const status = String(args.status ?? "open");
+    const limitRaw = Number(args.limit ?? 25);
+    const dealLimit = Math.max(
+      1,
+      Math.min(100, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 25),
+    );
+    const now = new Date();
+    const start = parseAuditTime(
+      args.since == null ? undefined : String(args.since),
+      new Date(now.getTime() - 7 * 86_400_000),
+      now,
+    );
+    const end = parseAuditTime(
+      args.until == null ? undefined : String(args.until),
+      now,
+      now,
+    );
+    const since = start.toISOString();
+    const until = end.toISOString();
+
+    const ownerResolution = await resolveOwner(ownerInput);
+    const userId = ownerResolution.matchedId;
+
+    let pipelineFilter: PipelineResolution | null = null;
+    const pipelineInputRaw = args.pipeline == null ? "" : String(args.pipeline).trim();
+    if (pipelineInputRaw) {
+      pipelineFilter = await resolvePipelineID(client, pipelineInputRaw);
+    }
+    const pipelineClause = pipelineFilter ? " AND pipeline_id = ?" : "";
+    const pipelineParams: string[] = pipelineFilter ? [pipelineFilter.matchedId] : [];
+
+    const bookStatus = statusClauseSql("status", status);
+    const activityStatus = statusClauseSql("opportunity_status", status);
+    const movementStatus = statusClauseSql("opportunity_status", status);
+
+    const [freshness, book, bookByStage, activity, deals, movement] = await Promise.all([
+      client.executeQuery(
+        "SELECT table_name, row_count, last_synced_at, lag_seconds FROM warehouse_freshness ORDER BY table_name",
+      ),
+      // Book: opportunities assigned to this user, status-filtered, optionally pipeline-filtered.
+      client.executeQuery(
+        `SELECT id AS opportunity_id, name AS opportunity_name, contact_id, pipeline_id, pipeline_name, ` +
+          `pipeline_stage_id, stage_name, status, ROUND(COALESCE(monetary_value, 0), 2) AS monetary_value, ` +
+          `created_at, updated_at, last_status_change_at, last_stage_change_at, ` +
+          `CAST(days_since_created AS INTEGER) AS days_since_created, ` +
+          `CAST(days_in_current_stage AS INTEGER) AS days_in_current_stage ` +
+          `FROM opportunity_funnel WHERE assigned_user_id = ?${bookStatus.clause}${pipelineClause} ` +
+          `ORDER BY updated_at DESC LIMIT 200`,
+        [userId, ...bookStatus.params, ...pipelineParams],
+      ),
+      // Book rolled up by pipeline+stage for at-a-glance shape.
+      client.executeQuery(
+        `SELECT pipeline_id, pipeline_name, pipeline_stage_id, stage_name, status, ` +
+          `COUNT(*) AS opportunity_count, ROUND(COALESCE(SUM(monetary_value), 0), 2) AS pipeline_value ` +
+          `FROM opportunity_funnel WHERE assigned_user_id = ?${bookStatus.clause}${pipelineClause} ` +
+          `GROUP BY pipeline_id, pipeline_name, pipeline_stage_id, stage_name, status ` +
+          `ORDER BY pipeline_name, opportunity_count DESC`,
+        [userId, ...bookStatus.params, ...pipelineParams],
+      ),
+      // Activity: touches THIS USER authored in window (lens 2 — user_id, not owner_user_id).
+      client.executeQuery(
+        `SELECT activity_class, direction, COUNT(DISTINCT source_id) AS unique_touches, ` +
+          `COUNT(DISTINCT opportunity_id) AS opportunities_touched, COUNT(DISTINCT contact_id) AS contacts_touched, ` +
+          `MIN(event_at) AS first_touch, MAX(event_at) AS last_touch ` +
+          `FROM pipeline_activity_window WHERE user_id = ?${activityStatus.clause}${pipelineClause} ` +
+          `AND event_at >= ? AND event_at <= ? ` +
+          `GROUP BY activity_class, direction ORDER BY unique_touches DESC`,
+        [userId, ...activityStatus.params, ...pipelineParams, since, until],
+      ),
+      // Per-deal breakdown of deals THIS USER touched (lens 2).
+      client.executeQuery(
+        `SELECT opportunity_id, opportunity_name, contact_id, pipeline_id, pipeline_stage_id, owner_user_id, ` +
+          `ROUND(monetary_value, 2) AS monetary_value, ` +
+          `COUNT(DISTINCT source_id) AS unique_touches, ` +
+          `COUNT(DISTINCT CASE WHEN activity_class = 'message' THEN source_id END) AS message_touches, ` +
+          `COUNT(DISTINCT CASE WHEN activity_class = 'call' THEN source_id END) AS call_touches, ` +
+          `COUNT(DISTINCT CASE WHEN activity_class = 'appointment' THEN source_id END) AS appointment_touches, ` +
+          `COUNT(DISTINCT CASE WHEN direction = 'inbound' THEN source_id END) AS inbound_touches, ` +
+          `COUNT(DISTINCT CASE WHEN direction = 'outbound' THEN source_id END) AS outbound_touches, ` +
+          `MIN(event_at) AS first_touch, MAX(event_at) AS last_touch ` +
+          `FROM pipeline_activity_window WHERE user_id = ?${activityStatus.clause}${pipelineClause} ` +
+          `AND event_at >= ? AND event_at <= ? ` +
+          `GROUP BY opportunity_id, opportunity_name, contact_id, pipeline_id, pipeline_stage_id, owner_user_id, monetary_value ` +
+          `ORDER BY unique_touches DESC, monetary_value DESC LIMIT ?`,
+        [userId, ...activityStatus.params, ...pipelineParams, since, until, dealLimit],
+      ),
+      // Movement: deals owned by THIS USER (lens 1) that moved in the window.
+      client.executeQuery(
+        `SELECT opportunity_id, opportunity_name, contact_id, pipeline_id, pipeline_name, ` +
+          `pipeline_stage_id, stage_name, opportunity_status, monetary_value, ` +
+          `last_movement_at, last_movement_kind ` +
+          `FROM pipeline_movement_window WHERE owner_user_id = ?${movementStatus.clause}${pipelineClause} ` +
+          `AND last_movement_at >= ? AND last_movement_at <= ? ` +
+          `ORDER BY last_movement_at DESC`,
+        [userId, ...movementStatus.params, ...pipelineParams, since, until],
+      ),
+    ]);
+
+    return {
+      userId,
+      ownerResolution,
+      user: ownerResolution.user ?? null,
+      window: { since, until },
+      pipelineFilter,
+      status,
+      freshness: { columns: freshness.columns, rows: freshness.rows },
+      book: { columns: book.columns, rows: book.rows },
+      bookByStage: { columns: bookByStage.columns, rows: bookByStage.rows },
+      activity: { columns: activity.columns, rows: activity.rows },
+      deals: { columns: deals.columns, rows: deals.rows },
+      movement: { columns: movement.columns, rows: movement.rows },
+    };
+  },
+};
+
 export const tools: ToolDef[] = [
   doctorTool,
   freshnessTool,
   snapshotTool,
   auditTool,
   contactAuditTool,
+  ownerAuditTool,
 ];
