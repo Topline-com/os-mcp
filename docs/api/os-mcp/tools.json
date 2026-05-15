@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "topline_ping",
-      "description": "Verify the Topline Private Integration Token works and return basic location info. Call this first to confirm setup.",
+      "description": "Verify the Topline OS Private Integration Token works and return basic location info. Call this first to confirm setup.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -12,7 +12,7 @@
     },
     {
       "name": "topline_setup_check",
-      "description": "End-to-end setup verification for Topline MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.",
+      "description": "End-to-end setup verification for Topline OS MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -22,7 +22,7 @@
     },
     {
       "name": "topline_request",
-      "description": "Generic passthrough to any Topline API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. \"/contacts/\" or \"/opportunities/pipelines\") and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.",
+      "description": "Generic passthrough to any Topline OS API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. \"/contacts/\" or \"/opportunities/pipelines\") and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -1886,6 +1886,160 @@
       "category": "analytics"
     },
     {
+      "name": "topline_query_doctor",
+      "description": "Deterministic readiness probe for the SQL warehouse surface. Confirms the schema endpoint is reachable, lists which expected tables are present, and reports any coverage gaps as actionable bugs (not as a reason to fall back to REST). Run this once at the start of any standard pipeline audit; if the report is green, proceed to topline_pipeline_audit. Returns { schemaReachable, tableCount, expectedTables, missingTables, recommendation }.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_warehouse_freshness",
+      "description": "Per-table sync freshness probe for the warehouse tables that drive pipeline audits. Returns row_count, last_synced_at, and lag_seconds for each tracked table. Call this when the user asks whether warehouse data is current, or when a pipeline audit shows stale numbers and you need to attribute it to sync lag versus coverage gaps. Cheap, no arguments.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_pipeline_snapshot",
+      "description": "Open opportunity count, pipeline value, and stage distribution for one pipeline. Single-call equivalent of `topline --agent query snapshot --pipeline ... --status open`. Accepts either an opaque 20-char pipeline ID or a fuzzy pipeline name (e.g. 'flex triage', 'qualified'); on 0 or >1 matches it errors with the candidate list. Use this when the user wants a snapshot without activity/movement detail. Returns { pipelineId, pipelineResolution, status, snapshot }.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pipeline": {
+            "type": "string",
+            "description": "Pipeline ID (opaque 20-char) or fuzzy name (e.g. 'flex triage', 'qualified')."
+          },
+          "status": {
+            "type": "string",
+            "description": "Opportunity status filter: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering."
+          }
+        },
+        "required": [
+          "pipeline"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_pipeline_audit",
+      "description": "Standard pipeline activity audit in a single call. Replaces the legacy 3-step flow (describe_schema → resolve pipeline name → hand-write SQL across pipeline_snapshot / pipeline_activity_window / pipeline_movement_window / warehouse_freshness). Accepts an opaque pipeline ID or a fuzzy name ('flex triage', 'qualified'); resolves the name internally and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand (e.g. '7d', '24h'). Returns { pipelineId, pipelineResolution, window, status, freshness, snapshot, activity, deals, movement } where activity uses unique_touches (deduped against source_id), deals carries per-deal touch breakdowns, and movement is stage/status changes inside the window. PREFER THIS over topline_execute_query for any 'what happened in pipeline X over window W' question — it is faster, cheaper, and prevents the agent from inventing SQL the audit views already cover.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pipeline": {
+            "type": "string",
+            "description": "Pipeline ID (opaque 20-char) or fuzzy name."
+          },
+          "since": {
+            "type": "string",
+            "description": "Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand."
+          },
+          "until": {
+            "type": "string",
+            "description": "Window end. Default: now. Same format as `since`."
+          },
+          "status": {
+            "type": "string",
+            "description": "Opportunity status filter: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max deals returned in the `deals` section. Default 25, max 100."
+          }
+        },
+        "required": [
+          "pipeline"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_contact_audit",
+      "description": "Standard contact activity audit in a single call. Replaces the legacy fan-out of search_contacts → get_contact → search_opportunities → search_conversations → get_messages. Accepts an opaque contact ID OR a fuzzy identifier (email like 'jane@acme.com', phone like '+15551234567', or name like 'Jane Smith'); resolves it internally and echoes how it matched. Accepts since/until as 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or relative shorthand (e.g. '90d', '24h'). Default since = 90d, until = now. Returns { contact, contactResolution, window, freshness, opportunities, activity, timeline, messages } where opportunities lists all deals for the contact with pipeline_name/stage_name/value/status (via opportunity_funnel), activity is a counts rollup by event_kind+direction over the window, timeline is per-event rows from contact_timeline within the window (messages + opportunities-created + appointments), and messages is the last N raw message bodies for context. PREFER THIS over topline_execute_query, topline_search_contacts, topline_search_conversations, or topline_get_messages for any 'what's going on with contact X' / 'what did Y say this month' / 'give me a brief on Z' question — it is faster, cheaper, and prevents the agent from inventing SQL the warehouse views already cover. Tasks and notes are NOT included (they are REST-only); drill down with topline_list_contact_tasks / topline_list_contact_notes if the user asks.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "contact": {
+            "type": "string",
+            "description": "Contact identifier. Accepts opaque contact ID, email (jane@acme.com), phone (+15551234567 or local-format), or fuzzy name (e.g. 'Jane Smith', 'Acme Corp')."
+          },
+          "since": {
+            "type": "string",
+            "description": "Window start. Default: 90 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand."
+          },
+          "until": {
+            "type": "string",
+            "description": "Window end. Default: now. Same format as `since`."
+          },
+          "message_limit": {
+            "type": "number",
+            "description": "Max raw messages returned in the `messages` section. Default 20, max 100."
+          },
+          "timeline_limit": {
+            "type": "number",
+            "description": "Max timeline events returned. Default 50, max 200."
+          }
+        },
+        "required": [
+          "contact"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
+      "name": "topline_owner_audit",
+      "description": "Owner-scoped activity audit in a single call. THE tool for any 'how is rep X doing' / 'rep snapshot for X' / 'what did X work on this week' / 'X's book' / 'who's most active' / 'is X caught up on their book' question. Replaces the legacy fan-out of topline_list_users → topline_search_opportunities(assignedTo=...) → topline_execute_query on pipeline_activity_window. Accepts an opaque user_id, email, or fuzzy name; resolves via REST /users/ once and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand. Optional `pipeline` arg (id or fuzzy name) scopes everything to one pipeline. Optional `stale_days` (default 14) defines the stale-ownership threshold. Returns { userId, ownerResolution, user, window, pipelineFilter, status, staleDays, freshness, book, bookByStage, activity, deals, staleOwnedDeals, crossAssignedTouches, movement }. TWO OWNERSHIP LENSES: `book` / `bookByStage` / `staleOwnedDeals` / `movement` use opportunities.assigned_to (deals owned by this user). `activity` / `deals` / `crossAssignedTouches` use messages.user_id / call_events.user_id (touches THIS USER personally logged). AUTOMATION FILTER: activity/deals/staleOwnedDeals/crossAssignedTouches all exclude messages where raw_payload.$.source IN ('campaign','workflow') — those are workflow blasts and bulk campaigns, not personal rep touches. Calls and appointments are always counted as rep activity (no automation noise there). staleOwnedDeals = opps in book with no rep-attributed touch in the last `stale_days` days, ordered by monetary_value DESC — this is the 'what's rotting in the rep's book' surface. crossAssignedTouches = deals THIS USER personally touched in window where assigned_to is someone else, ordered by unique_touches DESC — this is the 'helping someone else's book' surface. PREFER THIS over topline_execute_query for any owner-scoped question. NEVER hand-write CTEs for owner book + touches + stale + cross-assignment when this tool returns all four in one call.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "Owner identifier. Accepts opaque user_id, email (jane@topline.com), or fuzzy name (e.g. 'Joey Skatell', 'paul')."
+          },
+          "pipeline": {
+            "type": "string",
+            "description": "Optional pipeline filter (id or fuzzy name). When set, scopes everything to one pipeline."
+          },
+          "since": {
+            "type": "string",
+            "description": "Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand."
+          },
+          "until": {
+            "type": "string",
+            "description": "Window end. Default: now. Same format as `since`."
+          },
+          "status": {
+            "type": "string",
+            "description": "Opportunity status filter for book/deals/movement/staleOwnedDeals: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering."
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max deals returned in `deals` / `staleOwnedDeals` / `crossAssignedTouches` sections. Default 25, max 100. (`book` is capped at 200, `bookByStage` is unbounded.)"
+          },
+          "stale_days": {
+            "type": "number",
+            "description": "Stale-ownership threshold in days. Default 14. A deal is 'stale' when no rep-attributed touch (excluding campaign/workflow automation) has landed within this many days. Set to 7 for a stricter cadence, 30 for low-velocity pipelines."
+          }
+        },
+        "required": [
+          "owner"
+        ],
+        "additionalProperties": false
+      },
+      "category": "analytics"
+    },
+    {
       "name": "topline_find_references",
       "description": "Answer 'what uses X?' across synced CRM objects. Closed-enum dispatcher — runs hard-coded SQL per kind; no arbitrary SQL accepted. Supported kinds: tag, custom_field, custom_value, pipeline, pipeline_stage, calendar, user, contact, opportunity, form, survey. WORKFLOWS are NOT supported: the upstream platform's public API does not expose workflow internals, so we cannot know which workflows reference any given object. kind=opportunity returns ONLY direct references (the opportunity itself, its pipeline, stage, and contact) — it does NOT include downstream activity like messages or calls, since those belong to the contact and may span multiple opportunities. To get a contact's full activity, call this tool again with kind=contact using the contact_id from the opportunity's extra payload. Results are capped at 500 rows total (not per kind); truncated=true means upstream had more. For tags, accepts either the tag id or the tag name.",
       "inputSchema": {
@@ -1921,5 +2075,6 @@
       "category": "analytics"
     }
   ],
-  "count": 68
-}
+  "count": 74
+}(node:32500) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)

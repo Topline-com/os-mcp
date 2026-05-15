@@ -824,23 +824,26 @@ async function resolveOwner(input: string): Promise<OwnerResolution> {
 const ownerAuditTool: ToolDef = {
   name: "topline_owner_audit",
   description:
-    "Owner-scoped activity audit in a single call. Replaces the fan-out of topline_list_users → topline_search_opportunities(assignedTo=...) → topline_execute_query on pipeline_activity_window. Accepts an opaque user_id, email, or fuzzy name; resolves via REST /users/ once and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand. Optional `pipeline` arg (id or fuzzy name) scopes book/activity/deals/movement to one pipeline. Returns { userId, ownerResolution, user, window, pipelineFilter, status, freshness, book, bookByStage, activity, deals, movement }. IMPORTANT — TWO OWNERSHIP LENSES: `book` and `movement` use opportunities.assigned_to (deals owned by this user). `activity` and `deals` use messages.user_id / call_events.user_id (touches THIS USER logged). In Topline these diverge: AI agents, shared SDRs, automated workflows produce touches with NULL or system user_id, and reps often touch each other's books. The skill must surface both lenses; agents must not conflate 'is X caught up on their book' (lens 1) with 'how many calls did X make' (lens 2). PREFER THIS over topline_execute_query for any 'how is rep X doing' / 'what did rep X work on this week' / 'rep X's book' / 'who's most active' question.",
+    "Owner-scoped activity audit in a single call. THE tool for any 'how is rep X doing' / 'rep snapshot for X' / 'what did X work on this week' / 'X's book' / 'who's most active' / 'is X caught up on their book' question. Replaces the legacy fan-out of topline_list_users → topline_search_opportunities(assignedTo=...) → topline_execute_query on pipeline_activity_window. Accepts an opaque user_id, email, or fuzzy name; resolves via REST /users/ once and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand. Optional `pipeline` arg (id or fuzzy name) scopes everything to one pipeline. Optional `stale_days` (default 14) defines the stale-ownership threshold. Returns { userId, ownerResolution, user, window, pipelineFilter, status, staleDays, freshness, book, bookByStage, activity, deals, staleOwnedDeals, crossAssignedTouches, movement }. TWO OWNERSHIP LENSES: `book` / `bookByStage` / `staleOwnedDeals` / `movement` use opportunities.assigned_to (deals owned by this user). `activity` / `deals` / `crossAssignedTouches` use messages.user_id / call_events.user_id (touches THIS USER personally logged). AUTOMATION FILTER: activity/deals/staleOwnedDeals/crossAssignedTouches all exclude messages where raw_payload.$.source IN ('campaign','workflow') — those are workflow blasts and bulk campaigns, not personal rep touches. Calls and appointments are always counted as rep activity (no automation noise there). staleOwnedDeals = opps in book with no rep-attributed touch in the last `stale_days` days, ordered by monetary_value DESC — this is the 'what's rotting in the rep's book' surface. crossAssignedTouches = deals THIS USER personally touched in window where assigned_to is someone else, ordered by unique_touches DESC — this is the 'helping someone else's book' surface. PREFER THIS over topline_execute_query for any owner-scoped question. NEVER hand-write CTEs for owner book + touches + stale + cross-assignment when this tool returns all four in one call.",
   inputSchema: obj(
     {
       owner: str(
         "Owner identifier. Accepts opaque user_id, email (jane@topline.com), or fuzzy name (e.g. 'Joey Skatell', 'paul').",
       ),
       pipeline: str(
-        "Optional pipeline filter (id or fuzzy name). When set, scopes book/activity/deals/movement to one pipeline.",
+        "Optional pipeline filter (id or fuzzy name). When set, scopes everything to one pipeline.",
       ),
       since: str(
         "Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.",
       ),
       until: str("Window end. Default: now. Same format as `since`."),
       status: str(
-        "Opportunity status filter for book/deals/movement: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.",
+        "Opportunity status filter for book/deals/movement/staleOwnedDeals: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.",
       ),
-      limit: num("Max deals returned in `deals` section. Default 25, max 100."),
+      limit: num("Max deals returned in `deals` / `staleOwnedDeals` / `crossAssignedTouches` sections. Default 25, max 100. (`book` is capped at 200, `bookByStage` is unbounded.)"),
+      stale_days: num(
+        "Stale-ownership threshold in days. Default 14. A deal is 'stale' when no rep-attributed touch (excluding campaign/workflow automation) has landed within this many days. Set to 7 for a stricter cadence, 30 for low-velocity pipelines.",
+      ),
     },
     ["owner"],
   ),
@@ -852,6 +855,11 @@ const ownerAuditTool: ToolDef = {
     const dealLimit = Math.max(
       1,
       Math.min(100, Number.isFinite(limitRaw) ? Math.trunc(limitRaw) : 25),
+    );
+    const staleDaysRaw = Number(args.stale_days ?? 14);
+    const staleDays = Math.max(
+      1,
+      Math.min(365, Number.isFinite(staleDaysRaw) ? Math.trunc(staleDaysRaw) : 14),
     );
     const now = new Date();
     const start = parseAuditTime(
@@ -877,12 +885,22 @@ const ownerAuditTool: ToolDef = {
     }
     const pipelineClause = pipelineFilter ? " AND pipeline_id = ?" : "";
     const pipelineParams: string[] = pipelineFilter ? [pipelineFilter.matchedId] : [];
+    // For queries that join messages alias `m` for the automation filter,
+    // pipeline_id lives on pipeline_activity_window's columns — alias as `paw`.
+    const pipelineClausePaw = pipelineFilter ? " AND paw.pipeline_id = ?" : "";
 
     const bookStatus = statusClauseSql("status", status);
     const activityStatus = statusClauseSql("opportunity_status", status);
     const movementStatus = statusClauseSql("opportunity_status", status);
+    // Variant where opportunity_status lives on the aliased `paw` view.
+    const activityStatusPaw = statusClauseSql("paw.opportunity_status", status);
 
-    const [freshness, book, bookByStage, activity, deals, movement] = await Promise.all([
+    // Automation filter: exclude messages where raw_payload.$.source is one
+    // of GHL's bulk/automation sources. Calls and appointments always count
+    // as rep activity. NULL source is treated as rep (catches old inbound).
+    const REP_TOUCH_FILTER = `(paw.activity_class != 'message' OR json_extract(m.raw_payload, '$.source') IS NULL OR json_extract(m.raw_payload, '$.source') NOT IN ('campaign', 'workflow'))`;
+
+    const [freshness, book, bookByStage, activity, deals, staleOwnedDeals, crossAssignedTouches, movement] = await Promise.all([
       client.executeQuery(
         "SELECT table_name, row_count, last_synced_at, lag_seconds FROM warehouse_freshness ORDER BY table_name",
       ),
@@ -906,32 +924,96 @@ const ownerAuditTool: ToolDef = {
           `ORDER BY pipeline_name, opportunity_count DESC`,
         [userId, ...bookStatus.params, ...pipelineParams],
       ),
-      // Activity: touches THIS USER authored in window (lens 2 — user_id, not owner_user_id).
+      // Activity: rep-attributed touches THIS USER authored in window
+      // (lens 2 — user_id, not owner_user_id). Excludes campaign/workflow
+      // automation via the message-source filter; calls and appointments
+      // always count as rep activity.
       client.executeQuery(
-        `SELECT activity_class, direction, COUNT(DISTINCT source_id) AS unique_touches, ` +
-          `COUNT(DISTINCT opportunity_id) AS opportunities_touched, COUNT(DISTINCT contact_id) AS contacts_touched, ` +
-          `MIN(event_at) AS first_touch, MAX(event_at) AS last_touch ` +
-          `FROM pipeline_activity_window WHERE user_id = ?${activityStatus.clause}${pipelineClause} ` +
-          `AND event_at >= ? AND event_at <= ? ` +
-          `GROUP BY activity_class, direction ORDER BY unique_touches DESC`,
-        [userId, ...activityStatus.params, ...pipelineParams, since, until],
+        `SELECT paw.activity_class, paw.direction, COUNT(DISTINCT paw.source_id) AS unique_touches, ` +
+          `COUNT(DISTINCT paw.opportunity_id) AS opportunities_touched, COUNT(DISTINCT paw.contact_id) AS contacts_touched, ` +
+          `MIN(paw.event_at) AS first_touch, MAX(paw.event_at) AS last_touch ` +
+          `FROM pipeline_activity_window paw ` +
+          `LEFT JOIN messages m ON (paw.activity_class = 'message' AND m.id = paw.source_id) ` +
+          `WHERE paw.user_id = ?${activityStatusPaw.clause}${pipelineClausePaw} ` +
+          `AND paw.event_at >= ? AND paw.event_at <= ? ` +
+          `AND ${REP_TOUCH_FILTER} ` +
+          `GROUP BY paw.activity_class, paw.direction ORDER BY unique_touches DESC`,
+        [userId, ...activityStatusPaw.params, ...pipelineParams, since, until],
       ),
-      // Per-deal breakdown of deals THIS USER touched (lens 2).
+      // Per-deal breakdown of deals THIS USER touched in window (lens 2).
+      // Same automation filter as `activity` so counts are consistent.
       client.executeQuery(
-        `SELECT opportunity_id, opportunity_name, contact_id, pipeline_id, pipeline_stage_id, owner_user_id, ` +
-          `ROUND(monetary_value, 2) AS monetary_value, ` +
-          `COUNT(DISTINCT source_id) AS unique_touches, ` +
-          `COUNT(DISTINCT CASE WHEN activity_class = 'message' THEN source_id END) AS message_touches, ` +
-          `COUNT(DISTINCT CASE WHEN activity_class = 'call' THEN source_id END) AS call_touches, ` +
-          `COUNT(DISTINCT CASE WHEN activity_class = 'appointment' THEN source_id END) AS appointment_touches, ` +
-          `COUNT(DISTINCT CASE WHEN direction = 'inbound' THEN source_id END) AS inbound_touches, ` +
-          `COUNT(DISTINCT CASE WHEN direction = 'outbound' THEN source_id END) AS outbound_touches, ` +
-          `MIN(event_at) AS first_touch, MAX(event_at) AS last_touch ` +
-          `FROM pipeline_activity_window WHERE user_id = ?${activityStatus.clause}${pipelineClause} ` +
-          `AND event_at >= ? AND event_at <= ? ` +
-          `GROUP BY opportunity_id, opportunity_name, contact_id, pipeline_id, pipeline_stage_id, owner_user_id, monetary_value ` +
+        `SELECT paw.opportunity_id, paw.opportunity_name, paw.contact_id, paw.pipeline_id, paw.pipeline_stage_id, paw.owner_user_id, ` +
+          `ROUND(paw.monetary_value, 2) AS monetary_value, ` +
+          `COUNT(DISTINCT paw.source_id) AS unique_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'message' THEN paw.source_id END) AS message_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'call' THEN paw.source_id END) AS call_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'appointment' THEN paw.source_id END) AS appointment_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.direction = 'inbound' THEN paw.source_id END) AS inbound_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.direction = 'outbound' THEN paw.source_id END) AS outbound_touches, ` +
+          `MIN(paw.event_at) AS first_touch, MAX(paw.event_at) AS last_touch ` +
+          `FROM pipeline_activity_window paw ` +
+          `LEFT JOIN messages m ON (paw.activity_class = 'message' AND m.id = paw.source_id) ` +
+          `WHERE paw.user_id = ?${activityStatusPaw.clause}${pipelineClausePaw} ` +
+          `AND paw.event_at >= ? AND paw.event_at <= ? ` +
+          `AND ${REP_TOUCH_FILTER} ` +
+          `GROUP BY paw.opportunity_id, paw.opportunity_name, paw.contact_id, paw.pipeline_id, paw.pipeline_stage_id, paw.owner_user_id, paw.monetary_value ` +
           `ORDER BY unique_touches DESC, monetary_value DESC LIMIT ?`,
-        [userId, ...activityStatus.params, ...pipelineParams, since, until, dealLimit],
+        [userId, ...activityStatusPaw.params, ...pipelineParams, since, until, dealLimit],
+      ),
+      // staleOwnedDeals: opps in this user's BOOK (assigned_to) with NO
+      // rep-attributed touch by anyone in the last `stale_days` days.
+      // Independent of the audit window — staleness is "as of right now".
+      // `last_rep_touch_at` is the most recent rep touch by anyone (not
+      // just this user); a deal owned by Alex that Joey touched yesterday
+      // is NOT stale. `days_since_last_rep_touch` is NULL when the deal
+      // has never received a rep touch, ordered last.
+      client.executeQuery(
+        `WITH rep_touches AS ( ` +
+          `SELECT paw.opportunity_id, MAX(paw.event_at) AS last_rep_touch_at ` +
+          `FROM pipeline_activity_window paw ` +
+          `LEFT JOIN messages m ON (paw.activity_class = 'message' AND m.id = paw.source_id) ` +
+          `WHERE ${REP_TOUCH_FILTER} ` +
+          `GROUP BY paw.opportunity_id` +
+          `) ` +
+          `SELECT o.id AS opportunity_id, o.name AS opportunity_name, o.contact_id, ` +
+          `o.pipeline_id, o.pipeline_name, o.pipeline_stage_id, o.stage_name, ` +
+          `o.status, ROUND(COALESCE(o.monetary_value, 0), 2) AS monetary_value, ` +
+          `o.assigned_user_id, o.created_at, o.updated_at, ` +
+          `rt.last_rep_touch_at, ` +
+          `CASE WHEN rt.last_rep_touch_at IS NULL THEN NULL ` +
+          `     ELSE CAST(julianday('now') - julianday(rt.last_rep_touch_at) AS INTEGER) END AS days_since_last_rep_touch ` +
+          `FROM opportunity_funnel o ` +
+          `LEFT JOIN rep_touches rt ON rt.opportunity_id = o.id ` +
+          `WHERE o.assigned_user_id = ?${bookStatus.clause}${pipelineClause} ` +
+          `AND (rt.last_rep_touch_at IS NULL OR rt.last_rep_touch_at < datetime('now', ?)) ` +
+          `ORDER BY o.monetary_value DESC, rt.last_rep_touch_at ASC LIMIT ?`,
+        [userId, ...bookStatus.params, ...pipelineParams, `-${staleDays} days`, dealLimit],
+      ),
+      // crossAssignedTouches: deals THIS USER personally touched (lens 2)
+      // in the window where assigned_to is someone ELSE. The "helping
+      // someone else's book" surface. NULL owner_user_id is excluded —
+      // unassigned deals aren't "someone else's book", they're nobody's.
+      client.executeQuery(
+        `SELECT paw.opportunity_id, paw.opportunity_name, paw.contact_id, paw.pipeline_id, paw.pipeline_stage_id, paw.owner_user_id, ` +
+          `ROUND(paw.monetary_value, 2) AS monetary_value, ` +
+          `COUNT(DISTINCT paw.source_id) AS unique_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'message' THEN paw.source_id END) AS message_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'call' THEN paw.source_id END) AS call_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.activity_class = 'appointment' THEN paw.source_id END) AS appointment_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.direction = 'inbound' THEN paw.source_id END) AS inbound_touches, ` +
+          `COUNT(DISTINCT CASE WHEN paw.direction = 'outbound' THEN paw.source_id END) AS outbound_touches, ` +
+          `MIN(paw.event_at) AS first_touch, MAX(paw.event_at) AS last_touch ` +
+          `FROM pipeline_activity_window paw ` +
+          `LEFT JOIN messages m ON (paw.activity_class = 'message' AND m.id = paw.source_id) ` +
+          `WHERE paw.user_id = ? ` +
+          `AND paw.owner_user_id IS NOT NULL AND paw.owner_user_id != ? ` +
+          `${activityStatusPaw.clause}${pipelineClausePaw} ` +
+          `AND paw.event_at >= ? AND paw.event_at <= ? ` +
+          `AND ${REP_TOUCH_FILTER} ` +
+          `GROUP BY paw.opportunity_id, paw.opportunity_name, paw.contact_id, paw.pipeline_id, paw.pipeline_stage_id, paw.owner_user_id, paw.monetary_value ` +
+          `ORDER BY unique_touches DESC, monetary_value DESC LIMIT ?`,
+        [userId, userId, ...activityStatusPaw.params, ...pipelineParams, since, until, dealLimit],
       ),
       // Movement: deals owned by THIS USER (lens 1) that moved in the window.
       client.executeQuery(
@@ -952,11 +1034,14 @@ const ownerAuditTool: ToolDef = {
       window: { since, until },
       pipelineFilter,
       status,
+      staleDays,
       freshness: { columns: freshness.columns, rows: freshness.rows },
       book: { columns: book.columns, rows: book.rows },
       bookByStage: { columns: bookByStage.columns, rows: bookByStage.rows },
       activity: { columns: activity.columns, rows: activity.rows },
       deals: { columns: deals.columns, rows: deals.rows },
+      staleOwnedDeals: { columns: staleOwnedDeals.columns, rows: staleOwnedDeals.rows },
+      crossAssignedTouches: { columns: crossAssignedTouches.columns, rows: crossAssignedTouches.rows },
       movement: { columns: movement.columns, rows: movement.rows },
     };
   },

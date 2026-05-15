@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Topline OS MCP — Tool reference</title>
-  <meta name="description" content="Native MCP tool reference for the Topline OS MCP server. 68 tools across 15 categories." />
+  <meta name="description" content="Native MCP tool reference for the Topline OS MCP server. 74 tools across 15 categories." />
   <style>
     :root {
       --bg: #0b0d10;
@@ -75,16 +75,16 @@
     <aside class="sidebar">
       <h1>Topline OS MCP</h1>
       <span class="tag">Tool reference</span>
-      <section><h4><a href="#group-setup">Setup & diagnostics</a></h4><ul><li><a href="#topline_ping">topline_ping</a></li><li><a href="#topline_setup_check">topline_setup_check</a></li><li><a href="#topline_request">topline_request</a></li></ul></section><section><h4><a href="#group-contacts">Contacts</a></h4><ul><li><a href="#topline_search_contacts">topline_search_contacts</a></li><li><a href="#topline_get_contact">topline_get_contact</a></li><li><a href="#topline_create_contact">topline_create_contact</a></li><li><a href="#topline_update_contact">topline_update_contact</a></li><li><a href="#topline_delete_contact">topline_delete_contact</a></li><li><a href="#topline_add_contact_tags">topline_add_contact_tags</a></li><li><a href="#topline_remove_contact_tags">topline_remove_contact_tags</a></li><li><a href="#topline_upsert_contact">topline_upsert_contact</a></li><li><a href="#topline_add_contact_to_workflow">topline_add_contact_to_workflow</a></li><li><a href="#topline_remove_contact_from_workflow">topline_remove_contact_from_workflow</a></li><li><a href="#topline_list_contact_tasks">topline_list_contact_tasks</a></li><li><a href="#topline_list_contact_notes">topline_list_contact_notes</a></li></ul></section><section><h4><a href="#group-conversations">Conversations & messaging</a></h4><ul><li><a href="#topline_search_conversations">topline_search_conversations</a></li><li><a href="#topline_get_conversation">topline_get_conversation</a></li><li><a href="#topline_get_messages">topline_get_messages</a></li><li><a href="#topline_send_message">topline_send_message</a></li><li><a href="#topline_create_conversation">topline_create_conversation</a></li></ul></section><section><h4><a href="#group-opportunities">Opportunities & pipelines</a></h4><ul><li><a href="#topline_list_pipelines">topline_list_pipelines</a></li><li><a href="#topline_search_opportunities">topline_search_opportunities</a></li><li><a href="#topline_get_opportunity">topline_get_opportunity</a></li><li><a href="#topline_create_opportunity">topline_create_opportunity</a></li><li><a href="#topline_update_opportunity">topline_update_opportunity</a></li><li><a href="#topline_delete_opportunity">topline_delete_opportunity</a></li></ul></section><section><h4><a href="#group-calendars">Calendars & appointments</a></h4><ul><li><a href="#topline_list_calendars">topline_list_calendars</a></li><li><a href="#topline_get_calendar_slots">topline_get_calendar_slots</a></li><li><a href="#topline_create_appointment">topline_create_appointment</a></li><li><a href="#topline_update_appointment">topline_update_appointment</a></li><li><a href="#topline_delete_appointment">topline_delete_appointment</a></li><li><a href="#topline_get_calendar">topline_get_calendar</a></li><li><a href="#topline_update_calendar">topline_update_calendar</a></li><li><a href="#topline_delete_calendar">topline_delete_calendar</a></li></ul></section><section><h4><a href="#group-tasks">Tasks</a></h4><ul><li><a href="#topline_create_task">topline_create_task</a></li><li><a href="#topline_update_task">topline_update_task</a></li><li><a href="#topline_delete_task">topline_delete_task</a></li></ul></section><section><h4><a href="#group-notes">Notes</a></h4><ul><li><a href="#topline_create_note">topline_create_note</a></li><li><a href="#topline_update_note">topline_update_note</a></li><li><a href="#topline_delete_note">topline_delete_note</a></li></ul></section><section><h4><a href="#group-custom_fields">Custom fields</a></h4><ul><li><a href="#topline_list_custom_fields">topline_list_custom_fields</a></li><li><a href="#topline_get_custom_field">topline_get_custom_field</a></li><li><a href="#topline_create_custom_field">topline_create_custom_field</a></li><li><a href="#topline_update_custom_field">topline_update_custom_field</a></li><li><a href="#topline_delete_custom_field">topline_delete_custom_field</a></li></ul></section><section><h4><a href="#group-custom_values">Custom values</a></h4><ul><li><a href="#topline_list_custom_values">topline_list_custom_values</a></li><li><a href="#topline_get_custom_value">topline_get_custom_value</a></li><li><a href="#topline_create_custom_value">topline_create_custom_value</a></li><li><a href="#topline_update_custom_value">topline_update_custom_value</a></li><li><a href="#topline_delete_custom_value">topline_delete_custom_value</a></li></ul></section><section><h4><a href="#group-workflows">Workflows</a></h4><ul><li><a href="#topline_list_workflows">topline_list_workflows</a></li></ul></section><section><h4><a href="#group-tags">Tags</a></h4><ul><li><a href="#topline_list_tags">topline_list_tags</a></li><li><a href="#topline_create_tag">topline_create_tag</a></li><li><a href="#topline_update_tag">topline_update_tag</a></li><li><a href="#topline_delete_tag">topline_delete_tag</a></li></ul></section><section><h4><a href="#group-users">Users</a></h4><ul><li><a href="#topline_list_users">topline_list_users</a></li><li><a href="#topline_get_user">topline_get_user</a></li></ul></section><section><h4><a href="#group-location">Location (sub-account)</a></h4><ul><li><a href="#topline_get_location">topline_get_location</a></li></ul></section><section><h4><a href="#group-forms">Forms & surveys</a></h4><ul><li><a href="#topline_list_forms">topline_list_forms</a></li><li><a href="#topline_list_form_submissions">topline_list_form_submissions</a></li><li><a href="#topline_list_surveys">topline_list_surveys</a></li><li><a href="#topline_list_survey_submissions">topline_list_survey_submissions</a></li></ul></section><section><h4><a href="#group-analytics">Analytics (SQL)</a></h4><ul><li><a href="#topline_describe_data_catalog">topline_describe_data_catalog</a></li><li><a href="#topline_describe_schema">topline_describe_schema</a></li><li><a href="#topline_explain_tables">topline_explain_tables</a></li><li><a href="#topline_execute_query">topline_execute_query</a></li><li><a href="#topline_utilize_api">topline_utilize_api</a></li><li><a href="#topline_find_references">topline_find_references</a></li></ul></section>
+      <section><h4><a href="#group-setup">Setup & diagnostics</a></h4><ul><li><a href="#topline_ping">topline_ping</a></li><li><a href="#topline_setup_check">topline_setup_check</a></li><li><a href="#topline_request">topline_request</a></li></ul></section><section><h4><a href="#group-contacts">Contacts</a></h4><ul><li><a href="#topline_search_contacts">topline_search_contacts</a></li><li><a href="#topline_get_contact">topline_get_contact</a></li><li><a href="#topline_create_contact">topline_create_contact</a></li><li><a href="#topline_update_contact">topline_update_contact</a></li><li><a href="#topline_delete_contact">topline_delete_contact</a></li><li><a href="#topline_add_contact_tags">topline_add_contact_tags</a></li><li><a href="#topline_remove_contact_tags">topline_remove_contact_tags</a></li><li><a href="#topline_upsert_contact">topline_upsert_contact</a></li><li><a href="#topline_add_contact_to_workflow">topline_add_contact_to_workflow</a></li><li><a href="#topline_remove_contact_from_workflow">topline_remove_contact_from_workflow</a></li><li><a href="#topline_list_contact_tasks">topline_list_contact_tasks</a></li><li><a href="#topline_list_contact_notes">topline_list_contact_notes</a></li></ul></section><section><h4><a href="#group-conversations">Conversations & messaging</a></h4><ul><li><a href="#topline_search_conversations">topline_search_conversations</a></li><li><a href="#topline_get_conversation">topline_get_conversation</a></li><li><a href="#topline_get_messages">topline_get_messages</a></li><li><a href="#topline_send_message">topline_send_message</a></li><li><a href="#topline_create_conversation">topline_create_conversation</a></li></ul></section><section><h4><a href="#group-opportunities">Opportunities & pipelines</a></h4><ul><li><a href="#topline_list_pipelines">topline_list_pipelines</a></li><li><a href="#topline_search_opportunities">topline_search_opportunities</a></li><li><a href="#topline_get_opportunity">topline_get_opportunity</a></li><li><a href="#topline_create_opportunity">topline_create_opportunity</a></li><li><a href="#topline_update_opportunity">topline_update_opportunity</a></li><li><a href="#topline_delete_opportunity">topline_delete_opportunity</a></li></ul></section><section><h4><a href="#group-calendars">Calendars & appointments</a></h4><ul><li><a href="#topline_list_calendars">topline_list_calendars</a></li><li><a href="#topline_get_calendar_slots">topline_get_calendar_slots</a></li><li><a href="#topline_create_appointment">topline_create_appointment</a></li><li><a href="#topline_update_appointment">topline_update_appointment</a></li><li><a href="#topline_delete_appointment">topline_delete_appointment</a></li><li><a href="#topline_get_calendar">topline_get_calendar</a></li><li><a href="#topline_update_calendar">topline_update_calendar</a></li><li><a href="#topline_delete_calendar">topline_delete_calendar</a></li></ul></section><section><h4><a href="#group-tasks">Tasks</a></h4><ul><li><a href="#topline_create_task">topline_create_task</a></li><li><a href="#topline_update_task">topline_update_task</a></li><li><a href="#topline_delete_task">topline_delete_task</a></li></ul></section><section><h4><a href="#group-notes">Notes</a></h4><ul><li><a href="#topline_create_note">topline_create_note</a></li><li><a href="#topline_update_note">topline_update_note</a></li><li><a href="#topline_delete_note">topline_delete_note</a></li></ul></section><section><h4><a href="#group-custom_fields">Custom fields</a></h4><ul><li><a href="#topline_list_custom_fields">topline_list_custom_fields</a></li><li><a href="#topline_get_custom_field">topline_get_custom_field</a></li><li><a href="#topline_create_custom_field">topline_create_custom_field</a></li><li><a href="#topline_update_custom_field">topline_update_custom_field</a></li><li><a href="#topline_delete_custom_field">topline_delete_custom_field</a></li></ul></section><section><h4><a href="#group-custom_values">Custom values</a></h4><ul><li><a href="#topline_list_custom_values">topline_list_custom_values</a></li><li><a href="#topline_get_custom_value">topline_get_custom_value</a></li><li><a href="#topline_create_custom_value">topline_create_custom_value</a></li><li><a href="#topline_update_custom_value">topline_update_custom_value</a></li><li><a href="#topline_delete_custom_value">topline_delete_custom_value</a></li></ul></section><section><h4><a href="#group-workflows">Workflows</a></h4><ul><li><a href="#topline_list_workflows">topline_list_workflows</a></li></ul></section><section><h4><a href="#group-tags">Tags</a></h4><ul><li><a href="#topline_list_tags">topline_list_tags</a></li><li><a href="#topline_create_tag">topline_create_tag</a></li><li><a href="#topline_update_tag">topline_update_tag</a></li><li><a href="#topline_delete_tag">topline_delete_tag</a></li></ul></section><section><h4><a href="#group-users">Users</a></h4><ul><li><a href="#topline_list_users">topline_list_users</a></li><li><a href="#topline_get_user">topline_get_user</a></li></ul></section><section><h4><a href="#group-location">Location (sub-account)</a></h4><ul><li><a href="#topline_get_location">topline_get_location</a></li></ul></section><section><h4><a href="#group-forms">Forms & surveys</a></h4><ul><li><a href="#topline_list_forms">topline_list_forms</a></li><li><a href="#topline_list_form_submissions">topline_list_form_submissions</a></li><li><a href="#topline_list_surveys">topline_list_surveys</a></li><li><a href="#topline_list_survey_submissions">topline_list_survey_submissions</a></li></ul></section><section><h4><a href="#group-analytics">Analytics (SQL)</a></h4><ul><li><a href="#topline_describe_data_catalog">topline_describe_data_catalog</a></li><li><a href="#topline_describe_schema">topline_describe_schema</a></li><li><a href="#topline_explain_tables">topline_explain_tables</a></li><li><a href="#topline_execute_query">topline_execute_query</a></li><li><a href="#topline_utilize_api">topline_utilize_api</a></li><li><a href="#topline_query_doctor">topline_query_doctor</a></li><li><a href="#topline_warehouse_freshness">topline_warehouse_freshness</a></li><li><a href="#topline_pipeline_snapshot">topline_pipeline_snapshot</a></li><li><a href="#topline_pipeline_audit">topline_pipeline_audit</a></li><li><a href="#topline_contact_audit">topline_contact_audit</a></li><li><a href="#topline_owner_audit">topline_owner_audit</a></li><li><a href="#topline_find_references">topline_find_references</a></li></ul></section>
     </aside>
     <main>
       <header class="hero">
         <h1>Topline OS MCP — Tool reference</h1>
         <p>Native reference for every tool exposed by the <a href="https://github.com/Topline-com/os-mcp">Topline-com/os-mcp</a> server. Each tool is callable over MCP via <code>tools/call</code> with the arguments listed below.</p>
         <div class="stats">
-          <div class="stat"><strong>68</strong> tools total</div>
+          <div class="stat"><strong>74</strong> tools total</div>
           <div class="stat"><strong>62</strong> action tools</div>
-          <div class="stat"><strong>6</strong> analytics (SQL) tools</div>
+          <div class="stat"><strong>12</strong> analytics (SQL) tools</div>
           <div class="stat">Endpoint: <code>https://os-mcp.topline.com/mcp</code></div>
         </div>
       </header>
@@ -98,7 +98,7 @@
         <h3><code>topline_ping</code></h3>
         <a class="anchor" href="#topline_ping">#</a>
       </header>
-      <p class="tool-desc">Verify the Topline Private Integration Token works and return basic location info. Call this first to confirm setup.</p>
+      <p class="tool-desc">Verify the Topline OS Private Integration Token works and return basic location info. Call this first to confirm setup.</p>
       <p class="no-params">No parameters.</p>
       <h4>Example call</h4>
       <pre><code>{
@@ -117,7 +117,7 @@
         <h3><code>topline_setup_check</code></h3>
         <a class="anchor" href="#topline_setup_check">#</a>
       </header>
-      <p class="tool-desc">End-to-end setup verification for Topline MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.</p>
+      <p class="tool-desc">End-to-end setup verification for Topline OS MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.</p>
       <p class="no-params">No parameters.</p>
       <h4>Example call</h4>
       <pre><code>{
@@ -136,7 +136,7 @@
         <h3><code>topline_request</code></h3>
         <a class="anchor" href="#topline_request">#</a>
       </header>
-      <p class="tool-desc">Generic passthrough to any Topline API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. &quot;/contacts/&quot; or &quot;/opportunities/pipelines&quot;) and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.</p>
+      <p class="tool-desc">Generic passthrough to any Topline OS API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. &quot;/contacts/&quot; or &quot;/opportunities/pipelines&quot;) and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.</p>
       <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
       <tr>
         <td><code>method</code> <span class="req">required</span></td>
@@ -2719,6 +2719,223 @@
 }</code></pre>
     </article>
   
+    <article class="tool" id="topline_query_doctor">
+      <header>
+        <h3><code>topline_query_doctor</code></h3>
+        <a class="anchor" href="#topline_query_doctor">#</a>
+      </header>
+      <p class="tool-desc">Deterministic readiness probe for the SQL warehouse surface. Confirms the schema endpoint is reachable, lists which expected tables are present, and reports any coverage gaps as actionable bugs (not as a reason to fall back to REST). Run this once at the start of any standard pipeline audit; if the report is green, proceed to topline_pipeline_audit. Returns { schemaReachable, tableCount, expectedTables, missingTables, recommendation }.</p>
+      <p class="no-params">No parameters.</p>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_query_doctor&quot;,
+    &quot;arguments&quot;: {}
+  }
+}</code></pre>
+    </article>
+  
+    <article class="tool" id="topline_warehouse_freshness">
+      <header>
+        <h3><code>topline_warehouse_freshness</code></h3>
+        <a class="anchor" href="#topline_warehouse_freshness">#</a>
+      </header>
+      <p class="tool-desc">Per-table sync freshness probe for the warehouse tables that drive pipeline audits. Returns row_count, last_synced_at, and lag_seconds for each tracked table. Call this when the user asks whether warehouse data is current, or when a pipeline audit shows stale numbers and you need to attribute it to sync lag versus coverage gaps. Cheap, no arguments.</p>
+      <p class="no-params">No parameters.</p>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_warehouse_freshness&quot;,
+    &quot;arguments&quot;: {}
+  }
+}</code></pre>
+    </article>
+  
+    <article class="tool" id="topline_pipeline_snapshot">
+      <header>
+        <h3><code>topline_pipeline_snapshot</code></h3>
+        <a class="anchor" href="#topline_pipeline_snapshot">#</a>
+      </header>
+      <p class="tool-desc">Open opportunity count, pipeline value, and stage distribution for one pipeline. Single-call equivalent of `topline --agent query snapshot --pipeline ... --status open`. Accepts either an opaque 20-char pipeline ID or a fuzzy pipeline name (e.g. 'flex triage', 'qualified'); on 0 or &gt;1 matches it errors with the candidate list. Use this when the user wants a snapshot without activity/movement detail. Returns { pipelineId, pipelineResolution, status, snapshot }.</p>
+      <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+      <tr>
+        <td><code>pipeline</code> <span class="req">required</span></td>
+        <td class="type">string</td>
+        <td><div class="desc">Pipeline ID (opaque 20-char) or fuzzy name (e.g. 'flex triage', 'qualified').</div></td>
+      </tr>
+      <tr>
+        <td><code>status</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Opportunity status filter: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.</div></td>
+      </tr></tbody></table>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_pipeline_snapshot&quot;,
+    &quot;arguments&quot;: {
+      &quot;pipeline&quot;: &quot;string&quot;
+    }
+  }
+}</code></pre>
+    </article>
+  
+    <article class="tool" id="topline_pipeline_audit">
+      <header>
+        <h3><code>topline_pipeline_audit</code></h3>
+        <a class="anchor" href="#topline_pipeline_audit">#</a>
+      </header>
+      <p class="tool-desc">Standard pipeline activity audit in a single call. Replaces the legacy 3-step flow (describe_schema → resolve pipeline name → hand-write SQL across pipeline_snapshot / pipeline_activity_window / pipeline_movement_window / warehouse_freshness). Accepts an opaque pipeline ID or a fuzzy name ('flex triage', 'qualified'); resolves the name internally and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand (e.g. '7d', '24h'). Returns { pipelineId, pipelineResolution, window, status, freshness, snapshot, activity, deals, movement } where activity uses unique_touches (deduped against source_id), deals carries per-deal touch breakdowns, and movement is stage/status changes inside the window. PREFER THIS over topline_execute_query for any 'what happened in pipeline X over window W' question — it is faster, cheaper, and prevents the agent from inventing SQL the audit views already cover.</p>
+      <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+      <tr>
+        <td><code>pipeline</code> <span class="req">required</span></td>
+        <td class="type">string</td>
+        <td><div class="desc">Pipeline ID (opaque 20-char) or fuzzy name.</div></td>
+      </tr>
+      <tr>
+        <td><code>since</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.</div></td>
+      </tr>
+      <tr>
+        <td><code>until</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window end. Default: now. Same format as `since`.</div></td>
+      </tr>
+      <tr>
+        <td><code>status</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Opportunity status filter: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.</div></td>
+      </tr>
+      <tr>
+        <td><code>limit</code></td>
+        <td class="type">number</td>
+        <td><div class="desc">Max deals returned in the `deals` section. Default 25, max 100.</div></td>
+      </tr></tbody></table>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_pipeline_audit&quot;,
+    &quot;arguments&quot;: {
+      &quot;pipeline&quot;: &quot;string&quot;
+    }
+  }
+}</code></pre>
+    </article>
+  
+    <article class="tool" id="topline_contact_audit">
+      <header>
+        <h3><code>topline_contact_audit</code></h3>
+        <a class="anchor" href="#topline_contact_audit">#</a>
+      </header>
+      <p class="tool-desc">Standard contact activity audit in a single call. Replaces the legacy fan-out of search_contacts → get_contact → search_opportunities → search_conversations → get_messages. Accepts an opaque contact ID OR a fuzzy identifier (email like 'jane@acme.com', phone like '+15551234567', or name like 'Jane Smith'); resolves it internally and echoes how it matched. Accepts since/until as 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or relative shorthand (e.g. '90d', '24h'). Default since = 90d, until = now. Returns { contact, contactResolution, window, freshness, opportunities, activity, timeline, messages } where opportunities lists all deals for the contact with pipeline_name/stage_name/value/status (via opportunity_funnel), activity is a counts rollup by event_kind+direction over the window, timeline is per-event rows from contact_timeline within the window (messages + opportunities-created + appointments), and messages is the last N raw message bodies for context. PREFER THIS over topline_execute_query, topline_search_contacts, topline_search_conversations, or topline_get_messages for any 'what's going on with contact X' / 'what did Y say this month' / 'give me a brief on Z' question — it is faster, cheaper, and prevents the agent from inventing SQL the warehouse views already cover. Tasks and notes are NOT included (they are REST-only); drill down with topline_list_contact_tasks / topline_list_contact_notes if the user asks.</p>
+      <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+      <tr>
+        <td><code>contact</code> <span class="req">required</span></td>
+        <td class="type">string</td>
+        <td><div class="desc">Contact identifier. Accepts opaque contact ID, email (jane@acme.com), phone (+15551234567 or local-format), or fuzzy name (e.g. 'Jane Smith', 'Acme Corp').</div></td>
+      </tr>
+      <tr>
+        <td><code>since</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window start. Default: 90 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.</div></td>
+      </tr>
+      <tr>
+        <td><code>until</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window end. Default: now. Same format as `since`.</div></td>
+      </tr>
+      <tr>
+        <td><code>message_limit</code></td>
+        <td class="type">number</td>
+        <td><div class="desc">Max raw messages returned in the `messages` section. Default 20, max 100.</div></td>
+      </tr>
+      <tr>
+        <td><code>timeline_limit</code></td>
+        <td class="type">number</td>
+        <td><div class="desc">Max timeline events returned. Default 50, max 200.</div></td>
+      </tr></tbody></table>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_contact_audit&quot;,
+    &quot;arguments&quot;: {
+      &quot;contact&quot;: &quot;string&quot;
+    }
+  }
+}</code></pre>
+    </article>
+  
+    <article class="tool" id="topline_owner_audit">
+      <header>
+        <h3><code>topline_owner_audit</code></h3>
+        <a class="anchor" href="#topline_owner_audit">#</a>
+      </header>
+      <p class="tool-desc">Owner-scoped activity audit in a single call. THE tool for any 'how is rep X doing' / 'rep snapshot for X' / 'what did X work on this week' / 'X's book' / 'who's most active' / 'is X caught up on their book' question. Replaces the legacy fan-out of topline_list_users → topline_search_opportunities(assignedTo=...) → topline_execute_query on pipeline_activity_window. Accepts an opaque user_id, email, or fuzzy name; resolves via REST /users/ once and echoes how it matched. Accepts since/until as 'this-week-et' (default since = 7d), 'now', RFC3339, YYYY-MM-DD, or relative shorthand. Optional `pipeline` arg (id or fuzzy name) scopes everything to one pipeline. Optional `stale_days` (default 14) defines the stale-ownership threshold. Returns { userId, ownerResolution, user, window, pipelineFilter, status, staleDays, freshness, book, bookByStage, activity, deals, staleOwnedDeals, crossAssignedTouches, movement }. TWO OWNERSHIP LENSES: `book` / `bookByStage` / `staleOwnedDeals` / `movement` use opportunities.assigned_to (deals owned by this user). `activity` / `deals` / `crossAssignedTouches` use messages.user_id / call_events.user_id (touches THIS USER personally logged). AUTOMATION FILTER: activity/deals/staleOwnedDeals/crossAssignedTouches all exclude messages where raw_payload.$.source IN ('campaign','workflow') — those are workflow blasts and bulk campaigns, not personal rep touches. Calls and appointments are always counted as rep activity (no automation noise there). staleOwnedDeals = opps in book with no rep-attributed touch in the last `stale_days` days, ordered by monetary_value DESC — this is the 'what's rotting in the rep's book' surface. crossAssignedTouches = deals THIS USER personally touched in window where assigned_to is someone else, ordered by unique_touches DESC — this is the 'helping someone else's book' surface. PREFER THIS over topline_execute_query for any owner-scoped question. NEVER hand-write CTEs for owner book + touches + stale + cross-assignment when this tool returns all four in one call.</p>
+      <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
+      <tr>
+        <td><code>owner</code> <span class="req">required</span></td>
+        <td class="type">string</td>
+        <td><div class="desc">Owner identifier. Accepts opaque user_id, email (jane@topline.com), or fuzzy name (e.g. 'Joey Skatell', 'paul').</div></td>
+      </tr>
+      <tr>
+        <td><code>pipeline</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Optional pipeline filter (id or fuzzy name). When set, scopes everything to one pipeline.</div></td>
+      </tr>
+      <tr>
+        <td><code>since</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window start. Default: 7 days ago. Accepts 'this-week-et', 'now', RFC3339, YYYY-MM-DD, or Nd/Nh shorthand.</div></td>
+      </tr>
+      <tr>
+        <td><code>until</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Window end. Default: now. Same format as `since`.</div></td>
+      </tr>
+      <tr>
+        <td><code>status</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Opportunity status filter for book/deals/movement/staleOwnedDeals: 'open' (default), 'won', 'lost', 'abandoned', or 'all'/'any' to skip filtering.</div></td>
+      </tr>
+      <tr>
+        <td><code>limit</code></td>
+        <td class="type">number</td>
+        <td><div class="desc">Max deals returned in `deals` / `staleOwnedDeals` / `crossAssignedTouches` sections. Default 25, max 100. (`book` is capped at 200, `bookByStage` is unbounded.)</div></td>
+      </tr>
+      <tr>
+        <td><code>stale_days</code></td>
+        <td class="type">number</td>
+        <td><div class="desc">Stale-ownership threshold in days. Default 14. A deal is 'stale' when no rep-attributed touch (excluding campaign/workflow automation) has landed within this many days. Set to 7 for a stricter cadence, 30 for low-velocity pipelines.</div></td>
+      </tr></tbody></table>
+      <h4>Example call</h4>
+      <pre><code>{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;topline_owner_audit&quot;,
+    &quot;arguments&quot;: {
+      &quot;owner&quot;: &quot;string&quot;
+    }
+  }
+}</code></pre>
+    </article>
+  
     <article class="tool" id="topline_find_references">
       <header>
         <h3><code>topline_find_references</code></h3>
@@ -2759,3 +2976,5 @@
   </div>
 </body>
 </html>
+(node:32524) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
+(Use `node --trace-deprecation ...` to show where the warning was created)
