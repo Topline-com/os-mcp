@@ -266,6 +266,58 @@ describe("registry wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Opportunities — compound-cursor pagination regression
+// ---------------------------------------------------------------------------
+//
+// GHL's /opportunities/search uses a COMPOUND cursor: both startAfter (ms
+// epoch) and startAfterId must be sent together on the next request, or the
+// API silently returns the same page. The MCP tool used to forward only
+// startAfterId, which pinned callers to page 1. These tests guard the fix.
+
+describe("topline_search_opportunities pagination", () => {
+  it("forwards BOTH startAfter and startAfterId as query params", async () => {
+    const { tools } = await import("./tools/opportunities.js");
+    const tool = tools.find((t) => t.name === "topline_search_opportunities")!;
+    await withFakeCreds(() =>
+      tool.handler({
+        pipelineId: "pipe-1",
+        status: "open",
+        limit: 100,
+        startAfter: "1740000000000",
+        startAfterId: "opp-123",
+      }),
+    );
+    strictEqual(lastCall!.method, "GET");
+    const parsed = new URL(lastCall!.url);
+    strictEqual(parsed.pathname, "/opportunities/search");
+    strictEqual(parsed.searchParams.get("startAfter"), "1740000000000");
+    strictEqual(parsed.searchParams.get("startAfterId"), "opp-123");
+    strictEqual(parsed.searchParams.get("location_id"), "loc-fake-for-tests");
+    strictEqual(parsed.searchParams.get("limit"), "100");
+    strictEqual(parsed.searchParams.get("pipeline_id"), "pipe-1");
+    strictEqual(parsed.searchParams.get("status"), "open");
+  });
+
+  it("omits cursor params entirely when neither is passed", async () => {
+    const { tools } = await import("./tools/opportunities.js");
+    const tool = tools.find((t) => t.name === "topline_search_opportunities")!;
+    await withFakeCreds(() => tool.handler({ pipelineId: "pipe-1" }));
+    const parsed = new URL(lastCall!.url);
+    strictEqual(parsed.searchParams.has("startAfter"), false);
+    strictEqual(parsed.searchParams.has("startAfterId"), false);
+  });
+
+  it("declares both startAfter and startAfterId in its input schema", async () => {
+    const { tools } = await import("./tools/opportunities.js");
+    const tool = tools.find((t) => t.name === "topline_search_opportunities")!;
+    const props = (tool.inputSchema as { properties?: Record<string, unknown> })
+      .properties ?? {};
+    ok("startAfter" in props, "schema must expose startAfter");
+    ok("startAfterId" in props, "schema must expose startAfterId");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // find_references — closed-enum rejection of bad kinds
 // ---------------------------------------------------------------------------
 

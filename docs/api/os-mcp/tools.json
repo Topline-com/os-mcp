@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "topline_ping",
-      "description": "Verify the Topline OS Private Integration Token works and return basic location info. Call this first to confirm setup.",
+      "description": "Verify the Topline Private Integration Token works and return basic location info. Call this first to confirm setup.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -12,7 +12,7 @@
     },
     {
       "name": "topline_setup_check",
-      "description": "End-to-end setup verification for Topline OS MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.",
+      "description": "End-to-end setup verification for Topline MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.",
       "inputSchema": {
         "type": "object",
         "properties": {},
@@ -22,7 +22,7 @@
     },
     {
       "name": "topline_request",
-      "description": "Generic passthrough to any Topline OS API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. \"/contacts/\" or \"/opportunities/pipelines\") and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.",
+      "description": "Generic passthrough to any Topline API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. \"/contacts/\" or \"/opportunities/pipelines\") and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -581,7 +581,7 @@
     },
     {
       "name": "topline_search_opportunities",
-      "description": "Search opportunities. Filter by pipeline, stage, status, contact, or free text.",
+      "description": "Search opportunities. Filter by pipeline, stage, status, contact, or free text. PAGINATION: the cursor is COMPOUND — to advance past page 1 you must send BOTH `startAfter` and `startAfterId` from the previous response's `meta` object. Sending only one silently returns the same page.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -618,9 +618,13 @@
             "type": "number",
             "description": "Results per page (max 100, default 25)"
           },
+          "startAfter": {
+            "type": "string",
+            "description": "Cursor timestamp (ms epoch) from the previous response's `meta.startAfter`. Required together with `startAfterId` to advance the page — sending only one silently returns the same page."
+          },
           "startAfterId": {
             "type": "string",
-            "description": "Cursor from a previous page"
+            "description": "Cursor row id from the previous response's `meta.startAfterId`. Required together with `startAfter` to advance the page."
           },
           "locationId": {
             "type": "string",
@@ -2076,5 +2080,4 @@
     }
   ],
   "count": 74
-}(node:32500) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
-(Use `node --trace-deprecation ...` to show where the warning was created)
+}
