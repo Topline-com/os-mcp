@@ -98,7 +98,7 @@
         <h3><code>topline_ping</code></h3>
         <a class="anchor" href="#topline_ping">#</a>
       </header>
-      <p class="tool-desc">Verify the Topline OS Private Integration Token works and return basic location info. Call this first to confirm setup.</p>
+      <p class="tool-desc">Verify the Topline Private Integration Token works and return basic location info. Call this first to confirm setup.</p>
       <p class="no-params">No parameters.</p>
       <h4>Example call</h4>
       <pre><code>{
@@ -117,7 +117,7 @@
         <h3><code>topline_setup_check</code></h3>
         <a class="anchor" href="#topline_setup_check">#</a>
       </header>
-      <p class="tool-desc">End-to-end setup verification for Topline OS MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.</p>
+      <p class="tool-desc">End-to-end setup verification for Topline MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.</p>
       <p class="no-params">No parameters.</p>
       <h4>Example call</h4>
       <pre><code>{
@@ -136,7 +136,7 @@
         <h3><code>topline_request</code></h3>
         <a class="anchor" href="#topline_request">#</a>
       </header>
-      <p class="tool-desc">Generic passthrough to any Topline OS API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. &quot;/contacts/&quot; or &quot;/opportunities/pipelines&quot;) and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.</p>
+      <p class="tool-desc">Generic passthrough to any Topline API v2 endpoint. Use this when no dedicated tool fits. Provide the path (e.g. &quot;/contacts/&quot; or &quot;/opportunities/pipelines&quot;) and HTTP method. If the path or query needs a locationId and you don't provide one, the configured sub-account location is used automatically. Returns the parsed JSON response.</p>
       <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
       <tr>
         <td><code>method</code> <span class="req">required</span></td>
@@ -941,7 +941,7 @@
         <h3><code>topline_search_opportunities</code></h3>
         <a class="anchor" href="#topline_search_opportunities">#</a>
       </header>
-      <p class="tool-desc">Search opportunities. Filter by pipeline, stage, status, contact, or free text.</p>
+      <p class="tool-desc">Search opportunities. Filter by pipeline, stage, status, contact, or free text. PAGINATION: the cursor is COMPOUND — to advance past page 1 you must send BOTH `startAfter` and `startAfterId` from the previous response's `meta` object. Sending only one silently returns the same page.</p>
       <h4>Parameters</h4><table class="params"><thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead><tbody>
       <tr>
         <td><code>query</code></td>
@@ -979,9 +979,14 @@
         <td><div class="desc">Results per page (max 100, default 25)</div></td>
       </tr>
       <tr>
+        <td><code>startAfter</code></td>
+        <td class="type">string</td>
+        <td><div class="desc">Cursor timestamp (ms epoch) from the previous response's `meta.startAfter`. Required together with `startAfterId` to advance the page — sending only one silently returns the same page.</div></td>
+      </tr>
+      <tr>
         <td><code>startAfterId</code></td>
         <td class="type">string</td>
-        <td><div class="desc">Cursor from a previous page</div></td>
+        <td><div class="desc">Cursor row id from the previous response's `meta.startAfterId`. Required together with `startAfter` to advance the page.</div></td>
       </tr>
       <tr>
         <td><code>locationId</code></td>
@@ -2976,5 +2981,3 @@
   </div>
 </body>
 </html>
-(node:32524) [DEP0205] DeprecationWarning: `module.register()` is deprecated. Use `module.registerHooks()` instead.
-(Use `node --trace-deprecation ...` to show where the warning was created)

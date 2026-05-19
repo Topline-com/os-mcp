@@ -11,7 +11,6 @@ import {
   arr,
   obj,
   limitProp,
-  startAfterIdProp,
 } from "@topline/shared";
 
 export const tools: ToolDef[] = [
@@ -26,7 +25,8 @@ export const tools: ToolDef[] = [
   },
   {
     name: "topline_search_opportunities",
-    description: "Search opportunities. Filter by pipeline, stage, status, contact, or free text.",
+    description:
+      "Search opportunities. Filter by pipeline, stage, status, contact, or free text. PAGINATION: the cursor is COMPOUND — to advance past page 1 you must send BOTH `startAfter` and `startAfterId` from the previous response's `meta` object. Sending only one silently returns the same page.",
     inputSchema: obj({
       query: str("Free-text search"),
       pipelineId: str("Restrict to one pipeline"),
@@ -35,7 +35,12 @@ export const tools: ToolDef[] = [
       contactId: str(),
       status: { type: "string", enum: ["open", "won", "lost", "abandoned", "all"] },
       limit: limitProp,
-      startAfterId: startAfterIdProp,
+      startAfter: str(
+        "Cursor timestamp (ms epoch) from the previous response's `meta.startAfter`. Required together with `startAfterId` to advance the page — sending only one silently returns the same page.",
+      ),
+      startAfterId: str(
+        "Cursor row id from the previous response's `meta.startAfterId`. Required together with `startAfter` to advance the page.",
+      ),
       locationId,
     }),
     handler: async (args) => {
@@ -50,6 +55,7 @@ export const tools: ToolDef[] = [
         ["assignedTo", "assigned_to"],
         ["contactId", "contact_id"],
         ["status", "status"],
+        ["startAfter", "startAfter"],
         ["startAfterId", "startAfterId"],
       ] as const) {
         const v = args[k];
