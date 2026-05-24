@@ -41,13 +41,17 @@ Worker hits the placeholder host.
 `topline-os-sync` sync worker) — set the secret before the deploy
 triggered by #8 finishes:
 
+Substitute `<CRM_API_URL>` below with the actual upstream API base URL
+Topline provides during onboarding (not committed to this repo — see
+white-label hygiene below).
+
 ```bash
 # From apps/edge/
-printf 'https://services.leadconnectorhq.com' \
+printf '<CRM_API_URL>' \
   | npx wrangler secret put TOPLINE_API_BASE_URL
 
 # From apps/sync/
-printf 'https://services.leadconnectorhq.com' \
+printf '<CRM_API_URL>' \
   | npx wrangler secret put TOPLINE_API_BASE_URL
 ```
 
@@ -152,7 +156,7 @@ Run these against the live PIT after each pillar lands.
 
 ### After #8 (white-label scrub)
 
-- `git grep -i -E 'gohighlevel|highlevel|leadconnector|\bGHL\b'` returns zero matches.
+- The `.github/workflows/white-label-check.yml` CI job (canonical vendor-name grep) returns zero matches on every PR.
 - `npm run build` + `npm run test` + `npm run worker:typecheck` clean.
 - `topline_setup_check` still green.
 
