@@ -171,11 +171,13 @@ Interpretation:
 - *"Book Acme for a Discovery Call next Tuesday at 2pm ET."*
 - *"Which contacts haven't been messaged in 30 days and are tagged `warm-lead`?"*
 
-48 curated tools plus a generic `topline_request` escape hatch.
+~120 curated tools plus a generic `topline_request` escape hatch. Run `topline_describe_data_catalog` for the live inventory with sync status, or browse `apps/edge/src/tools/`.
 
 ---
 
 ## Tool categories
+
+### Core CRM surface (the original 48)
 
 | Area | Tools |
 |---|---|
@@ -184,15 +186,171 @@ Interpretation:
 | Conversations | search, get, list messages, send message (SMS / Email / WhatsApp / IG / FB / Custom) |
 | Opportunities | list pipelines, search, get, create, update, delete |
 | Calendars | list calendars, get slots, book / update / cancel appointments |
-| Tasks | list / create / update / delete |
-| Notes | list / create / update / delete |
-| Custom fields | list / get |
-| Workflows | list |
-| Tags | list |
-| Users | list / get |
-| Forms & surveys | list, list submissions |
-| Location | `topline_get_location` |
+| Tasks, Notes | list / create / update / delete |
+| Custom fields, Custom values | list / get / create / update / delete |
+| Workflows, Tags | list |
+| Users, Forms, Surveys, Location | list / get / submissions |
 | Escape hatch | `topline_request` — call any Topline OS API endpoint |
+
+### Marketing OS overlay (~55 additional tools across pillars P1–P6)
+
+| Area | Tools | Pillar |
+|---|---|---|
+| Social Planner | `topline_social_post`, `topline_social_account`, `topline_social_csv`, `topline_social_oauth` (umbrella, action-discriminated) | P1A |
+| Ad Publishing | `topline_fb_*` (11), `topline_google_*` (7), `topline_linkedin_*` (6) — integration, ad accounts, campaigns, ad sets, ads, audiences, conversions, targeting, reporting | P1B |
+| Email Campaigns | `topline_email_template`, `topline_email_campaign`, `topline_email_campaign_stats`, `topline_email_campaign_recipients` | P1C |
+| Agent Studio | `topline_agent`, `topline_agent_version`, `topline_agent_legacy` | P1D |
+| UTM standardization | `topline_get_marketing_config`, `topline_set_marketing_config`, `topline_init_attribution_fields`, `topline_register_campaign_utm`, `topline_get_campaign_utm`, `topline_list_campaign_utms`, `topline_build_utm_url`, `topline_lint_utm` | P2 |
+| Spend ingestion | `topline_list_spend_providers`, `topline_list_spend_transactions`, `topline_get_channel_spend`, `topline_list_spend_classification_rules`, `topline_add_spend_classification_rule`, `topline_reconcile_spend` — sources from `/ad-publishing/{network}/reporting`, no third-party expense integration | P3 |
+| Attribution | SQL views `contact_attribution` + `opportunity_attribution` (queryable via `topline_execute_query`) | P4 |
+| Marketing dashboard | `topline_get_marketing_dashboard` — composite payload: channel rollup, summary cards, prebuilt SQL for opp/MRR widgets | P5 |
+| Form submission visibility | `topline_get_slack_config`, `topline_notify_slack`, `topline_dispatch_form_submission` | P6 |
+
+See [docs/marketing-os-rollout.md](./docs/marketing-os-rollout.md) for the full P1–P7 operational runbook (smoke tests, per-tenant config, follow-ups).
+
+---
+
+## Architecture
+
+```
+topline-com/os-mcp (monorepo)
+├── apps/
+│   ├── edge/        MCP worker — stdio CLI (npx) + Cloudflare Worker (remote.ts)
+│   │   ├── src/index.ts       stdio entry — reads TOPLINE_PIT / _LOCATION_ID from env
+│   │   ├── src/remote.ts      Cloudflare Worker entry — per-request PIT via headers
+│   │   ├── src/registry.ts    ACTION_TOOLS (stdio + remote) + ANALYTICS_TOOLS (remote only)
+│   │   └── src/tools/         one file per tool family (~30 files)
+│   └── sync/        Sync worker — backfill + 15-min incremental sync into per-tenant LocationDO
+├── packages/
+│   ├── shared/              toplineFetch client + JSON-schema helpers + brand
+│   ├── shared-schema/       entity manifests + analytics views + data catalog
+│   ├── shared-auth/         per-tenant connection storage (KV) + PIT encryption
+│   └── shared-do/           LocationDO — one Durable Object per tenant, SQLite-backed
+└── docs/                    rollout runbook + per-client setup guides
+```
+
+**Runtime model.** Two entry points share one `ACTION_TOOLS` registry:
+
+- **stdio install** (`npx -y github:topline-com/os-mcp`) — runs locally as a Claude Desktop/Code subprocess. Reads `TOPLINE_PIT`, `TOPLINE_LOCATION_ID`, `TOPLINE_API_BASE_URL` from env. No hosted intermediary.
+- **remote install** (`https://os-mcp.topline.com/mcp`) — Cloudflare Worker. Per-request credentials via `Authorization: Bearer <pit-or-minted-token>` + `X-Topline-Location-Id`.
+
+**Per-tenant isolation.** LocationDO architecture: one Durable Object instance per `location_id`, each with its own embedded SQLite database. No shared query engine — cross-tenant leakage is impossible by construction. Sync worker pulls into each DO on a 15-min cron; SQL surface (`topline_execute_query`) reads only from the calling tenant's DO.
+
+**Tool dispatch.** `ACTION_TOOLS` proxy CRM REST endpoints via `toplineFetch`, work in both stdio and remote. `ANALYTICS_TOOLS` are the SQL surface and need the LocationDO binding, so they only run in the Worker.
+
+**White-label rule.** The public repo cannot name the underlying CRM vendor by brand. CI runs `.github/workflows/white-label-check.yml` on every PR — see that file for the exact forbidden patterns. Use "the CRM" or "the connected CRM" in all new code, comments, and docs.
+
+---
+
+## For developers (clone + run locally)
+
+**Prereqs:** Node 22+, npm, [wrangler](https://developers.cloudflare.com/workers/wrangler/install-and-update/) (`npm i -g wrangler` or use `npx wrangler` per-call).
+
+```bash
+git clone https://github.com/topline-com/os-mcp.git
+cd os-mcp
+npm install
+npm run build              # tsc across all workspaces
+npm run test               # unit tests across apps + packages
+npm run worker:typecheck   # apps/edge Worker tsconfig
+```
+
+**Run the stdio entry point locally** (against your own sub-account):
+
+```bash
+TOPLINE_PIT=pit-... \
+TOPLINE_LOCATION_ID=... \
+TOPLINE_API_BASE_URL=https://<onboarding-url> \
+  node apps/edge/dist/index.js
+# Speaks MCP over stdin/stdout. Or wire into Claude via claude_desktop_config.json.
+```
+
+**Run the Worker locally**:
+
+```bash
+cd apps/edge
+npx wrangler dev    # serves at http://localhost:8787
+```
+
+### Adding a new tool
+
+1. Create `apps/edge/src/tools/<your_family>.ts`:
+
+   ```ts
+   import { toplineFetch, getLocationId } from "@topline/shared";
+   import { obj, str, locationId } from "@topline/shared";
+   import type { ToolDef } from "./types.js";
+
+   export const tools: ToolDef[] = [
+     {
+       name: "topline_your_tool",                   // must start with `topline_`
+       description: "One-line summary the LLM reads to decide when to call it.",
+       inputSchema: obj({ foo: str("Foo description"), locationId }, ["foo"]),
+       handler: async (args) => {
+         const loc = getLocationId(args.locationId as string | undefined);
+         return await toplineFetch(`/your/endpoint`, { query: { locationId: loc, foo: args.foo } });
+       },
+     },
+   ];
+   ```
+
+   - `apps/edge/src/tools/contacts.ts` is the canonical narrow-tool example.
+   - `apps/edge/src/tools/ad_publishing.ts` is the canonical umbrella (action-discriminator) example.
+   - Reuse the shared schema helpers from `@topline/shared`: `obj`, `objLoose`, `str`, `num`, `bool`, `arr`, `locationId`.
+   - Never name the vendor in `description` or comments — the CI grep guard will reject the PR.
+
+2. Wire it into `apps/edge/src/registry.ts`:
+
+   ```ts
+   import { tools as yourTools } from "./tools/your_family.js";
+   // ...
+   export const ACTION_TOOLS: ToolDef[] = [
+     // ...
+     ...yourTools,
+   ];
+   ```
+
+3. Document it in `packages/shared-schema/src/catalog.ts` so `topline_describe_data_catalog` surfaces it.
+
+4. Verify:
+
+   ```bash
+   npm run build && npm run test && npm run worker:typecheck
+   ```
+
+   The registry self-checks for duplicate tool names at startup.
+
+### Conventions
+
+- **Naming.** `topline_<resource>_<verb>` for narrow tools (`topline_create_contact`), `topline_<resource>` for umbrella tools with an `action` discriminator (`topline_social_post action=create`).
+- **Per-action validation.** Pre-validate required-by-action params in the handler (`requireArg` is the conventional helper). Don't trust the JSON Schema alone.
+- **Errors.** Throw `Error` with a message that names the missing field. The MCP wrapper converts to a structured error response.
+- **Multi-tenant.** Always use `getLocationId(args.locationId)`. Never hardcode anything tenant-specific. Per-tenant config goes in the `_topline_marketing_config` custom value, not env or constants.
+
+---
+
+## For operators (deploy + configure a new tenant)
+
+Deploys are automated: pushing to `main` triggers `.github/workflows/deploy.yml` which runs `npm test` + `npm run build` + `wrangler deploy` for both `apps/edge` and `apps/sync`. No manual step.
+
+**Worker secrets** — set via `wrangler secret put` per Worker, never committed:
+
+```bash
+cd apps/edge
+printf '<CRM_API_URL>'        | npx wrangler secret put TOPLINE_API_BASE_URL
+printf '<admin-token>'        | npx wrangler secret put ADMIN_TOKEN
+printf '<32-byte-hex>'        | npx wrangler secret put TOKEN_SIGNING_SECRET
+printf '<slack-webhook-url>'  | npx wrangler secret put TOPLINE_SLACK_WEBHOOK_URL   # optional (P6)
+# Repeat for apps/sync — at minimum TOPLINE_API_BASE_URL.
+```
+
+Generate `TOKEN_SIGNING_SECRET` with `openssl rand -hex 32`. Get `<CRM_API_URL>` from Topline onboarding (never commit it to the repo).
+
+**Per-tenant config** (marketing OS pillars):
+
+1. **One-time marketing config blob** — channel taxonomy, qualified-pipeline name, stage probabilities, spend classification rules, Slack target. Stored as a JSON custom value `_topline_marketing_config` in the tenant's location. Apply via `topline_set_marketing_config` (see [docs/marketing-os-rollout.md](./docs/marketing-os-rollout.md) for the canonical schema).
+2. **Initialize attribution fields** on contacts — `topline_init_attribution_fields` creates the six `utm_*_first/last` custom fields that the homepage form integration populates.
+3. **Verify** — `topline_setup_check` should return 19/19 scope areas OK. If `ad_publishing_google` or `_linkedin` fail, the PIT may need regeneration with Select-All after the network is connected in CRM Integrations.
 
 ---
 
@@ -218,9 +376,17 @@ Override the brand name end-users see — add `"TOPLINE_BRAND_NAME": "Acme Growt
 
 ## Scope reference
 
-`Select All` covers everything. If your Topline OS build lacks a Select All button, tick each of these: `contacts.readonly`, `contacts.write`, `conversations.readonly`, `conversations.write`, `conversations/message.readonly`, `conversations/message.write`, `opportunities.readonly`, `opportunities.write`, `calendars.readonly`, `calendars.write`, `calendars/events.readonly`, `calendars/events.write`, `workflows.readonly`, `forms.readonly`, `forms.write`, `surveys.readonly`, `users.readonly`, `locations.readonly`, `locations/customFields.readonly`, `locations/customFields.write`, `locations/tags.readonly`, `locations/tags.write`, `locations/tasks.readonly`, `locations/tasks.write`, `medias.readonly`, `medias.write`.
+`Select All` covers everything. `topline_setup_check` probes all 19 scope areas and tells you which are missing.
 
-`topline_setup_check` probes all of these and tells you which are missing.
+If your Topline OS build lacks a Select All button, tick each of these:
+
+**Core CRM:** `contacts.readonly`, `contacts.write`, `conversations.readonly`, `conversations.write`, `conversations/message.readonly`, `conversations/message.write`, `opportunities.readonly`, `opportunities.write`, `calendars.readonly`, `calendars.write`, `calendars/events.readonly`, `calendars/events.write`, `workflows.readonly`, `forms.readonly`, `forms.write`, `surveys.readonly`, `users.readonly`, `locations.readonly`, `locations/customFields.readonly`, `locations/customFields.write`, `locations/customValues.readonly`, `locations/customValues.write`, `locations/tags.readonly`, `locations/tags.write`, `locations/tasks.readonly`, `locations/tasks.write`, `medias.readonly`, `medias.write`.
+
+**Marketing OS surfaces** (required for the P1–P6 pillars): `socialplanner/post.readonly`, `socialplanner/post.write`, `socialplanner/account.readonly`, `socialplanner/account.write`, `socialplanner/oauth.readonly`, `socialplanner/oauth.write`, `socialplanner/csv.readonly`, `socialplanner/csv.write`, `socialplanner/category.readonly`, `socialplanner/tag.readonly`, `ad-publishing/facebook.readonly`, `ad-publishing/facebook.write`, `ad-publishing/google.readonly`, `ad-publishing/google.write`, `ad-publishing/linkedin.readonly`, `ad-publishing/linkedin.write`, `campaigns.readonly`, `emails/builder.readonly`, `emails/builder.write`, `agent-studio.readonly`, `agent-studio.write`.
+
+If `ad_publishing_google` or `ad_publishing_linkedin` fail in setup_check after Select All, two prereqs to verify in order:
+1. The corresponding network is connected in Topline OS → **Settings → Integrations** (operator action via browser OAuth flow).
+2. The PIT was regenerated **after** the integration was connected — Select All at regen time picks up scopes that weren't available when the original PIT was issued.
 
 ## Security
 
