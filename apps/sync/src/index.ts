@@ -4,7 +4,7 @@
 //
 // Separate from the edge worker so backfill / polling traffic never shares
 // the same isolate as customer-facing MCP requests. Reads encrypted
-// connection records from the shared CONNECTIONS KV namespace, calls GHL
+// connection records from the shared CONNECTIONS KV namespace, calls the CRM
 // via the shared toplineFetch client, and writes rows into each tenant's
 // LocationDO via cross-worker DO binding.
 //
@@ -79,7 +79,7 @@ export default {
 // ---------------------------------------------------------------------------
 // POST /sync/incremental?connection_id=<uuid>&entity=<table>
 //
-// Fetches only records with cursor_column > watermark from GHL and upserts
+// Fetches only records with cursor_column > watermark from the CRM and upserts
 // them. Refuses with `skipped: "not_complete"` if the entity's initial
 // backfill hasn't finished — see index.ts handleBackfill for that flow.
 // ---------------------------------------------------------------------------
@@ -197,7 +197,7 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
     return json(500, { error: message });
   }
 
-  // 200 even if the backfill hit GHL auth / rate-limit errors — the result
+  // 200 even if the backfill hit the CRM auth / rate-limit errors — the result
   // payload carries the error detail. A 500 is reserved for infra failures
   // (missing connection, DO binding broken, etc.) where retrying won't help.
   return json(200, result);

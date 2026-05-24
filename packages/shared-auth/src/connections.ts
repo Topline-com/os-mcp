@@ -3,7 +3,7 @@
 // Key:    connection_id (UUID v4, assigned at creation)
 // Value:  stored JSON (see StoredConnection below)
 //
-// The stored record contains the *encrypted* PIT. To actually call GHL,
+// The stored record contains the *encrypted* PIT. To actually call the CRM,
 // callers must decrypt with the worker's TOKEN_SIGNING_SECRET via
 // `loadAndDecryptConnection`.
 //

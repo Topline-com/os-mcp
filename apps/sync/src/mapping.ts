@@ -1,4 +1,4 @@
-// GHL payload → SQLite row mapper.
+// the CRM payload → SQLite row mapper.
 //
 // Reads each column's source_path from the manifest and extracts the
 // corresponding value from the upstream JSON. Dot-notation is supported
@@ -9,7 +9,7 @@
 import type { EntityManifest } from "@topline/shared-schema";
 
 /**
- * Convert one GHL record into a row keyed by the manifest's column names.
+ * Convert one CRM record into a row keyed by the manifest's column names.
  * Missing source fields become null. Timestamp columns normalized to ISO
  * 8601 per the manifest's `timestamp_format` flag. The caller passes the
  * resulting rows to `LocationDO.upsertRows(table, rows)`.
@@ -41,7 +41,7 @@ export function mapRow(
       continue;
     }
 
-    // Normalize timestamps. GHL is inconsistent across endpoints — some
+    // Normalize timestamps. the CRM is inconsistent across endpoints — some
     // return ISO strings, some return ms-epoch numbers. We pick a single
     // on-disk representation (ISO 8601 string) so queries don't have to
     // care which upstream shape produced the row.

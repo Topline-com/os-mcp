@@ -6,11 +6,11 @@
 //   poll_full     → not yet (pipelines, pipeline_stages) — stubbed
 //
 // Appointments is additionally blocked because its manifest has
-// `pagination: "unknown"` — we haven't verified GHL's list contract
+// `pagination: "unknown"` — we haven't verified the CRM's list contract
 // yet. The dispatcher refuses to touch it.
 //
 // The sync worker holds no persistent state. Every call loads the
-// connection record from KV, decrypts the PIT, runs against GHL.
+// connection record from KV, decrypts the PIT, runs against the CRM.
 // Cursor progress is persisted in the LocationDO's `_sync_state`
 // table so retries and scheduled re-runs resume from the right
 // place.
@@ -137,7 +137,7 @@ const DEFAULT_PAGE_LIMIT = 100;
 
 // per_parent fan-out cap. Cloudflare Workers limit subrequests to 1000
 // per invocation (Paid tier) — conservatively budget for ~20 parents
-// per run. Each parent costs one GHL fetch + one DO upsert = 2
+// per run. Each parent costs one CRM fetch + one DO upsert = 2
 // subrequests, plus per-page follow-ups. 20 × (say 3 pages + 3 upserts)
 // = ~120 subrequests leaves plenty of headroom. Re-declared as the
 // single source of truth in the per_parent backfill section below;
@@ -185,7 +185,7 @@ export async function backfillEntity(
       entityTable,
       connectionId,
       connection.location_id,
-      `Backfill contract for ${entityTable} is marked "unknown" in the manifest. Verify against live GHL before syncing.`,
+      `Backfill contract for ${entityTable} is marked "unknown" in the manifest. Verify against the live CRM before syncing.`,
     );
   }
 
@@ -220,7 +220,7 @@ export async function backfillEntity(
  * Paginate an entity whose backfill is a single endpoint with a cursor.
  *
  * Method matters: GET puts the cursor in the query string, POST puts it in
- * the body. Cursor shape is whatever GHL returns — we round-trip via JSON
+ * the body. Cursor shape is whatever the CRM returns — we round-trip via JSON
  * serialization so arrays, objects, and strings all survive unchanged.
  */
 async function backfillStandardCursor(
@@ -319,7 +319,7 @@ async function backfillStandardCursor(
   } catch (err) {
     stoppedReason = "error";
     errorMsg = err instanceof ToplineApiError
-      ? `GHL ${err.statusCode}: ${err.message}`
+      ? `CRM : ${err.message}`
       : err instanceof Error
       ? err.message
       : String(err);
@@ -330,7 +330,7 @@ async function backfillStandardCursor(
   // didn't get touched in this drain (deleted upstream), then capture
   // the max cursor_column value as the watermark and flip
   // backfill_complete so incremental polling can start. cursor_stalled
-  // is a legitimate EOF signal when GHL echoes the last-row-id back on
+  // is a legitimate EOF signal when the CRM echoes the last-row-id back on
   // the final page.
   if (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") {
     if (drainStartedAt !== null) {
@@ -392,7 +392,7 @@ async function setWatermarkAndComplete(
     await stub.clearSyncCursor(entity.table);
   } catch {
     // Non-fatal — worst case, a future resume reads a stale cursor
-    // and GHL returns an empty page. We'd rather proceed than throw.
+    // and the CRM returns an empty page. We'd rather proceed than throw.
   }
 
   const col = entity.incremental.cursor_column;
@@ -431,7 +431,7 @@ function buildRequest(
   const body: Record<string, unknown> = {};
 
   // Fixed query_extras always go into the query for GET and into the body
-  // for POST (GHL's POST search endpoints expect filter params in body).
+  // for POST (the CRM's POST search endpoints expect filter params in body).
   if (backfill.query_extras) {
     for (const [k, v] of Object.entries(backfill.query_extras)) {
       if (backfill.method === "GET") {
@@ -451,7 +451,7 @@ function buildRequest(
   //         /locations/{locationId}/customFields
   //
   // When the endpoint template carries {locationId}, don't ALSO add it
-  // as a query/body key — GHL's shape-(b) endpoints reject extra
+  // as a query/body key — the CRM's shape-(b) endpoints reject extra
   // locationId params from some SDKs. resolveEndpoint() handles the
   // path substitution; buildRequest just needs to skip the param.
   const endpointHasLocationToken = backfill.endpoint.includes("{locationId}");
@@ -524,7 +524,7 @@ function serializeCursor(value: unknown): string {
 
 /**
  * Resolve `{locationId}` (and any future path-template variables) in
- * the manifest's endpoint string. Some GHL endpoints take location as
+ * the manifest's endpoint string. Some CRM endpoints take location as
  * a path segment (`/locations/{locationId}/tags`) rather than a query
  * param; this keeps the manifest declarative for both shapes.
  */
@@ -533,7 +533,7 @@ function resolveEndpoint(template: string, locationId: string): string {
 }
 
 /**
- * Extract the upstream row-count estimate from a GHL list response.
+ * Extract the upstream row-count estimate from a CRM list response.
  * Endpoints are inconsistent about where they put this:
  *   contacts / conversations (POST search) → top-level `total`
  *   opportunities / appointments (GET search) → `meta.total`
@@ -563,9 +563,9 @@ function parseCursor(stored: string): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// callEventFromMessage — normalize a raw GHL message into a call_events row.
+// callEventFromMessage — normalize a raw CRM message into a call_events row.
 //
-// GHL's call fields are inconsistently placed across endpoints:
+// the CRM's call fields are inconsistently placed across endpoints:
 //   - duration: sometimes `duration`, sometimes `call.duration`,
 //     `meta.duration`, `meta.call.duration`, `metadata.duration`
 //   - voicemail/missed: sometimes booleans, sometimes strings, sometimes
@@ -725,7 +725,7 @@ function parentFreshnessColumns(parent: EntityManifest): readonly string[] {
 // ---------------------------------------------------------------------------
 // Structured cursor helpers (BackfillDescriptor.cursor).
 //
-// GHL's cursor shapes vary per endpoint; these helpers normalize the mess:
+// the CRM's cursor shapes vary per endpoint; these helpers normalize the mess:
 //
 //   extractNextCursor  — pull the next-cursor record out of a response
 //                         (from `meta` or from the last item of items[]).
@@ -762,7 +762,7 @@ function extractNextCursor(
   for (const f of cfg.fields) {
     const v = getByPath(source, f.response_path);
     if (v === null || v === undefined) {
-      // Incomplete cursor → treat as end-of-stream. GHL leaves the
+      // Incomplete cursor → treat as end-of-stream. the CRM leaves the
       // trailing cursor field off on the last page.
       return null;
     }
@@ -875,7 +875,7 @@ function unsupportedResult(
 // table always consistent with its source messages.
 // ---------------------------------------------------------------------------
 
-// Paid-plan-friendly sizing. Each parent typically costs 1–3 GHL
+// Paid-plan-friendly sizing. Each parent typically costs 1–3 CRM
 // subrequests + 1 DO upsert RPC, so 200 parents × ~4 calls = ~800
 // under the 1000-subrequest Cloudflare cap.
 const MAX_PARENTS_PER_INVOCATION = 200;
@@ -898,7 +898,7 @@ async function backfillPerParent(
     );
   }
   // Cursor metadata is only required for paginated children. Tasks /
-  // notes use pagination: "none" (one page per parent is all GHL
+  // notes use pagination: "none" (one page per parent is all CRM
   // gives you), so those don't need cursor_request_param.
   if (
     backfill.pagination === "cursor" &&
@@ -954,7 +954,7 @@ async function backfillPerParent(
   //       sync-first regardless of freshness. Needed when the parent
   //       freshness signal doesn't correlate with child mutations
   //       (appointments → calendars.updated_at is orthogonal to new
-  //       bookings). Cost: O(parents) GHL calls per tick.
+  //       bookings). Cost: O(parents) the CRM calls per tick.
   //
   // Before the entity-level backfill completes, mode (A) applies
   // regardless — sweep only kicks in for the post-drain steady state.
@@ -1119,7 +1119,7 @@ async function backfillPerParent(
           // Dual-write call_events from messages. Each TYPE_CALL /
           // TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL
           // message becomes a call_events row with duration + status
-          // + voicemail/missed flags normalized across GHL's varied
+          // + voicemail/missed flags normalized across the CRM's varied
           // shapes.
           if (entity.table === "messages") {
             const callRows: Record<string, unknown>[] = [];
@@ -1180,7 +1180,7 @@ async function backfillPerParent(
         parentsSucceeded += 1;
         } catch (parentErr) {
           const parentMsg = parentErr instanceof ToplineApiError
-            ? `GHL ${parentErr.statusCode}: ${parentErr.message}`
+            ? `CRM ${parentErr.statusCode}: ${parentErr.message}`
             : parentErr instanceof Error
             ? parentErr.message
             : String(parentErr);
@@ -1195,7 +1195,7 @@ async function backfillPerParent(
     // runInContext setup itself blew up). Preserve the legacy behavior.
     stoppedReason = "error";
     errorMsg = err instanceof ToplineApiError
-      ? `GHL ${err.statusCode}: ${err.message}`
+      ? `CRM : ${err.message}`
       : err instanceof Error
       ? err.message
       : String(err);
@@ -1373,7 +1373,7 @@ async function backfillPollFull(
           buildFetchOptions(entity, query, body),
         );
 
-        // GHL returns `total` on the top-level of many list responses.
+        // the CRM returns `total` on the top-level of many list responses.
         // Persist whichever one we see so the next run's drift check has
         // something to compare against.
         const upstreamTotal = extractUpstreamTotal(response);
@@ -1484,7 +1484,7 @@ async function backfillPollFull(
         }
         const nextSerialized = serializeCursor(nextCursor);
         if (nextSerialized === cursorSerialized) {
-          // GHL echoed the same cursor back — common on the last page
+          // the CRM echoed the same cursor back — common on the last page
           // (returns final row's id as startAfterId). Treat as done.
           stoppedReason = "cursor_stalled";
           break;
@@ -1504,7 +1504,7 @@ async function backfillPollFull(
   } catch (err) {
     stoppedReason = "error";
     errorMsg = err instanceof ToplineApiError
-      ? `GHL ${err.statusCode}: ${err.message}`
+      ? `CRM : ${err.message}`
       : err instanceof Error
       ? err.message
       : String(err);
@@ -1787,7 +1787,7 @@ export async function incrementalEntity(
     };
   }
 
-  // Filter contract not yet verified for this entity. GHL's filter grammar
+  // Filter contract not yet verified for this entity. the CRM's filter grammar
   // varies per-endpoint (see notes on IncrementalDescriptor.filter_ready);
   // running an unverified filter burns API budget for likely 422s. When a
   // maintainer confirms the shape, they flip this flag in the manifest.
@@ -1804,7 +1804,7 @@ export async function incrementalEntity(
       watermark_after: stateRow?.watermark ?? null,
       duration_ms: Date.now() - started,
       stopped_reason: "skipped",
-      error: `Entity ${entity.table} has filter_ready: false. Its incremental filter contract against GHL has not been verified; stick to manual /sync/backfill until the manifest entry is updated.`,
+      error: `Entity ${entity.table} has filter_ready: false. Its incremental filter contract against the CRM has not been verified; stick to manual /sync/backfill until the manifest entry is updated.`,
     };
   }
 
@@ -1843,13 +1843,13 @@ export async function incrementalEntity(
         // Inject the incremental filter. Shape depends on method:
         //   GET   → query[<cursor_query_param>] = <watermark>
         //   POST  → body.filters = [...existing, { field, operator: "greater_than", value: watermark }]
-        // GHL's POST search endpoints use a structured filter array; a
+        // the CRM's POST search endpoints use a structured filter array; a
         // top-level body.dateUpdated returns 422 "property should not exist".
         if (entity.backfill.method === "GET") {
           query[entity.incremental.cursor_query_param!] = watermarkBefore;
         } else if (body) {
           const existingFilters = Array.isArray(body.filters) ? body.filters : [];
-          // GHL's date fields in POST filters reject `gt` / `gte` as
+          // the CRM's date fields in POST filters reject `gt` / `gte` as
           // top-level operators and only accept `range` with a nested
           // `{gte, lte}` object. Verified live against /contacts/search:
           //   {field:"dateUpdated", operator:"range", value:{gte:X}}
@@ -1904,7 +1904,7 @@ export async function incrementalEntity(
   } catch (err) {
     stoppedReason = "error";
     errorMsg = err instanceof ToplineApiError
-      ? `GHL ${err.statusCode}: ${err.message}`
+      ? `CRM : ${err.message}`
       : err instanceof Error
       ? err.message
       : String(err);

@@ -9,7 +9,7 @@
 // The closed enum is the security model: the LLM cannot smuggle
 // arbitrary SQL through the handler. Every query is hard-coded.
 //
-// Workflows are NOT a supported kind because GHL's public API doesn't
+// Workflows are NOT a supported kind because the CRM's public API doesn't
 // expose workflow internals — we cannot know which workflow references
 // a given tag / field / calendar. That's documented in catalog.ts.
 

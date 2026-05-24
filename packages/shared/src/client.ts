@@ -1,8 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { BRAND_NAME } from "./branding.js";
 
-const BASE_URL = "https://services.leadconnectorhq.com";
-const API_VERSION = "2021-07-28";
+const BASE_URL = process.env.TOPLINE_API_BASE_URL || "https://api.example.com";
+const API_VERSION = process.env.TOPLINE_API_VERSION || "2021-07-28";
 
 export interface RequestCredentials {
   pit: string;

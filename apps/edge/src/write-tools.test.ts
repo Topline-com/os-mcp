@@ -3,9 +3,9 @@
 // These tests prove each write tool stays registered and carries the
 // right request shape (method, path template, body construction).
 // They monkey-patch global fetch to intercept the outbound call and
-// assert what got sent — no live GHL needed.
+// assert what got sent — no the live CRM needed.
 //
-// What they don't test: whether GHL accepts the body. That's the job
+// What they don't test: whether the CRM accepts the body. That's the job
 // of the live-probe step + the smoke test against the test sub-account.
 // Here we only guard against refactors that accidentally change the
 // path, method, or body shape.
@@ -269,7 +269,7 @@ describe("registry wiring", () => {
 // Opportunities — compound-cursor pagination regression
 // ---------------------------------------------------------------------------
 //
-// GHL's /opportunities/search uses a COMPOUND cursor: both startAfter (ms
+// The CRM's /opportunities/search uses a COMPOUND cursor: both startAfter (ms
 // epoch) and startAfterId must be sent together on the next request, or the
 // API silently returns the same page. The MCP tool used to forward only
 // startAfterId, which pinned callers to page 1. These tests guard the fix.

@@ -86,7 +86,7 @@ export interface SyncState {
      */
     drain_started_at: string | null;
     /**
-     * Most recent upstream `total` GHL returned on a response that
+     * Most recent upstream `total` the CRM returned on a response that
      * carried one. NULL if we've never seen one. Compared against
      * row_count to detect stale backfill_complete states from older
      * broken-cursor runs and trigger a self-heal re-drain.
@@ -256,7 +256,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // drain_started_at was not re-observed, so the upstream deleted it.
     this.ensureSyncStateColumn("drain_started_at", "TEXT");
     // Upstream row total captured on the most recent response that
-    // carried one (GHL puts `total` at the top level on some endpoints).
+    // carried one (the CRM puts `total` at the top level on some endpoints).
     // The cron's drift-detection compares this against row_count to catch
     // stale `backfill_complete=1` states left by older broken cursor
     // code; when the gap exceeds ~10% the cron resets the complete flag
@@ -488,9 +488,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   /**
    * Upsert rows into an entity's table.
    *
-   * `rows` MUST already be keyed by column name (not the upstream GHL path).
+   * `rows` MUST already be keyed by column name (not the upstream path).
    * The sync worker handles the source_path → column_name mapping before
-   * calling this — it's not the DO's job to know GHL's JSON shape.
+   * calling this — it's not the DO's job to know the CRM's JSON shape.
    *
    * Columns not present on a row are written as NULL. Extra keys on a row
    * (not in the column schema) are silently ignored.
@@ -602,7 +602,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   /**
    * Advance the incremental watermark for an entity. The watermark is the
    * max cursor_column value (typically updated_at) the worker has seen for
-   * this entity — the next incremental poll uses it to filter GHL to only
+   * this entity — the next incremental poll uses it to filter the CRM to only
    * newly-updated rows.
    */
   async setSyncWatermark(entity: string, watermark: string): Promise<void> {
@@ -824,7 +824,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * upstream.
    *
    * Only safe for small parent tables (91 calendars is fine; 16k
-   * contacts would cost 16k GHL calls per full rotation). Opt-in
+   * contacts would cost 16k the CRM calls per full rotation). Opt-in
    * via per_parent.steady_state_sweep on the manifest; the sync
    * worker dispatches to this RPC only when that flag is set AND
    * the entity has completed its initial drain.
@@ -901,7 +901,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    *   1. `last_sync_at` is NOT advanced here. That timestamp means
    *      "the parent's most recent SUCCESSFUL drain completion" and
    *      is the gate getNextParentsForChild uses to detect staleness.
-   *      If a previously-complete parent gets re-visited and the GHL
+   *      If a previously-complete parent gets re-visited and the CRM
    *      fetch throws before we call markParentBackfillComplete,
    *      bumping last_sync_at mid-drain would leave the row looking
    *      like "just synced" while backfill_complete stayed 1 — and
@@ -942,7 +942,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   /**
    * Flip the parent's child sync to complete AND snapshot-and-swap
    * prune any children whose _synced_at predates the drain marker
-   * (i.e. rows present in this DO from a previous drain that GHL did
+   * (i.e. rows present in this DO from a previous drain that the CRM did
    * not return this time — upstream deleted them).
    *
    * For entities with a derived dual-write (messages → call_events),
@@ -1136,7 +1136,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         "SQLite dialect. No DATE_TRUNC — use strftime('%Y-%m-%d', col) for date truncation.",
         "Timestamps are ISO 8601 strings. Compare lexicographically or parse with strftime.",
         "JSON columns (e.g. contacts.tags, contacts.custom_fields, every table's raw_payload) — query with json_extract() and json_each().",
-        "Every table has a `raw_payload` TEXT/JSON column holding the full upstream GHL object — use json_extract(raw_payload, '$.meta.call.duration') etc. for fields that aren't surfaced as their own columns.",
+        "Every table has a `raw_payload` TEXT/JSON column holding the full upstream CRM object — use json_extract(raw_payload, '$.meta.call.duration') etc. for fields that aren't surfaced as their own columns.",
         "Derived views (email_events, sms_events, lead_response_metrics, contact_timeline, opportunity_funnel, pipeline_activity_window, pipeline_snapshot, pipeline_movement_window, warehouse_freshness) are READ-ONLY virtual tables — cheaper to query than re-deriving from base tables yourself. call_events is a typed synced table, not a view.",
         "Tenant isolation is physical; every row you see is already scoped to your sub-account.",
         "Counts are eventually consistent: the sync worker polls upstream every 15 min, and a small sampling gap (~0.03% on conversations) exists because the upstream cursor uses a single timestamp field with no tie-breaker. For questions sensitive to single-row exactness, prefer SUM/COUNT over ranges to smooth the variance.",
@@ -1268,7 +1268,7 @@ function quoteIdent(name: string): string {
  *     caller's intent without the column type as context)
  *   - anything else non-primitive: String()
  * The sync worker SHOULD pass clean values; this is defensive coercion so
- * a GHL payload shape change can't crash the upsert.
+ * a the CRM payload shape change can't crash the upsert.
  */
 function coerceForSqlite(col: ColumnDef, value: unknown): SqlStorageValue {
   if (value === null || value === undefined) return null;

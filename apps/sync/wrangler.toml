@@ -9,7 +9,7 @@ account_id = "9013139d3c5200efb4c73c5ecb36d8be"
 TOPLINE_BRAND_NAME = "Topline OS"
 
 # ConnectionDirectory — shared with the edge worker. Sync reads encrypted PITs
-# here when it needs to call GHL on a customer's behalf. Same KV namespace id.
+# here when it needs to call the CRM on a customer's behalf. Same KV namespace id.
 [[kv_namespaces]]
 binding = "CONNECTIONS"
 id = "f88571c17a4c47d4bf0a174d4c7dcb53"

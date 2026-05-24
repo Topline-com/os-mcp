@@ -8,7 +8,7 @@ import {
 import { BRAND_NAME, SERVER_INFO } from "@topline/shared";
 import { ACTION_TOOLS } from "./registry.js";
 
-// Stdio only exposes ACTION_TOOLS (GHL REST proxies). The analytics SQL
+// Stdio only exposes ACTION_TOOLS (the CRM REST proxies). The analytics SQL
 // surface needs the Cloudflare Worker's request context (LOCATION_DO
 // binding + edgeContext); it would register successfully in stdio but
 // every call would throw at runtime. Better to not advertise it at all.
