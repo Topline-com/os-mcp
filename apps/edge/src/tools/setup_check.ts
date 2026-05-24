@@ -90,6 +90,70 @@ const PROBES: Probe[] = [
       await toplineFetch(`/locations/${locationId}/tags`);
     },
   },
+  {
+    area: "custom_values",
+    scope: "locations/customValues.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/locations/${locationId}/customValues`);
+    },
+  },
+  {
+    area: "medias",
+    scope: "medias.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/medias/`, { query: { locationId, limit: 1 } });
+    },
+  },
+  // ---- Marketing OS surfaces (P1A–D) ----
+  {
+    area: "social_planner",
+    scope: "socialplanner/post.readonly + account.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/social-media-posting/${locationId}/accounts`);
+    },
+  },
+  {
+    area: "ad_publishing_facebook",
+    scope: "ad-publishing/facebook.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/ad-publishing/facebook/integration`, { query: { locationId } });
+    },
+  },
+  {
+    area: "ad_publishing_google",
+    scope: "ad-publishing/google.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/ad-publishing/google/integration`, { query: { locationId } });
+    },
+  },
+  {
+    area: "ad_publishing_linkedin",
+    scope: "ad-publishing/linkedin.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/ad-publishing/linkedin/integration`, { query: { locationId } });
+    },
+  },
+  {
+    area: "email_campaigns",
+    scope: "campaigns.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/campaigns/`, { query: { locationId, limit: 1 } });
+    },
+  },
+  {
+    area: "email_templates",
+    scope: "emails/builder.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/emails/builder`, { query: { locationId, limit: 1 } });
+    },
+  },
+  {
+    area: "agent_studio",
+    scope: "agent-studio.readonly",
+    run: async (locationId) => {
+      await toplineFetch(`/agent-studio/agent`, { query: { locationId } });
+    },
+  },
 ];
 
 async function runProbe(p: Probe, locationId: string): Promise<ProbeResult> {
@@ -130,7 +194,7 @@ function maskToken(token: string): string {
 export const tools: ToolDef[] = [
   {
     name: "topline_setup_check",
-    description: `End-to-end setup verification for ${BRAND_NAME} MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major scope (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, tags). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.`,
+    description: `End-to-end setup verification for ${BRAND_NAME} MCP. Confirms the Private Integration Token is valid, resolves the location, and probes every major CRM scope: core (contacts, conversations, opportunities, calendars, workflows, forms, surveys, users, custom fields, custom values, tags, medias) + marketing OS surfaces (social planner, ad publishing for Facebook / Google / LinkedIn, email campaigns + templates, agent studio). Returns a structured pass/fail report so you can guide the user to fix any missing scopes. Call this immediately after a client finishes setup.`,
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     handler: async () => {
       const brand = BRAND_NAME;
