@@ -144,7 +144,7 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   // access to this location' even though reads work. Update/delete
   // are fine (shipped).
   { name: "calendar_create", category: "Scheduling", description: "Creating new calendars.", status: "requires_oauth", notes: "Probed 2026-04-24: POST /calendars/ 403 'token does not have access to this location'. Update/delete ship as topline_update_calendar / topline_delete_calendar." },
-  { name: "campaigns", category: "Activity", description: "Legacy campaign definitions (pre-workflow).", status: "catalogued", endpoint: "/campaigns/" },
+  { name: "campaigns", category: "Activity", description: "Email campaigns (broadcasts / scheduled sends) and their stats/recipients. Exposed via topline_email_campaign, topline_email_campaign_stats, topline_email_campaign_recipients.", status: "exposed", endpoint: "/campaigns/", notes: "Live PIT smoke test pending — endpoint paths inferred from documentation conventions; validate after merge." },
   { name: "trigger_links", category: "Activity", description: "Trackable short links; click events feed attribution.", status: "catalogued" },
 
   // Marketing / content
@@ -157,7 +157,7 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   { name: "communities", category: "Content", description: "Community forums/groups feature.", status: "requires_oauth" },
 
   // Marketing ops
-  { name: "email_templates", category: "Marketing", description: "Saved email templates.", status: "catalogued", endpoint: "/emails/templates" },
+  { name: "email_templates", category: "Marketing", description: "Saved email templates. Exposed via topline_email_template (list/get/create/update/delete).", status: "exposed", endpoint: "/emails/builder", notes: "Live PIT smoke test pending — endpoint inferred (/emails/builder); validate after merge." },
   { name: "sms_templates", category: "Marketing", description: "Saved SMS templates.", status: "catalogued" },
   { name: "social_planner_posts", category: "Marketing", description: "Scheduled / published social posts. Exposed via topline_social_post (list/get/create/update/delete/bulk_delete) and topline_social_csv (bulk CSV imports).", status: "exposed", endpoint: "/social-media-posting/" },
   { name: "social_accounts", category: "Marketing", description: "Connected social media accounts per location. Exposed via topline_social_account (list/delete) and topline_social_oauth (connect flow).", status: "exposed", endpoint: "/social-media-posting/accounts" },
