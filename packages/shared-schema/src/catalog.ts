@@ -161,6 +161,10 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   // views.ts — they show up automatically in buildCatalog() via
   // ANALYTICS_VIEWS. Documenting them here for discoverability.
 
+  // Marketing operating system (Topline OS overlay)
+  { name: "marketing_config", category: "Marketing", description: "Per-tenant marketing config — channel taxonomy (allowed utm_source / utm_medium), attribution rules (qualified pipeline, closed-won stages, stage probabilities), spend classification rules, dashboard layout, Slack target. Stored as JSON in the _topline_marketing_config custom value. Managed via topline_get_marketing_config / topline_set_marketing_config / topline_init_attribution_fields.", status: "exposed" },
+  { name: "campaign_utm_registry", category: "Marketing", description: "Per-tenant registry mapping campaign slug → canonical UTM set, so the same campaign always emits consistent utm_source / utm_medium / utm_campaign / utm_id across Social Planner, Email Campaigns, and Ad Publishing. Stored as JSON in the _topline_campaign_utms custom value. Managed via topline_register_campaign_utm / topline_get_campaign_utm / topline_list_campaign_utms / topline_build_utm_url / topline_lint_utm.", status: "exposed" },
+
   // Marketing ops
   { name: "email_templates", category: "Marketing", description: "Saved email templates. Exposed via topline_email_template (list/get/create/update/delete).", status: "exposed", endpoint: "/emails/builder", notes: "Live PIT smoke test pending — endpoint inferred (/emails/builder); validate after merge." },
   { name: "sms_templates", category: "Marketing", description: "Saved SMS templates.", status: "catalogued" },
