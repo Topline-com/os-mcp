@@ -101,7 +101,12 @@ const PROBES: Probe[] = [
     area: "medias",
     scope: "medias.readonly",
     run: async (locationId) => {
-      await toplineFetch(`/medias/`, { query: { locationId, limit: 1 } });
+      // /medias/ doesn't exist as a direct list; the v2 surface is
+      // /medias/files?altType=location&altId=<loc>. Probed 2026-05-23:
+      // returns 200 with the files list under PIT auth.
+      await toplineFetch(`/medias/files`, {
+        query: { altType: "location", altId: locationId, limit: 1 },
+      });
     },
   },
   // ---- Marketing OS surfaces (P1A–D) ----
@@ -137,7 +142,10 @@ const PROBES: Probe[] = [
     area: "email_campaigns",
     scope: "campaigns.readonly",
     run: async (locationId) => {
-      await toplineFetch(`/campaigns/`, { query: { locationId, limit: 1 } });
+      // /campaigns/ rejects `limit` (422 "property limit should not exist").
+      // locationId alone is sufficient — the list is naturally paginated
+      // upstream. Probed 2026-05-23.
+      await toplineFetch(`/campaigns/`, { query: { locationId } });
     },
   },
   {
