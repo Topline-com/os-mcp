@@ -59,7 +59,7 @@ export interface ColumnDef {
   indexed?: boolean;
 
   /**
-   * Path inside the upstream GHL JSON payload. Dot-notation for nested.
+   * Path inside the upstream JSON payload. Dot-notation for nested.
    * Sync worker uses this to map API responses into rows. If omitted,
    * defaults to the column name.
    */
@@ -69,7 +69,7 @@ export interface ColumnDef {
    * How the upstream value represents a timestamp. Sync's mapRow
    * normalizes all variants to ISO 8601 strings before writing into
    * the DO so WHERE / ORDER BY / strftime(...) work consistently
-   * across every timestamp column, regardless of what GHL returned.
+   * across every timestamp column, regardless of what the CRM returned.
    *
    *   "iso8601"  — upstream is already an ISO string; passed through
    *   "ms_epoch" — upstream is a Unix millisecond epoch number
@@ -83,7 +83,7 @@ export interface ColumnDef {
   /**
    * When true, mapRow stores the ENTIRE upstream object (not a single
    * field) in this column. Combined with `json: true`, this gives us a
-   * lossless escape hatch: every row keeps its full GHL payload so the
+   * lossless escape hatch: every row keeps its full CRM payload so the
    * LLM can json_extract(raw_payload, '$.meta.call.duration') for
    * fields we haven't bothered to type yet. Zero schema migrations
    * required when a new demand surfaces — just query into raw_payload.
@@ -138,12 +138,12 @@ export interface CursorField {
 }
 
 export interface BackfillDescriptor {
-  /** API path relative to services.leadconnectorhq.com. */
+  /** API path relative to the configured CRM API base URL. */
   endpoint: string;
   method: "GET" | "POST";
   /**
    * Parameter name used to scope the request to a location.
-   * Defaults to "locationId" (camelCase, what most GHL v2 endpoints use).
+   * Defaults to "locationId" (camelCase, what most CRM v2 endpoints use).
    * Override to "location_id" for the snake_case stragglers like
    * /opportunities/search.
    */
@@ -151,9 +151,9 @@ export interface BackfillDescriptor {
   /**
    * Pagination strategy.
    *   cursor   — keyset pagination via a cursor field
-   *   page     — numeric page number (rare in GHL)
+   *   page     — numeric page number (rare in the CRM)
    *   none     — single-response endpoint, no pagination needed
-   *   unknown  — contract not yet probed against live GHL. Consumers
+   *   unknown  — contract not yet probed against the live CRM. Consumers
    *              (sync worker, audit runner) MUST refuse to operate on
    *              entities in this state. Used for entities we've declared
    *              but haven't verified a real list endpoint for.
@@ -163,7 +163,7 @@ export interface BackfillDescriptor {
   items_field?: string;
   /**
    * Structured cursor config. Required for entities with non-trivial
-   * pagination — GHL's cursor shapes vary wildly per endpoint:
+   * pagination — the CRM's cursor shapes vary wildly per endpoint:
    *
    *   contacts (POST /contacts/search)
    *     cursor lives on each contact as `searchAfter: [ts, id]`.
@@ -265,11 +265,11 @@ export interface IncrementalDescriptor {
   poll_interval_minutes: number;
   /**
    * Explicit flag that the filter contract has been verified against
-   * live GHL. Only when true will the sync worker run an incremental
+   * the live CRM. Only when true will the sync worker run an incremental
    * poll against this entity. When false, the entity stays synced via
    * periodic full backfills (triggered manually today, cron later).
    *
-   * GHL's filter grammar varies per-endpoint: /contacts/search uses
+   * the CRM's filter grammar varies per-endpoint: /contacts/search uses
    * a filters[] array with short operator codes (eq/gt/lte/contains/
    * range/etc.), while other endpoints take top-level query params.
    * This flag gates incremental sync until a maintainer has confirmed
@@ -280,8 +280,8 @@ export interface IncrementalDescriptor {
 }
 
 export interface WebhookEvent {
-  /** GHL event name as emitted by the platform, e.g. "ContactCreate". */
-  ghl_event: string;
+  /** Webhook event name as emitted by the platform, e.g. "ContactCreate". */
+  webhook_event: string;
   /** What this event implies for our stored row. */
   kind: "upsert" | "delete";
 }
@@ -298,7 +298,7 @@ export interface WebhookEvent {
 export interface AuditReport {
   /** Has the audit been run end-to-end against a live Topline sub-account? */
   live_tested: boolean;
-  /** GHL's `id` field is immutable across updates. */
+  /** the CRM's `id` field is immutable across updates. */
   stable_pk: boolean;
   /** A paginated endpoint exists that returns every record. */
   backfill_path: boolean;
@@ -315,7 +315,7 @@ export interface AuditReport {
    * Required for phase-1 hot tables. Optional (undefined = N/A) for warm/cool.
    */
   webhook_coverage?: boolean;
-  /** Free-form notes: known issues, GHL quirks, caveats. */
+  /** Free-form notes: known issues, CRM quirks, caveats. */
   notes?: string;
 }
 

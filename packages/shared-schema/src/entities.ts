@@ -65,7 +65,7 @@ const RAW_PAYLOAD: ColumnDef = {
   json: true,
   raw: true,
   description:
-    "Full upstream GHL JSON for this row. Use json_extract(raw_payload, '$.field') or json_each(raw_payload, '$.arr') for fields not yet surfaced as their own columns.",
+    "Full upstream CRM JSON for this row. Use json_extract(raw_payload, '$.field') or json_each(raw_payload, '$.arr') for fields not yet surfaced as their own columns.",
 };
 
 // ---------------------------------------------------------------------------
@@ -78,7 +78,7 @@ export const CONTACTS: EntityManifest = {
   phase: 1,
   primary_key: "id",
   columns: [
-    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable GHL contact ID." },
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable the CRM contact ID." },
     LOCATION_ID,
     { name: "first_name", sqlite_type: "TEXT", nullable: true, description: "", source_path: "firstName" },
     { name: "last_name", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lastName" },
@@ -107,7 +107,7 @@ export const CONTACTS: EntityManifest = {
     // Matches apps/edge/src/tools/contacts.ts `topline_search_contacts`:
     // POST /contacts/search with body.searchAfter = [ts, lastId].
     //
-    // GHL does NOT include a top-level cursor in the response. Instead
+    // the CRM does NOT include a top-level cursor in the response. Instead
     // the last contact in the `contacts[]` array carries a
     // `searchAfter: [ms_epoch, id]` tuple that we must send BACK in
     // the next body. Probed live 2026-04-24 on ucNDNXi… — only this
@@ -139,9 +139,9 @@ export const CONTACTS: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "ContactCreate", kind: "upsert" },
-    { ghl_event: "ContactUpdate", kind: "upsert" },
-    { ghl_event: "ContactDelete", kind: "delete" },
+    { webhook_event: "ContactCreate", kind: "upsert" },
+    { webhook_event: "ContactUpdate", kind: "upsert" },
+    { webhook_event: "ContactDelete", kind: "delete" },
   ],
   audit: {
     // Verified live on 2026-04-23 against ucNDNXi… sub-account:
@@ -167,7 +167,7 @@ export const OPPORTUNITIES: EntityManifest = {
   phase: 1,
   primary_key: "id",
   columns: [
-    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable GHL opportunity ID." },
+    { name: "id", sqlite_type: "TEXT", nullable: false, description: "Stable the CRM opportunity ID." },
     LOCATION_ID,
     { name: "name", sqlite_type: "TEXT", nullable: true, description: "Opportunity display name." },
     { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
@@ -180,7 +180,7 @@ export const OPPORTUNITIES: EntityManifest = {
     { name: "lost_reason_id", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lostReasonId" },
     { name: "last_status_change_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the last status change.", source_path: "lastStatusChangeAt", timestamp_format: "iso8601" },
     { name: "last_stage_change_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp of the last pipeline-stage change.", source_path: "lastStageChangeAt", timestamp_format: "iso8601" },
-    // GHL's /opportunities/search response uses camelCase createdAt / updatedAt
+    // the CRM's /opportunities/search response uses camelCase createdAt / updatedAt
     // (ISO strings) — NOT the dateAdded / dateUpdated convention contacts
     // uses. Overriding the shared CREATED_AT / UPDATED_AT constants here.
     { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the opportunity was created upstream.", source_path: "createdAt", timestamp_format: "iso8601" },
@@ -211,10 +211,10 @@ export const OPPORTUNITIES: EntityManifest = {
     query_extras: { limit: 100 },
   },
   incremental: {
-    // poll_full: GHL's /opportunities/search silently ignores every
+    // poll_full: the CRM's /opportunities/search silently ignores every
     // date-filter query param we probed (date_updated, dateUpdated,
     // dateAdded, startAfter=<epoch_ms>) — live-tested 2026-04-23 against
-    // ucNDNXi…. And PITs can't register webhooks in GHL v2 (probed the
+    // ucNDNXi…. And PITs can't register webhooks in the CRM v2 (probed the
     // /webhooks, /hooks, /locations/{id}/webhooks endpoints — all 404).
     // Every 15 min, re-pull; in steady-state the page loop walks only
     // until it hits a row whose cursor_column <= watermark (i.e. a row
@@ -226,9 +226,9 @@ export const OPPORTUNITIES: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "OpportunityCreate", kind: "upsert" },
-    { ghl_event: "OpportunityUpdate", kind: "upsert" },
-    { ghl_event: "OpportunityDelete", kind: "delete" },
+    { webhook_event: "OpportunityCreate", kind: "upsert" },
+    { webhook_event: "OpportunityUpdate", kind: "upsert" },
+    { webhook_event: "OpportunityDelete", kind: "delete" },
   ],
   audit: {
     // Verified live on 2026-04-24 against ucNDNXi… sub-account:
@@ -236,13 +236,13 @@ export const OPPORTUNITIES: EntityManifest = {
     //     startAfterId back on over-consumption (treated as EOF).
     //   - backfillPollFull walks every page within one cron invocation.
     //   - Upserts are idempotent on `id`; re-pulling costs only the
-    //     GHL API budget, never duplicate rows.
+    //     the CRM API budget, never duplicate rows.
     live_tested: true,
     stable_pk: true,
     backfill_path: true,
     incremental_path: true,
     update_cursor: false, // N/A for poll_full — requiredAuditChecks skips it
-    notes: "Uses poll_full because (a) no working date-filter query param on GHL's /opportunities/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
+    notes: "Uses poll_full because (a) no working date-filter query param on the CRM's /opportunities/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
   },
   exposed: true,
 };
@@ -264,7 +264,7 @@ export const CONVERSATIONS: EntityManifest = {
     { name: "last_message_type", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lastMessageType" },
     { name: "last_message_body", sqlite_type: "TEXT", nullable: true, description: "", source_path: "lastMessageBody" },
     { name: "last_message_date", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "lastMessageDate", timestamp_format: "ms_epoch" },
-    // GHL's /conversations/search returns dateAdded / dateUpdated as
+    // the CRM's /conversations/search returns dateAdded / dateUpdated as
     // Unix millisecond epoch NUMBERS, not ISO strings like contacts.
     // timestamp_format: ms_epoch tells sync's mapRow to normalize to ISO.
     { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 timestamp the conversation was created upstream.", source_path: "dateAdded", timestamp_format: "ms_epoch" },
@@ -298,7 +298,7 @@ export const CONVERSATIONS: EntityManifest = {
     //
     // KNOWN LIMITATION: /conversations/search's cursor is single-field
     // (lastMessageDate only). If two conversations share the same
-    // lastMessageDate at a page boundary, the cursor can skip one. GHL
+    // lastMessageDate at a page boundary, the cursor can skip one. the CRM
     // doesn't expose a documented tie-breaker (startAfterId is silently
     // accepted but doesn't split ties). In a 14k-conversation live test
     // this cost 4 rows (~0.03%). If exactness ever matters for a
@@ -310,8 +310,8 @@ export const CONVERSATIONS: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "ConversationCreate", kind: "upsert" },
-    { ghl_event: "ConversationUpdate", kind: "upsert" },
+    { webhook_event: "ConversationCreate", kind: "upsert" },
+    { webhook_event: "ConversationUpdate", kind: "upsert" },
   ],
   audit: {
     // Verified live on 2026-04-24 against ucNDNXi… sub-account.
@@ -322,7 +322,7 @@ export const CONVERSATIONS: EntityManifest = {
     backfill_path: true,
     incremental_path: true,
     update_cursor: false, // N/A for poll_full
-    notes: "Uses poll_full because (a) no working date-filter query param on GHL's /conversations/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
+    notes: "Uses poll_full because (a) no working date-filter query param on the CRM's /conversations/search, and (b) PITs can't register webhooks. Refreshes every 15 min via cron.",
   },
   exposed: true,
 };
@@ -337,7 +337,7 @@ export const MESSAGES: EntityManifest = {
     LOCATION_ID,
     { name: "conversation_id", sqlite_type: "TEXT", nullable: false, description: "", indexed: true, references: "conversations.id", source_path: "conversationId" },
     { name: "contact_id", sqlite_type: "TEXT", nullable: true, description: "", indexed: true, references: "contacts.id", source_path: "contactId" },
-    // GHL returns BOTH `type` (integer numeric code like 1/2/28) and
+    // the CRM returns BOTH `type` (integer numeric code like 1/2/28) and
     // `messageType` (semantic string like "TYPE_CALL"/"TYPE_SMS"/
     // "TYPE_LIVE_CHAT") on every message. Source the semantic string
     // so LLMs can write readable WHERE clauses without a code lookup.
@@ -349,7 +349,7 @@ export const MESSAGES: EntityManifest = {
     { name: "date_added", sqlite_type: "TEXT", nullable: true, description: "ISO 8601 when the message was recorded. Primary time axis — use this for 'first message' / 'last message' queries.", indexed: true, source_path: "dateAdded", timestamp_format: "iso8601" },
     { name: "user_id", sqlite_type: "TEXT", nullable: true, description: "Sub-account user who sent/handled the message (NULL for pure inbound without an owner).", indexed: true, source_path: "userId", references: "users.id" },
     // For TYPE_CALL / TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL
-    // messages GHL nests call-specific fields under `meta.call`. Duration
+    // messages the CRM nests call-specific fields under `meta.call`. Duration
     // in seconds is the key signal for distinguishing voicemails (usually
     // status = 'voicemail' or duration < ~5s) from real conversations.
     { name: "call_duration_seconds", sqlite_type: "INTEGER", nullable: true, description: "Call length in seconds. NULL for non-call messages. Use with type IN ('TYPE_CALL','TYPE_IVR_CALL') and direction='inbound' + duration<=5 to isolate voicemails / missed calls.", source_path: "meta.call.duration" },
@@ -357,9 +357,9 @@ export const MESSAGES: EntityManifest = {
     SYNCED_AT,
   ],
   backfill: {
-    // GHL's /conversations/{id}/messages wraps its response in a
+    // the CRM's /conversations/{id}/messages wraps its response in a
     // "messages" object, with the actual array and cursor nested one
-    // level deeper. Confirmed against live GHL:
+    // level deeper. Confirmed against the live CRM:
     //   { messages: { lastMessageId, nextPage, messages: [...] },
     //     traceId: "..." }
     endpoint: "/conversations/{parent}/messages",
@@ -379,7 +379,7 @@ export const MESSAGES: EntityManifest = {
     // register webhooks so this is the only path to <=15 min freshness.
     //
     // filter_ready: true — the "date filter" here is a DO-side query
-    // against conversations.last_message_date, not a GHL server-side
+    // against conversations.last_message_date, not a the CRM server-side
     // filter. It's been probed live (the conversations table is
     // self-polling via its own poll_full path, so its last_message_date
     // is always within ~15 min of upstream).
@@ -389,8 +389,8 @@ export const MESSAGES: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "InboundMessage", kind: "upsert" },
-    { ghl_event: "OutboundMessage", kind: "upsert" },
+    { webhook_event: "InboundMessage", kind: "upsert" },
+    { webhook_event: "OutboundMessage", kind: "upsert" },
   ],
   audit: {
     // Verified live on 2026-04-24 against ucNDNXi… sub-account:
@@ -414,8 +414,8 @@ export const MESSAGES: EntityManifest = {
  * CALL_EVENTS — a real synced table, NOT a view.
  *
  * The view version of this (views.ts, pre-merge) read json_extract
- * from messages.raw_payload and depended on GHL putting call data
- * consistently under `meta.call.duration`. In practice GHL's shape
+ * from messages.raw_payload and depended on the CRM putting call data
+ * consistently under `meta.call.duration`. In practice the CRM's shape
  * varies per message (some rows have `duration`, some `call.duration`,
  * some `meta.call.duration`, some `metadata.duration`). Extracting
  * once at sync time — with a multi-path normalizer — gets consistent
@@ -428,7 +428,7 @@ export const MESSAGES: EntityManifest = {
  */
 export const CALL_EVENTS: EntityManifest = {
   table: "call_events",
-  description: "Individual phone call events (inbound + outbound + IVR). One row per call message, with duration / status / voicemail flag normalized out of the varied GHL shapes. Use this for callback-time, voicemail-rate, per-rep call volume. Subset of messages — every call_event row has a matching messages row.",
+  description: "Individual phone call events (inbound + outbound + IVR). One row per call message, with duration / status / voicemail flag normalized out of the varied the CRM shapes. Use this for callback-time, voicemail-rate, per-rep call volume. Subset of messages — every call_event row has a matching messages row.",
   phase: 1,
   primary_key: "id",
   columns: [
@@ -473,8 +473,8 @@ export const CALL_EVENTS: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "InboundMessage", kind: "upsert" },
-    { ghl_event: "OutboundMessage", kind: "upsert" },
+    { webhook_event: "InboundMessage", kind: "upsert" },
+    { webhook_event: "OutboundMessage", kind: "upsert" },
   ],
   audit: {
     live_tested: true,
@@ -532,7 +532,7 @@ export const APPOINTMENTS: EntityManifest = {
       // appointments" (it bumps on calendar-definition edits only,
       // not on booking events). Without sweep, the default active-
       // parent selector would never re-visit any calendar after the
-      // first drain. 91 calendars × 1 GHL call per 15-min tick is
+      // first drain. 91 calendars × 1 CRM call per 15-min tick is
       // well under Cloudflare's 1000-subrequest cap.
       steady_state_sweep: true,
     },
@@ -551,9 +551,9 @@ export const APPOINTMENTS: EntityManifest = {
     filter_ready: true,
   },
   webhooks: [
-    { ghl_event: "AppointmentCreate", kind: "upsert" },
-    { ghl_event: "AppointmentUpdate", kind: "upsert" },
-    { ghl_event: "AppointmentDelete", kind: "delete" },
+    { webhook_event: "AppointmentCreate", kind: "upsert" },
+    { webhook_event: "AppointmentUpdate", kind: "upsert" },
+    { webhook_event: "AppointmentDelete", kind: "delete" },
   ],
   audit: {
     // Verified live 2026-04-24 against ucNDNXi… sub-account:
@@ -806,20 +806,20 @@ export const CALENDARS: EntityManifest = {
 /**
  * WORKFLOWS — shallow sync (id/name/status/version/timestamps).
  *
- * GHL's public API exposes only the list endpoint (GET /workflows/) and
+ * the CRM's public API exposes only the list endpoint (GET /workflows/) and
  * it returns this shape. There is NO GET /workflows/{id} with config
  * details in v2 public — triggers, actions, filters, branches are not
  * part of any public surface. Workflow authoring stays UI-only.
  *
  * This manifest exists so SQL can answer "how many active workflows"
- * and "list workflow names by status" without a GHL round-trip. It
+ * and "list workflow names by status" without a the CRM round-trip. It
  * does NOT enable reference extraction (cataloging which workflows
  * touch which tags/custom-fields/etc.) — that would require workflow
  * internals we cannot access.
  */
 export const WORKFLOWS: EntityManifest = {
   table: "workflows",
-  description: "Workflow definitions (id/name/status/version/timestamps). Shallow — internal config (triggers, actions, branches) is NOT accessible via GHL's public API; that would require a marketplace OAuth app.",
+  description: "Workflow definitions (id/name/status/version/timestamps). Shallow — internal config (triggers, actions, branches) is NOT accessible via the CRM's public API; that would require a marketplace OAuth app.",
   phase: 3,
   primary_key: "id",
   columns: [
@@ -846,7 +846,7 @@ export const WORKFLOWS: EntityManifest = {
     backfill_path: true,
     incremental_path: true,
     update_cursor: false,
-    notes: "Shallow-only. Workflow configs are NOT exposed by GHL's public v2 API under any auth type we can use (PIT or marketplace OAuth). Reference-extraction (which workflows touch which tag/field/calendar) is blocked upstream.",
+    notes: "Shallow-only. Workflow configs are NOT exposed by the CRM's public v2 API under any auth type we can use (PIT or marketplace OAuth). Reference-extraction (which workflows touch which tag/field/calendar) is blocked upstream.",
   },
   exposed: true,
 };
@@ -932,13 +932,13 @@ export const FORM_SUBMISSIONS: EntityManifest = {
     { name: "name", sqlite_type: "TEXT", nullable: true, description: "Submitter name as captured on the form." },
     { name: "email", sqlite_type: "TEXT", nullable: true, description: "Submitter email.", indexed: true },
     { name: "phone", sqlite_type: "TEXT", nullable: true, description: "Submitter phone." },
-    { name: "others", sqlite_type: "TEXT", nullable: true, json: true, description: "Full per-field JSON object GHL returns (includes the form's custom fields)." },
+    { name: "others", sqlite_type: "TEXT", nullable: true, json: true, description: "Full per-field JSON object the CRM returns (includes the form's custom fields)." },
     { name: "created_at", sqlite_type: "TEXT", nullable: true, description: "ISO 8601.", indexed: true, source_path: "createdAt", timestamp_format: "iso8601" },
     RAW_PAYLOAD,
     SYNCED_AT,
   ],
   backfill: {
-    // Location-scoped endpoint; GHL returns {submissions[], meta:{total,
+    // Location-scoped endpoint; the CRM returns {submissions[], meta:{total,
     // currentPage, nextPage, prevPage}}. Page-number pagination.
     endpoint: "/forms/submissions",
     method: "GET",

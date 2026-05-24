@@ -896,7 +896,7 @@ const ownerAuditTool: ToolDef = {
     const activityStatusPaw = statusClauseSql("paw.opportunity_status", status);
 
     // Automation filter: exclude messages where raw_payload.$.source is one
-    // of GHL's bulk/automation sources. Calls and appointments always count
+    // of the CRM's bulk/automation sources. Calls and appointments always count
     // as rep activity. NULL source is treated as rep (catches old inbound).
     const REP_TOUCH_FILTER = `(paw.activity_class != 'message' OR json_extract(m.raw_payload, '$.source') IS NULL OR json_extract(m.raw_payload, '$.source') NOT IN ('campaign', 'workflow'))`;
 

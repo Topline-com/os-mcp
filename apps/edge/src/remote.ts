@@ -450,8 +450,8 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   let { pit, locationId, cid } = resolved;
 
   // Raw-PIT bearers only (detected by the bearer starting with "pit-").
-  // Action tools tolerate raw PITs because GHL validates them upstream;
-  // analytics tools (SQL surface) never call GHL, so an unvalidated PIT
+  // Action tools tolerate raw PITs because the CRM validates them upstream;
+  // analytics tools (SQL surface) never call the CRM, so an unvalidated PIT
   // plus a caller-supplied location header is an auth bypass. Tracked
   // as a flag so dispatch can reject analytics calls for raw-PIT sessions.
   const rawPitBearer = bearer.startsWith("pit-");
@@ -538,7 +538,7 @@ async function dispatch(
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
         });
       }
-      // Analytics tools (the SQL surface) don't touch GHL and therefore
+      // Analytics tools (the SQL surface) don't touch the CRM and therefore
       // can't implicitly validate a raw-PIT bearer the way action tools
       // do. Block them under raw-PIT sessions — caller must upgrade to
       // an OAuth-issued cid token or a /connect-minted signed bearer.
@@ -644,8 +644,8 @@ async function authorizeQueryRequest(
   // The SQL surface requires a CONNECTION-BOUND bearer (cid token from
   // OAuth/connect, or the legacy signed { pit, locationId } token).
   // Raw PITs are NOT accepted here: the action-tool path validates raw
-  // PITs implicitly by forwarding them to GHL, but the SQL path never
-  // calls GHL — it just picks a LocationDO by caller-supplied
+  // PITs implicitly by forwarding them to the CRM, but the SQL path never
+  // calls the CRM — it just picks a LocationDO by caller-supplied
   // location_id. Without upstream validation, a raw "pit-" string plus
   // any location header would let the caller read whatever SQLite DB
   // they name. Reject at the door.

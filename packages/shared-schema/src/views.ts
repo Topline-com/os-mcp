@@ -36,7 +36,7 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "email_events",
     description:
-      "Every email message as one row, with delivery status pulled from the top-level columns. Open / click / bounce event streams live inside messages.raw_payload.meta when GHL records them — join through json_extract for those.",
+      "Every email message as one row, with delivery status pulled from the top-level columns. Open / click / bounce event streams live inside messages.raw_payload.meta when the CRM records them — join through json_extract for those.",
     base_tables: ["messages"],
     ddl: `
       CREATE VIEW email_events AS

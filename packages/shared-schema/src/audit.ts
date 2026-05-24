@@ -1,7 +1,7 @@
 // Source-audit framework.
 //
 // Scope today: TYPES only + a runner STUB. The actual live-audit
-// implementation (hit GHL endpoints, verify IDs, confirm cursor semantics
+// implementation (hit the CRM endpoints, verify IDs, confirm cursor semantics
 // end-to-end, etc.) ships when we have the sync worker to run it in.
 //
 // Why land types now? Because `EntityManifest.audit: AuditReport` is the
@@ -65,7 +65,7 @@ export function summarizeAuditByTable(table: string): AuditSummary | null {
 // --- Runner contract (implementation lives in apps/sync later) ---
 
 /**
- * The live audit runner signature. Implementations call GHL with a real PIT
+ * The live audit runner signature. Implementations call the CRM with a real PIT
  * + Location ID and verify each of the six checks end-to-end against a
  * non-empty sub-account. Returns a fresh AuditReport that the maintainer
  * pastes back into entities.ts.

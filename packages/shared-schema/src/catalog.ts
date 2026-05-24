@@ -1,4 +1,4 @@
-// GHL data-surface catalog.
+// the CRM data-surface catalog.
 //
 // The entity manifest (entities.ts) describes what we sync. The catalog
 // describes what EXISTS upstream — including objects we haven't built
@@ -9,10 +9,9 @@
 // sees the schema, doesn't see "messages", and assumes it doesn't
 // exist rather than asking whether it's hidden.
 //
-// Every row here is a factual claim about GHL v2. Keep it grounded in
-// live probing (services.leadconnectorhq.com/*) and the marketplace
-// docs (https://marketplace.gohighlevel.com/docs/). If you add an
-// entry, note the probe date and what the PIT-auth response was.
+// Every row here is a factual claim about the CRM v2 surface. Keep it
+// grounded in live PIT-auth probing and the CRM marketplace docs. If you
+// add an entry, note the probe date and what the PIT-auth response was.
 //
 // Status semantics:
 //   exposed          — in entities.ts, exposed=true, queryable via SQL
@@ -58,14 +57,14 @@ export interface CatalogEntry {
   description: string;
   /** Current status in our warehouse. Resolved from entities.ts where relevant. */
   status: CatalogStatus;
-  /** GHL v2 endpoint path (sans `/services.leadconnectorhq.com`). Null if unknown. */
+  /** CRM API v2 endpoint path. Null if unknown. */
   endpoint?: string;
   /** Notes: probe dates, known quirks, rationale for status. */
   notes?: string;
 }
 
 // ---------------------------------------------------------------------------
-// The catalog. One entry per GHL object we know exists. Status for
+// The catalog. One entry per CRM object we know exists. Status for
 // entries that have a manifest is computed dynamically in
 // buildCatalog() — hardcoded status here is for objects WITHOUT a
 // manifest (catalogued / requires_oauth / inaccessible / declined).
@@ -92,7 +91,7 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   // catalog entries are needed here — keeping them would shadow the
   // real "exposed" status with a stale "catalogued".
   { name: "call_recordings", category: "Communications", description: "Audio recording URLs + metadata per call message.", status: "catalogued", notes: "Already surfaced via call_events.recording_url when upstream populates it; no dedicated endpoint ships yet." },
-  { name: "call_transcripts", category: "Communications", description: "Text transcripts of call recordings (when available upstream).", status: "requires_oauth", notes: "GHL's Voice AI / transcription APIs are marketplace-scoped." },
+  { name: "call_transcripts", category: "Communications", description: "Text transcripts of call recordings (when available upstream).", status: "requires_oauth", notes: "the CRM's Voice AI / transcription APIs are marketplace-scoped." },
   { name: "chat_events", category: "Communications", description: "Live-chat widget events (session start, visitor typing, agent joined).", status: "declined", notes: "Low analytics value; skip unless a customer asks." },
 
   // Scheduling & lead capture
@@ -126,10 +125,10 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   { name: "tasks", category: "Activity", description: "Tasks attached to contacts (title, dueDate, completed).", status: "catalogued", endpoint: "/contacts/{contactId}/tasks" },
   { name: "notes", category: "Activity", description: "Free-form notes per contact.", status: "catalogued", endpoint: "/contacts/{contactId}/notes" },
   // workflows is synced as a shallow entity (id/name/status/version).
-  // Internals (triggers, actions, branches, filters) are NOT in GHL's
+  // Internals (triggers, actions, branches, filters) are NOT in the CRM's
   // public v2 API under any auth — not PIT, not marketplace OAuth at
   // the current docs level. Reference-extraction ("which workflows
-  // touch tag X") is blocked upstream until GHL opens the surface or
+  // touch tag X") is blocked upstream until the CRM opens the surface or
   // we build a scraping path via the admin UI (out of scope).
   { name: "workflow_internals", category: "Activity", description: "Workflow triggers, actions, branches, filters, and step configs.", status: "requires_oauth", notes: "Probed 2026-04-24: GET /workflows/ returns only {id, name, status, version, timestamps}. GET /workflows/{id} does not exist. POST/PUT/DELETE on /workflows/* 401 'not authorized for this scope' under PIT. Workflow authoring and inspection are UI-only today." },
   { name: "workflow_events", category: "Activity", description: "Per-contact workflow enrollment + step-execution history.", status: "requires_oauth", notes: "Detailed execution events are marketplace-scoped." },
@@ -167,7 +166,7 @@ const STATIC_ENTRIES: CatalogEntry[] = [
 
   // Platform
   { name: "media", category: "Platform", description: "Media library (images, videos, docs) uploaded to the sub-account.", status: "catalogued", endpoint: "/medias/" },
-  { name: "webhooks", category: "Platform", description: "Registered webhook subscriptions.", status: "requires_oauth", notes: "Probed 2026-04-24: /webhooks, /hooks, /locations/{id}/webhooks all 404 under PIT auth. Webhooks are marketplace-OAuth-only in GHL v2 — blocking webhook-based freshness for everything." },
+  { name: "webhooks", category: "Platform", description: "Registered webhook subscriptions.", status: "requires_oauth", notes: "Probed 2026-04-24: /webhooks, /hooks, /locations/{id}/webhooks all 404 under PIT auth. Webhooks are marketplace-OAuth-only in the CRM v2 — blocking webhook-based freshness for everything." },
   { name: "voice_ai_agents", category: "Platform", description: "Voice AI agent definitions (for inbound/outbound calling).", status: "requires_oauth" },
   { name: "conversation_ai_bots", category: "Platform", description: "Conversation AI bot definitions.", status: "requires_oauth" },
   { name: "affiliates", category: "Platform", description: "Affiliate program members.", status: "requires_oauth" },

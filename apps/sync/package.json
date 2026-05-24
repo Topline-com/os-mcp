@@ -1,7 +1,7 @@
 {
   "name": "@topline-ai/sync",
   "version": "0.1.0",
-  "description": "Topline OS sync worker — backfill + incremental sync from GHL into per-tenant LocationDO databases.",
+  "description": "Topline OS sync worker — backfill + incremental sync from the CRM into per-tenant LocationDO databases.",
   "private": true,
   "type": "module",
   "scripts": {

@@ -1,6 +1,6 @@
 // Tests for the sync worker's row mapper. The timestamp normalization
 // logic is the most important thing to lock down — it's how we paper
-// over GHL's per-endpoint inconsistency (some return ISO, some return
+// over the CRM's per-endpoint inconsistency (some return ISO, some return
 // ms epoch, some return epoch-as-string) so the downstream SQL layer
 // only ever sees ISO 8601.
 

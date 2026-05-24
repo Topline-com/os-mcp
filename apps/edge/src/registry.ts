@@ -3,7 +3,7 @@
 //
 // Tools are split into two categories:
 //
-//   ACTION_TOOLS   — proxy individual GHL API endpoints (contacts,
+//   ACTION_TOOLS   — proxy individual the CRM API endpoints (contacts,
 //                    opportunities, calendars, messages, etc). Available
 //                    in every runtime, including stdio. They depend only
 //                    on the shared toplineFetch client + credentialsContext.
@@ -40,7 +40,7 @@ import { tools as formTools } from "./tools/forms.js";
 import { tools as surveyTools } from "./tools/surveys.js";
 
 /**
- * Runtime-independent GHL action tools. Safe to run from stdio (local
+ * Runtime-independent the CRM action tools. Safe to run from stdio (local
  * Claude Desktop / Code install) because they only need the shared
  * HTTP client + credentialsContext.
  */
