@@ -39,6 +39,7 @@ import { tools as userTools } from "./tools/users.js";
 import { tools as formTools } from "./tools/forms.js";
 import { tools as surveyTools } from "./tools/surveys.js";
 import { tools as socialPlannerTools } from "./tools/social_planner.js";
+import { tools as agentStudioTools } from "./tools/agent_studio.js";
 
 /**
  * Runtime-independent the CRM action tools. Safe to run from stdio (local
@@ -64,6 +65,7 @@ export const ACTION_TOOLS: ToolDef[] = [
   ...formTools,
   ...surveyTools,
   ...socialPlannerTools,
+  ...agentStudioTools,
 ];
 
 /**
