@@ -156,6 +156,11 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   { name: "courses", category: "Content", description: "Membership / course offerings.", status: "requires_oauth" },
   { name: "communities", category: "Content", description: "Community forums/groups feature.", status: "requires_oauth" },
 
+  // Attribution analytics (P4)
+  // contact_attribution and opportunity_attribution are SQL views in
+  // views.ts — they show up automatically in buildCatalog() via
+  // ANALYTICS_VIEWS. Documenting them here for discoverability.
+
   // Marketing ops
   { name: "email_templates", category: "Marketing", description: "Saved email templates. Exposed via topline_email_template (list/get/create/update/delete).", status: "exposed", endpoint: "/emails/builder", notes: "Live PIT smoke test pending — endpoint inferred (/emails/builder); validate after merge." },
   { name: "sms_templates", category: "Marketing", description: "Saved SMS templates.", status: "catalogued" },
