@@ -46,6 +46,7 @@ import { tools as marketingConfigTools } from "./tools/marketing_config.js";
 import { tools as utmTools } from "./tools/utm.js";
 import { tools as spendTools } from "./tools/spend.js";
 import { tools as formSubmissionTools } from "./tools/form_submissions.js";
+import { tools as dashboardTools } from "./tools/dashboard.js";
 
 /**
  * Runtime-independent the CRM action tools. Safe to run from stdio (local
@@ -78,6 +79,7 @@ export const ACTION_TOOLS: ToolDef[] = [
   ...utmTools,
   ...spendTools,
   ...formSubmissionTools,
+  ...dashboardTools,
 ];
 
 /**
