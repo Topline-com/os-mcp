@@ -201,6 +201,112 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   },
 
   {
+    name: "contact_attribution",
+    description:
+      "One row per contact with channel attribution derived from contacts.source (placeholder) plus first/last-touch UTM values extracted from contacts.custom_fields when present. NOTE: the custom-field extraction uses json_each lookups by id; the homepage form integration must populate the 6 attribution custom fields (utm_source_first / utm_medium_first / utm_campaign_first / utm_source_last / utm_medium_last / utm_campaign_last) for this view to return real UTM data — see topline_init_attribution_fields. Until the form integration ships, channel falls back to contacts.source.",
+    base_tables: ["contacts"],
+    ddl: `
+      CREATE VIEW contact_attribution AS
+      SELECT
+        c.id AS contact_id,
+        c.location_id,
+        c.created_at,
+        c.source AS source_legacy,
+        -- First-touch / last-touch UTM extraction: looks for custom-field
+        -- entries by NAME. Name-based matching requires that the tenant
+        -- creates the custom fields with these exact names via
+        -- topline_init_attribution_fields. Until then these return NULL
+        -- and the view falls back to contacts.source.
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_source_first'
+          LIMIT 1) AS utm_source_first,
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_medium_first'
+          LIMIT 1) AS utm_medium_first,
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_campaign_first'
+          LIMIT 1) AS utm_campaign_first,
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_source_last'
+          LIMIT 1) AS utm_source_last,
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_medium_last'
+          LIMIT 1) AS utm_medium_last,
+        (SELECT json_extract(value, '$.value')
+           FROM json_each(c.custom_fields)
+          WHERE json_extract(value, '$.name') = 'utm_campaign_last'
+          LIMIT 1) AS utm_campaign_last,
+        -- Coalesced channel: prefer first-touch UTM source; fall back to
+        -- last-touch; finally fall back to legacy contacts.source.
+        COALESCE(
+          (SELECT json_extract(value, '$.value')
+             FROM json_each(c.custom_fields)
+            WHERE json_extract(value, '$.name') = 'utm_source_first'
+            LIMIT 1),
+          (SELECT json_extract(value, '$.value')
+             FROM json_each(c.custom_fields)
+            WHERE json_extract(value, '$.name') = 'utm_source_last'
+            LIMIT 1),
+          c.source,
+          'unknown'
+        ) AS channel_first_touch,
+        COALESCE(
+          (SELECT json_extract(value, '$.value')
+             FROM json_each(c.custom_fields)
+            WHERE json_extract(value, '$.name') = 'utm_source_last'
+            LIMIT 1),
+          (SELECT json_extract(value, '$.value')
+             FROM json_each(c.custom_fields)
+            WHERE json_extract(value, '$.name') = 'utm_source_first'
+            LIMIT 1),
+          c.source,
+          'unknown'
+        ) AS channel_last_touch
+      FROM contacts c
+    `,
+  },
+
+  {
+    name: "opportunity_attribution",
+    description:
+      "Opportunities enriched with the parent contact's channel attribution (first-touch + last-touch) and pipeline / stage names. Use for 'opportunities by channel by month', 'closed MRR by channel', 'CPQO by channel' (join to spend_transactions externally). The qualified-pipeline filter is NOT applied here — the consuming tool / dashboard applies it based on the tenant's marketing_config.attribution.qualified_pipeline_id_or_name.",
+    base_tables: ["opportunities", "contacts", "pipelines", "pipeline_stages"],
+    ddl: `
+      CREATE VIEW opportunity_attribution AS
+      SELECT
+        o.id AS opportunity_id,
+        o.location_id,
+        o.contact_id,
+        o.name,
+        o.status,
+        o.monetary_value,
+        o.assigned_to AS assigned_user_id,
+        o.created_at AS opp_created_at,
+        o.updated_at AS opp_updated_at,
+        o.last_status_change_at,
+        o.last_stage_change_at,
+        p.id AS pipeline_id,
+        p.name AS pipeline_name,
+        ps.id AS stage_id,
+        ps.name AS stage_name,
+        ca.channel_first_touch,
+        ca.channel_last_touch,
+        ca.utm_campaign_first,
+        ca.utm_campaign_last
+      FROM opportunities o
+      LEFT JOIN contacts c ON c.id = o.contact_id
+      LEFT JOIN contact_attribution ca ON ca.contact_id = o.contact_id
+      LEFT JOIN pipelines p ON p.id = o.pipeline_id
+      LEFT JOIN pipeline_stages ps ON ps.id = o.pipeline_stage_id
+    `,
+  },
+
+  {
     name: "opportunity_funnel",
     description:
       "Opportunities enriched with pipeline / stage names and the elapsed time in each status. Useful for 'which stage are deals stalling in', 'win-rate by pipeline', 'average days-to-close'.",
