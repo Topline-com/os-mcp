@@ -14,7 +14,7 @@ counterpart to `/Users/alexskatell/.claude/plans/does-my-mcp-include-lively-ligh
 | #11 | P1C | Email Campaigns tools (4 umbrella, paths best-effort) | — |
 | #12 | P1B | Ad Publishing — Facebook + Google + LinkedIn (24 umbrella) | — |
 | #13 | P2 | UTM standardization (8 tools) | — |
-| #14 | P3 | Spend ingestion scaffold (6 tools, Brex + QBO pluggable) | #13 |
+| #14 | P3 | Spend ingestion — sources spend from the CRM's ad-publishing reporting endpoints (Meta + Google + LinkedIn). 6 tools. | #13 |
 | #15 | P4 | Attribution SQL views (contact + opportunity) | — |
 | #16 | P6 | Form submission Slack notifier (3 tools) | #13 |
 | #17 | P5 | Marketing dashboard data tool (1 composite) | #13, #14 |
@@ -86,12 +86,10 @@ stdio installs need to pass it through the install snippet.
 ### Optional (per pillar)
 
 ```
-# P3 Spend
-TOPLINE_BREX_API_KEY=
-TOPLINE_QBO_REFRESH_TOKEN=
-TOPLINE_QBO_CLIENT_ID=
-TOPLINE_QBO_CLIENT_SECRET=
-TOPLINE_QBO_REALM_ID=
+# P3 Spend — no env vars required. Spend sources from the CRM's
+# ad-publishing reporting endpoints (Meta, Google, LinkedIn). Works
+# automatically when the network is connected in the CRM Integrations
+# UI and the PIT has the matching ad-publishing scope.
 
 # P6 Slack
 TOPLINE_SLACK_WEBHOOK_URL=
@@ -203,16 +201,14 @@ If any return 401/403, demote that network's catalog entry from `exposed` to
 
 ### After #14 (P3 Spend)
 
-With Brex configured:
+For the location with Meta + Google + LinkedIn connected in the CRM Integrations UI:
 
-- `topline_list_spend_providers` shows `brex: configured`.
-- `topline_list_spend_transactions since=2026-04-01 until=2026-05-01` returns Brex card transactions.
-- `topline_add_spend_classification_rule when='{ "merchant_regex": "Meta" }' classify_as=meta` succeeds.
-- `topline_get_channel_spend since=2026-04-01 until=2026-05-01` returns per-channel rollup with `meta` populated from the rule above.
+- `topline_list_spend_providers` shows `meta_ads`, `google_ads`, `linkedin_ads` all `configured: true`.
+- `topline_list_spend_transactions since=2026-04-01 until=2026-05-01` returns one row per campaign per network with `channel` pre-set to `meta` / `google` / `linkedin`.
+- `topline_get_channel_spend since=2026-04-01 until=2026-05-01` returns per-channel rollup with the three ad-network channels populated (any tenant `spend_rules` apply only to rows that arrive unclassified, e.g. future manual entries).
+- `topline_reconcile_spend provider_a=meta_ads provider_b=google_ads since=... until=...` returns the per-network delta (useful for sanity-checking against the platforms' UIs).
 
-With QBO configured:
-
-- `topline_reconcile_spend provider_a=brex provider_b=qbo since=... until=...` returns the delta.
+If a network returns no rows, double-check (a) the integration is connected in the CRM Integrations UI for this location, and (b) the PIT has the matching ad-publishing scope ticked.
 
 ### After #16 (P6 Form submissions)
 
@@ -232,4 +228,5 @@ With QBO configured:
 - **Homepage form UTM capture.** P4 attribution falls back to `contacts.source` until web pages set the six `utm_*_first/last` custom fields on form submission. Requires a small browser-side JS snippet, out of scope for these PRs.
 - **Worker-mode dashboard SQL execution.** P5's `topline_get_marketing_dashboard` returns SQL strings rather than running them, because the SQL surface needs the LocationDO context. A follow-up will fold the SQL execution into the dashboard tool when run in Worker mode.
 - **D1 persistence for spend.** P3 ships live-fetch only. A follow-up will sync spend transactions into a partitioned D1 table so historical data is queryable via `topline_execute_query`.
+- **Non-ad-network spend.** Software Advice invoices, marketplace fees, influencer pay, SaaS tools, etc. are not captured by the ad-publishing reporting endpoints. A future tool (e.g. `topline_add_manual_spend_entry`) can write these to the same shape; the classification engine in `classify.ts` is already wired to apply tenant `spend_rules` to any row that arrives without a pre-set channel.
 - **Live PIT probe-confirm for ad publishing.** Tools were exposed optimistically. Demote per-network catalog entries to `requires_oauth` if PIT auth fails post-merge.

@@ -1,6 +1,11 @@
 // Spend classification — apply the tenant's marketing_config.spend_rules
 // to a list of SpendTxn, producing ClassifiedSpendTxn (each row gets a
 // `channel` from the tenant's source taxonomy).
+//
+// Ad-network providers (meta_ads, google_ads, linkedin_ads) self-classify
+// by pre-setting SpendTxn.channel. This function passes through any
+// pre-classified row unchanged and only applies regex rules to rows
+// with no channel set (e.g. manual entries).
 
 import type { MarketingConfig } from "../../config/defaults.js";
 import type { SpendTxn, ClassifiedSpendTxn } from "./types.js";
@@ -11,6 +16,10 @@ export function classifyTransactions(
 ): ClassifiedSpendTxn[] {
   const rules = config.spend_rules ?? [];
   return txns.map((txn) => {
+    // Pre-classified by the provider (ad networks know their channel).
+    if (txn.channel) {
+      return { ...txn, channel: txn.channel };
+    }
     for (let i = 0; i < rules.length; i++) {
       const rule = rules[i];
       if (matches(rule.when, txn)) {

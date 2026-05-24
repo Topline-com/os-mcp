@@ -1,9 +1,14 @@
 // Spend tools — list / classify / rollup / reconcile spend transactions
-// across configured providers (Brex, QBO, ...).
+// across the CRM's connected ad networks (Meta, Google, LinkedIn).
 //
-// Storage: this PR ships the live-fetch path (call provider APIs on each
-// tool invocation). A future PR will add D1 persistence so historical
-// spend is queryable via topline_execute_query.
+// Spend sources come from /ad-publishing/<network>/reporting endpoints.
+// No third-party expense integration is wired up. Each ad-network
+// provider self-classifies by pre-setting SpendTxn.channel, so the
+// regex-based classification engine is reserved for any manual or
+// non-ad-network rows added in the future.
+//
+// Storage: live-fetch path only. A future enhancement could add D1
+// persistence so historical spend is queryable via topline_execute_query.
 
 import { obj, objLoose, str, num, arr, locationId } from "@topline/shared";
 import type { ToolDef } from "./types.js";
@@ -26,9 +31,12 @@ export const tools: ToolDef[] = [
   {
     name: "topline_list_spend_providers",
     description:
-      "List all spend providers compiled into the MCP, and which are configured (credentials present in env). " +
-      "Bundled providers: brex (TOPLINE_BREX_API_KEY), qbo (TOPLINE_QBO_REFRESH_TOKEN + " +
-      "TOPLINE_QBO_CLIENT_ID + TOPLINE_QBO_CLIENT_SECRET + TOPLINE_QBO_REALM_ID). " +
+      "List all spend providers compiled into the MCP. Spend is sourced from " +
+      "the CRM's ad-publishing reporting endpoints — no third-party expense " +
+      "integration is required. Bundled providers: meta_ads, google_ads, " +
+      "linkedin_ads. Each provider is `configured: true` as long as PIT auth " +
+      "is present; whether it actually returns spend depends on the network " +
+      "being connected in the CRM Integrations UI for this location. " +
       "Returns { providers: [{ name, configured }], configured_count }.",
     inputSchema: obj({}),
     handler: async () => {
@@ -50,7 +58,7 @@ export const tools: ToolDef[] = [
       {
         since: str("ISO date string (inclusive)."),
         until: str("ISO date string (exclusive)."),
-        provider: str("Filter to a single provider name (brex / qbo / ...). Omit to query all configured."),
+        provider: str("Filter to a single provider name (meta_ads / google_ads / linkedin_ads). Omit to query all configured."),
       },
       ["since", "until"],
     ),
@@ -175,14 +183,14 @@ export const tools: ToolDef[] = [
   {
     name: "topline_reconcile_spend",
     description:
-      "Reconcile totals across two providers for a date range — useful for cross-checking Brex against QBO. " +
+      "Reconcile totals across two providers for a date range — useful for cross-checking spend totals between ad networks or against an external source. " +
       "Returns per-channel totals from each provider plus delta and a list of transactions present in one but not the other (best-effort match by date + amount + merchant).",
     inputSchema: obj(
       {
         since: str("ISO date string (inclusive)."),
         until: str("ISO date string (exclusive)."),
-        provider_a: str("First provider name (e.g. 'brex')."),
-        provider_b: str("Second provider name (e.g. 'qbo')."),
+        provider_a: str("First provider name (e.g. 'meta_ads')."),
+        provider_b: str("Second provider name (e.g. 'google_ads')."),
         locationId,
       },
       ["since", "until", "provider_a", "provider_b"],

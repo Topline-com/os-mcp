@@ -479,14 +479,26 @@ export const tools: ToolDef[] = [
     name: "topline_fb_reporting",
     description:
       "Facebook ads reporting. Actions: " +
-      "`data` (aggregated metrics across campaigns / ad sets / ads — pass filters in `query`), " +
+      "`data` (aggregated metrics across campaigns / ad sets / ads — pass `level` + date range), " +
       "`campaign` (metrics for a specific campaign by `campaignId`), " +
-      "`list` (list campaigns / ad sets / ads with reporting data — pass filters in `query`).",
+      "`list` (list entities with their reporting data — pass `type` + `listType` + optional `fields`). " +
+      "ALL actions take `dateFrom` and `dateTo` as ISO date strings (YYYY-MM-DD). " +
+      "Common values for `level` / `type`: `account`, `campaign`, `adset`, `ad`. " +
+      "Common values for `listType`: `active`, `paused`, `all`. " +
+      "`fields` is a comma-separated list of metric column names (e.g. `spend,impressions,clicks,conversions`). " +
+      "If the endpoint rejects your values with 422, surface that to the operator — the valid enum set isn't stably published in CRM docs and can shift.",
     inputSchema: obj(
       {
         action: { type: "string", enum: FB_REPORTING_ACTIONS, description: "Which operation to perform." },
         campaignId: str("Campaign id — required for action='campaign'."),
-        query: objLoose({}, []),
+        dateFrom: str("ISO date string (YYYY-MM-DD). Inclusive."),
+        dateTo: str("ISO date string (YYYY-MM-DD). Inclusive."),
+        level: str("Aggregation level: 'account' | 'campaign' | 'adset' | 'ad'. Used by action='data'."),
+        type: str("Entity type for list: 'campaign' | 'adset' | 'ad'. Used by action='list'."),
+        listType: str("List filter: 'active' | 'paused' | 'all'. Used by action='list'."),
+        fields: str("Comma-separated metric columns (e.g. 'spend,impressions,clicks'). Used by action='list'."),
+        breakdown: str("Optional dimensional breakdown ('date', 'age', 'gender', 'device', etc.)."),
+        extra: objLoose({}, []),
         locationId,
       },
       ["action"],
@@ -496,8 +508,12 @@ export const tools: ToolDef[] = [
       const loc = getLocationId(args.locationId as string | undefined);
       const query: Record<string, string | number | boolean | undefined> = {
         locationId: loc,
-        ...((args.query as Record<string, string | number | boolean | undefined>) ?? {}),
+        ...((args.extra as Record<string, string | number | boolean | undefined>) ?? {}),
       };
+      for (const k of ["dateFrom", "dateTo", "level", "type", "listType", "fields", "breakdown"]) {
+        const v = (args as Record<string, unknown>)[k];
+        if (typeof v === "string" && v.length > 0) query[k] = v;
+      }
       switch (action) {
         case "data":
           return toplineFetch(`/ad-publishing/facebook/reporting`, { query });
@@ -731,14 +747,24 @@ export const tools: ToolDef[] = [
     name: "topline_google_reporting",
     description:
       "Google Ads reporting. Actions: " +
-      "`data` (aggregated metrics across campaigns — pass filters in `query`), " +
-      "`list` (list with reporting data), " +
-      "`campaign` (metrics for a specific campaign by `campaignId`).",
+      "`data` (aggregated metrics — pass `level` + date range), " +
+      "`list` (list entities with reporting data — pass `type` + `listType` + optional `fields`), " +
+      "`campaign` (metrics for a specific campaign by `campaignId`). " +
+      "ALL actions take `dateFrom` and `dateTo` as ISO date strings (YYYY-MM-DD). " +
+      "Common `level` / `type`: `account`, `campaign`, `ad_group`, `ad`. " +
+      "Google Ads reports cost in micros internally; this MCP forwards the CRM's normalized values.",
     inputSchema: obj(
       {
         action: { type: "string", enum: GOOGLE_REPORTING_ACTIONS, description: "Which operation to perform." },
         campaignId: str("Campaign id — required for action='campaign'."),
-        query: objLoose({}, []),
+        dateFrom: str("ISO date string (YYYY-MM-DD)."),
+        dateTo: str("ISO date string (YYYY-MM-DD)."),
+        level: str("Aggregation level: 'account' | 'campaign' | 'ad_group' | 'ad'."),
+        type: str("Entity type for list: 'campaign' | 'ad_group' | 'ad'."),
+        listType: str("List filter: 'active' | 'paused' | 'all'."),
+        fields: str("Comma-separated metric columns (e.g. 'cost,impressions,clicks')."),
+        breakdown: str("Optional dimensional breakdown."),
+        extra: objLoose({}, []),
         locationId,
       },
       ["action"],
@@ -748,8 +774,12 @@ export const tools: ToolDef[] = [
       const loc = getLocationId(args.locationId as string | undefined);
       const query: Record<string, string | number | boolean | undefined> = {
         locationId: loc,
-        ...((args.query as Record<string, string | number | boolean | undefined>) ?? {}),
+        ...((args.extra as Record<string, string | number | boolean | undefined>) ?? {}),
       };
+      for (const k of ["dateFrom", "dateTo", "level", "type", "listType", "fields", "breakdown"]) {
+        const v = (args as Record<string, unknown>)[k];
+        if (typeof v === "string" && v.length > 0) query[k] = v;
+      }
       switch (action) {
         case "data":
           return toplineFetch(`/ad-publishing/google/reporting`, { query });
@@ -932,14 +962,24 @@ export const tools: ToolDef[] = [
     name: "topline_linkedin_reporting",
     description:
       "LinkedIn Ads reporting. Actions: " +
-      "`data` (aggregated metrics across campaign groups / campaigns / ads), " +
-      "`list` (list with reporting data — pass filters in `query`), " +
-      "`campaign` (metrics for a specific campaign group by `campaignId`).",
+      "`data` (aggregated metrics — pass `level` + date range), " +
+      "`list` (list entities with reporting data — pass `type` + `listType` + optional `fields`), " +
+      "`campaign` (metrics for a specific campaign group by `campaignId`). " +
+      "ALL actions take `dateFrom` and `dateTo` as ISO date strings (YYYY-MM-DD). " +
+      "Common `level` / `type`: `account`, `campaign_group`, `campaign`, `ad`. " +
+      "LinkedIn's campaign-group is the equivalent of Meta's campaign — the top of the hierarchy.",
     inputSchema: obj(
       {
         action: { type: "string", enum: LI_REPORTING_ACTIONS, description: "Which operation to perform." },
         campaignId: str("Campaign id — required for action='campaign'."),
-        query: objLoose({}, []),
+        dateFrom: str("ISO date string (YYYY-MM-DD)."),
+        dateTo: str("ISO date string (YYYY-MM-DD)."),
+        level: str("Aggregation level: 'account' | 'campaign_group' | 'campaign' | 'ad'."),
+        type: str("Entity type for list: 'campaign_group' | 'campaign' | 'ad'."),
+        listType: str("List filter: 'active' | 'paused' | 'all'."),
+        fields: str("Comma-separated metric columns (e.g. 'spend,impressions,clicks')."),
+        breakdown: str("Optional dimensional breakdown."),
+        extra: objLoose({}, []),
         locationId,
       },
       ["action"],
@@ -949,8 +989,12 @@ export const tools: ToolDef[] = [
       const loc = getLocationId(args.locationId as string | undefined);
       const query: Record<string, string | number | boolean | undefined> = {
         locationId: loc,
-        ...((args.query as Record<string, string | number | boolean | undefined>) ?? {}),
+        ...((args.extra as Record<string, string | number | boolean | undefined>) ?? {}),
       };
+      for (const k of ["dateFrom", "dateTo", "level", "type", "listType", "fields", "breakdown"]) {
+        const v = (args as Record<string, unknown>)[k];
+        if (typeof v === "string" && v.length > 0) query[k] = v;
+      }
       switch (action) {
         case "data":
           return toplineFetch(`/ad-publishing/linkedin/reporting`, { query });
