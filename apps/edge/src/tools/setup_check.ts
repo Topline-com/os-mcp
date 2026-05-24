@@ -101,11 +101,12 @@ const PROBES: Probe[] = [
     area: "medias",
     scope: "medias.readonly",
     run: async (locationId) => {
-      // /medias/ doesn't exist as a direct list; the v2 surface is
-      // /medias/files?altType=location&altId=<loc>. Probed 2026-05-23:
-      // returns 200 with the files list under PIT auth.
+      // /medias/files requires altType + altId + a non-empty type filter
+      // (returns 422 "type must be a string; type should not be empty"
+      // without it). Probed 2026-05-23 — type=image is sufficient to
+      // verify scope access without listing every media type.
       await toplineFetch(`/medias/files`, {
-        query: { altType: "location", altId: locationId, limit: 1 },
+        query: { altType: "location", altId: locationId, type: "image", limit: 1 },
       });
     },
   },
