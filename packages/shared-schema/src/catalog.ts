@@ -159,8 +159,8 @@ const STATIC_ENTRIES: CatalogEntry[] = [
   // Marketing ops
   { name: "email_templates", category: "Marketing", description: "Saved email templates.", status: "catalogued", endpoint: "/emails/templates" },
   { name: "sms_templates", category: "Marketing", description: "Saved SMS templates.", status: "catalogued" },
-  { name: "social_planner_posts", category: "Marketing", description: "Scheduled / published social posts.", status: "catalogued", endpoint: "/social-media-posting/" },
-  { name: "social_accounts", category: "Marketing", description: "Connected social media accounts per location.", status: "catalogued", endpoint: "/social-media-posting/accounts" },
+  { name: "social_planner_posts", category: "Marketing", description: "Scheduled / published social posts. Exposed via topline_social_post (list/get/create/update/delete/bulk_delete) and topline_social_csv (bulk CSV imports).", status: "exposed", endpoint: "/social-media-posting/" },
+  { name: "social_accounts", category: "Marketing", description: "Connected social media accounts per location. Exposed via topline_social_account (list/delete) and topline_social_oauth (connect flow).", status: "exposed", endpoint: "/social-media-posting/accounts" },
   { name: "ad_accounts", category: "Marketing", description: "Connected Google Ads / Meta Ads accounts.", status: "requires_oauth" },
   { name: "ad_reports", category: "Marketing", description: "Ad-spend + performance attribution reports.", status: "requires_oauth" },
 
