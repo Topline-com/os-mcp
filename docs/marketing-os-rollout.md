@@ -29,17 +29,55 @@ counterpart to `/Users/alexskatell/.claude/plans/does-my-mcp-include-lively-ligh
 
 Each merge step expects the previous batch to be in `main` first.
 
+## ⚠️ Worker secrets — set these BEFORE merging #8
+
+The white-label scrub (#8) replaced the hardcoded API base URL with the
+`TOPLINE_API_BASE_URL` env var. The default in source is the placeholder
+`https://api.example.com`. If you merge #8 without setting the secret on
+each deployed Cloudflare Worker first, every API call 530s because the
+Worker hits the placeholder host.
+
+**On every Worker deployment** (`topline-os-mcp` edge worker AND
+`topline-os-sync` sync worker) — set the secret before the deploy
+triggered by #8 finishes:
+
+```bash
+# From apps/edge/
+printf 'https://services.leadconnectorhq.com' \
+  | npx wrangler secret put TOPLINE_API_BASE_URL
+
+# From apps/sync/
+printf 'https://services.leadconnectorhq.com' \
+  | npx wrangler secret put TOPLINE_API_BASE_URL
+```
+
+Cloudflare Workers hot-load secrets on the next request — no redeploy
+needed once they're set.
+
+Symptom if you skip this: `topline_setup_check` returns "Auth: ❌ HTTP 530"
+on the auth probe (NOT 401 — 401 would mean bad PIT; 530 means the
+upstream host is unreachable, which is what happens when the Worker
+fetches `https://api.example.com/...`).
+
+`ADMIN_TOKEN` and `TOKEN_SIGNING_SECRET` are already managed via this
+same `wrangler secret put` pattern. `TOPLINE_API_BASE_URL` is now the
+third secret each Worker needs.
+
 ## Per-tenant configuration (one-time per location)
 
 After the worker is deployed with these PRs landed:
 
-### Required env vars
+### Required env vars (per stdio install — `claude_desktop_config.json` / `claude mcp add`)
 
 ```
 TOPLINE_PIT=<<Private Integration Token>>
 TOPLINE_LOCATION_ID=<<Location ID>>
 TOPLINE_API_BASE_URL=<<API base URL from onboarding>>
 ```
+
+The Cloudflare-hosted remote Worker already has `TOPLINE_API_BASE_URL`
+baked in via the Wrangler secret (see "Worker secrets" above); only
+stdio installs need to pass it through the install snippet.
 
 ### Optional (per pillar)
 
@@ -54,6 +92,10 @@ TOPLINE_QBO_REALM_ID=
 # P6 Slack
 TOPLINE_SLACK_WEBHOOK_URL=
 ```
+
+Same as `TOPLINE_API_BASE_URL`: any of these the remote Worker needs to
+provide should be set via `wrangler secret put`. Stdio installs set them
+in the local install snippet's env block.
 
 ### Tenant config blob (`_topline_marketing_config`)
 
