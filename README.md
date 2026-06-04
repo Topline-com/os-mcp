@@ -9,6 +9,7 @@ Pick the client you use. Every path ends with `topline_setup_check` returning al
 | Claude.ai web / Team / Enterprise | OAuth (built in) | ~2 min | [docs/setup-claude-web.md](./docs/setup-claude-web.md) |
 | Claude Desktop / Code | local env vars | ~2 min | agent-driven below |
 | ChatGPT (Apps) | OAuth (select in dropdown) | ~2 min | [docs/setup-chatgpt.md](./docs/setup-chatgpt.md) |
+| ChatGPT Codex (CLI / IDE) | local env vars | ~2 min | [docs/setup-chatgpt-codex.md](./docs/setup-chatgpt-codex.md) |
 | Zapier / n8n / mcp-inspector / curl | Bearer token from `/connect` | ~2 min | [docs/setup-mcp-clients.md](./docs/setup-mcp-clients.md) |
 
 ---
