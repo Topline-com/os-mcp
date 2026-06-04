@@ -2,6 +2,8 @@
 
 Connect Topline OS to ChatGPT as a custom MCP App. ~2 minutes.
 
+> Looking for **ChatGPT Codex** (the CLI / IDE coding agent) instead of the chatgpt.com app? That's a local stdio install — see [setup-chatgpt-codex.md](./setup-chatgpt-codex.md).
+
 ## 1. Create a Private Integration in Topline OS
 
 - **Settings → Private Integrations → Create new integration**
