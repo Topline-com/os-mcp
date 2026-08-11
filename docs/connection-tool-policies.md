@@ -26,7 +26,11 @@ Remote MCP requests with a `cid` bearer check `ConnectionAuthDO` before the encr
 
 ## Update, cache, and revocation semantics
 
-A connection-bound bearer can manage its policy at `/connection/policy`. `GET` returns the current policy, client target, revision, selected count, stale IDs, and private-cache revision. `PUT` accepts an expected revision plus an `all`, preset, or custom selection and can change the client target. Existing access credentials remain valid; the new policy applies to the next stateless request.
+A connection-bound bearer can manage its policy at `/connection/policy`. `GET` returns the current policy, client target, revision, selected count, stale IDs, and private-cache revision. `PUT` accepts an expected revision plus an `all`, preset, or custom selection, but the bearer may only keep or narrow its current canonical tool set. It may add the stricter Copilot Studio target, but it cannot remove that target. Successful narrowing applies to the next stateless request and keeps the existing credential valid.
+
+Any tool addition, a change from an allowlist to `all`, or a change that removes the Copilot Studio constraint returns `403` with `error: "reauthorization_required"`. The authorization object, policy revision, and saved snapshot remain unchanged. Preset names, custom ordering, omitted target values, and stale expected revisions do not bypass this check. A stale revision returns `409` before the server evaluates the requested policy.
+
+Broadening requires a fresh `/authorize` or `/connect` credential authorization that creates a new `cid` and initializes its policy. The server does not accept a client hint, existing connection bearer, or implicit administrator credential as proof that broader access was approved.
 
 Tool-list caches are private to the authenticated connection and keyed operationally by `policy_version`. A cached list is never an authorization grant. If a client calls a tool from an old list after the policy narrows, `tools/call` resolves the current authorization snapshot and denies it. Clients that support list-change notifications can refresh sooner after the transport integration adds that signal, but enforcement does not depend on notification or cache behavior.
 

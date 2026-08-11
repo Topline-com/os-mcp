@@ -7,7 +7,10 @@ import {
   type ToolPresetId,
   type ToolSelection,
 } from "./tool-presets.js";
-import type { PersistedToolPolicy } from "./tool-policy.js";
+import {
+  assertPolicyUpdateCanUseBearer,
+  type PersistedToolPolicy,
+} from "./tool-policy.js";
 import type { ToolDef } from "./tools/types.js";
 
 export interface ToolSelectionPresetView {
@@ -36,9 +39,17 @@ export function compilePolicyUpdate(
   requestedTarget: ClientTarget | undefined,
   currentTarget: ClientTarget,
   registry: readonly ToolDef[],
+  currentPolicy: PersistedToolPolicy,
 ): { policy: PersistedToolPolicy; target: ClientTarget } {
   const policy = compileToolSelection(selection, registry);
   const target = requestedTarget ?? currentTarget;
+  assertPolicyUpdateCanUseBearer(
+    currentPolicy,
+    currentTarget,
+    policy,
+    target,
+    registry.map((tool) => tool.name),
+  );
   const count = policy.mode === "all" ? registry.length : policy.tool_ids.length;
   const compatibility = assessClientCompatibility(count, target);
   if (!compatibility.compatible) {

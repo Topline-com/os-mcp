@@ -10,6 +10,7 @@ import type {
   ConnectionAuthorizationSnapshot,
   PersistedToolPolicy,
 } from "./tool-policy.js";
+import { ALL_TOOLS } from "./registry.js";
 
 export interface ConnectionAuthDOEnv {}
 
@@ -65,7 +66,10 @@ export class ConnectionAuthDO extends DurableObject<ConnectionAuthDOEnv> {
         last_verified_at TEXT
       )
     `);
-    this.service = new ConnectionAuthorizationService(new SqlAuthorizationRepository(ctx));
+    this.service = new ConnectionAuthorizationService(
+      new SqlAuthorizationRepository(ctx),
+      ALL_TOOLS.map((tool) => tool.name),
+    );
   }
 
   async getOrBootstrap(

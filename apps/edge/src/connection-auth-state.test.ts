@@ -6,7 +6,11 @@ import {
   ConnectionAuthorizationStateError,
   type ConnectionAuthorizationRepository,
 } from "./connection-auth-state.js";
-import type { ConnectionAuthorizationSnapshot } from "./tool-policy.js";
+import type {
+  ConnectionAuthorizationSnapshot,
+  ConnectionClientTarget,
+  PersistedToolPolicy,
+} from "./tool-policy.js";
 
 class MemoryRepository implements ConnectionAuthorizationRepository {
   snapshot: ConnectionAuthorizationSnapshot | null = null;
@@ -21,11 +25,58 @@ class MemoryRepository implements ConnectionAuthorizationRepository {
 }
 
 const NOW = "2026-08-11T20:00:00.000Z";
+const CANONICAL_TOOL_IDS = ["topline_ping", "topline_hidden"];
 
 describe("connection authorization state", () => {
+  it("rejects bearer policy broadening without changing the snapshot", () => {
+    const repository = new MemoryRepository();
+    const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);
+    const initial = service.initialize(
+      "loc-a",
+      { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+      NOW,
+      "copilot_studio",
+    );
+    const before = structuredClone(repository.snapshot);
+
+    const broadeningUpdates: Array<{
+      policy: PersistedToolPolicy;
+      target?: ConnectionClientTarget;
+    }> = [
+      { policy: { version: 1, mode: "all" } },
+      {
+        policy: {
+          version: 1,
+          mode: "allow",
+          tool_ids: ["topline_ping", "topline_hidden"],
+        },
+      },
+      {
+        policy: { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+        target: "generic",
+      },
+    ];
+    for (const update of broadeningUpdates) {
+      throws(
+        () =>
+          service.updatePolicy(
+            "loc-a",
+            initial.policy_version,
+            update.policy,
+            undefined,
+            update.target,
+          ),
+        (error: unknown) =>
+          error instanceof ConnectionAuthorizationStateError &&
+          error.reason === "reauthorization_required",
+      );
+      deepStrictEqual(repository.snapshot, before);
+    }
+  });
+
   it("bootstraps an existing credential to active/all exactly once", () => {
     const repository = new MemoryRepository();
-    const service = new ConnectionAuthorizationService(repository);
+    const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);
 
     throws(
       () => service.getOrBootstrap("loc-a", false, NOW),
@@ -45,7 +96,7 @@ describe("connection authorization state", () => {
 
   it("serializes policy updates, tenant checks, touches, and revocation", () => {
     const repository = new MemoryRepository();
-    const service = new ConnectionAuthorizationService(repository);
+    const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);
     const initial = service.initialize(
       "loc-a",
       { version: 1, mode: "all" },
@@ -63,7 +114,7 @@ describe("connection authorization state", () => {
     const narrowed = service.updatePolicy(
       "loc-a",
       initial.policy_version,
-      { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+      { version: 1, mode: "allow", tool_ids: ["topline_ping", "topline_hidden"] },
       "2026-08-11T21:00:00.000Z",
     );
     strictEqual(narrowed.policy_version, 2);
@@ -75,9 +126,23 @@ describe("connection authorization state", () => {
         error instanceof ConnectionAuthorizationStateError && error.reason === "version_conflict",
     );
 
+    const reordered = service.updatePolicy(
+      "loc-a",
+      narrowed.policy_version,
+      { version: 1, mode: "allow", tool_ids: ["topline_hidden", "topline_ping"] },
+      "2026-08-11T21:15:00.000Z",
+    );
+    const strictSubset = service.updatePolicy(
+      "loc-a",
+      reordered.policy_version,
+      { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+      "2026-08-11T21:30:00.000Z",
+    );
+    strictEqual(strictSubset.policy_version, 4);
+
     const touched = service.touch("loc-a", "2026-08-11T22:00:00.000Z");
-    deepStrictEqual(touched.policy, narrowed.policy);
-    strictEqual(touched.policy_version, narrowed.policy_version);
+    deepStrictEqual(touched.policy, strictSubset.policy);
+    strictEqual(touched.policy_version, strictSubset.policy_version);
 
     const revoked = service.revoke("loc-a", touched.policy_version, "2026-08-11T23:00:00.000Z");
     strictEqual(revoked.status, "revoked");
@@ -89,5 +154,26 @@ describe("connection authorization state", () => {
     const retryable = service.getForManagement("loc-a", true);
     strictEqual(retryable.status, "revoked");
     deepStrictEqual(service.revoke("loc-a", retryable.policy_version), retryable);
+  });
+
+  it("fails closed on corrupt persisted state", () => {
+    const repository = new MemoryRepository();
+    repository.snapshot = {
+      schema_version: 1,
+      status: "active",
+      location_id: "loc-a",
+      client_target: "generic",
+      policy: { version: 1, mode: "allow", tool_ids: [""] },
+      policy_version: 1,
+      created_at: NOW,
+      updated_at: NOW,
+    };
+    const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);
+
+    throws(
+      () => service.getForManagement("loc-a", true),
+      (error: unknown) =>
+        error instanceof ConnectionAuthorizationStateError && error.reason === "corrupt_state",
+    );
   });
 });

@@ -1,7 +1,9 @@
-import type {
-  ConnectionClientTarget,
-  ConnectionAuthorizationSnapshot,
-  PersistedToolPolicy,
+import {
+  PolicyReauthorizationRequiredError,
+  assertPolicyUpdateCanUseBearer,
+  type ConnectionClientTarget,
+  type ConnectionAuthorizationSnapshot,
+  type PersistedToolPolicy,
 } from "./tool-policy.js";
 
 export interface ConnectionAuthorizationRepository {
@@ -16,6 +18,7 @@ export class ConnectionAuthorizationStateError extends Error {
     | "version_conflict"
     | "revoked_connection"
     | "already_initialized"
+    | "reauthorization_required"
     | "corrupt_state";
 
   constructor(reason: ConnectionAuthorizationStateError["reason"]) {
@@ -26,7 +29,10 @@ export class ConnectionAuthorizationStateError extends Error {
 }
 
 export class ConnectionAuthorizationService {
-  constructor(private readonly repository: ConnectionAuthorizationRepository) {}
+  constructor(
+    private readonly repository: ConnectionAuthorizationRepository,
+    private readonly canonicalToolIds: readonly string[],
+  ) {}
 
   getOrBootstrap(
     locationId: string,
@@ -107,9 +113,24 @@ export class ConnectionAuthorizationService {
       throw new ConnectionAuthorizationStateError("version_conflict");
     }
     assertPolicy(policy);
+    const nextTarget = requireClientTarget(clientTarget ?? current.client_target ?? "generic");
+    try {
+      assertPolicyUpdateCanUseBearer(
+        current.policy,
+        current.client_target ?? "generic",
+        policy,
+        nextTarget,
+        this.canonicalToolIds,
+      );
+    } catch (error) {
+      if (error instanceof PolicyReauthorizationRequiredError) {
+        throw new ConnectionAuthorizationStateError("reauthorization_required");
+      }
+      throw error;
+    }
     const updated: ConnectionAuthorizationSnapshot = {
       ...current,
-      client_target: requireClientTarget(clientTarget ?? current.client_target ?? "generic"),
+      client_target: nextTarget,
       policy: structuredClone(policy),
       policy_version: current.policy_version + 1,
       updated_at: now,

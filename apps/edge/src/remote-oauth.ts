@@ -114,14 +114,14 @@ function toolSelectionControlsHtml(view: ToolSelectionView): string {
       ${options}
       <option value="custom" data-count="0">Custom selection</option>
     </select>
-    <p id="toolPolicyDescription" style="font-size:13px;margin:8px 0 0">The server advertises and accepts only the selected tools. Changing the policy affects the next request; cached hidden calls are still denied.</p>
+    <p id="toolPolicyDescription" style="font-size:13px;margin:8px 0 0">The server advertises and accepts only the selected tools. A connection bearer can keep or reduce this set. Adding tools later requires a new authorization.</p>
     <div id="customTools" hidden style="max-height:220px;overflow:auto;border:1px solid #999;padding:8px 12px;margin-top:8px">${customTools}</div>
     <label for="targetClient">Client compatibility</label>
     <select id="targetClient" name="targetClient" style="width:100%;box-sizing:border-box;padding:10px 12px;margin-top:6px">
       <option value="generic">Generic MCP client</option>
       <option value="copilot_studio">Microsoft Copilot Studio</option>
     </select>
-    <p style="font-size:12px;color:#555;margin:6px 0 0">The target is saved with this connection. A Copilot Studio all-tools policy fails closed if future catalog growth would exceed 128 tools.</p>
+    <p style="font-size:12px;color:#555;margin:6px 0 0">The target is saved with this connection. Removing a Copilot Studio target requires a new authorization. A Copilot Studio all-tools policy fails closed if future catalog growth would exceed 128 tools.</p>
     <p id="toolCount" style="font-size:13px;margin:8px 0 0"></p>
     <p id="toolWarning" role="alert" style="font-size:13px;margin:8px 0 0;color:#8a5600;font-weight:600"></p>
     <details style="margin-top:8px"><summary>Review selected tool IDs</summary><pre id="selectedTools" style="white-space:pre-wrap;font-size:11px;max-height:180px;overflow:auto"></pre></details>

@@ -3,7 +3,9 @@ import { deepStrictEqual, ok, strictEqual, throws } from "node:assert";
 
 import { ALL_TOOLS } from "./registry.js";
 import {
+  PolicyReauthorizationRequiredError,
   ToolPolicyError,
+  assertPolicyUpdateCanUseBearer,
   resolveToolPolicy,
   type ConnectionAuthorizationSnapshot,
 } from "./tool-policy.js";
@@ -14,6 +16,22 @@ import {
 } from "./tool-presets.js";
 
 describe("connection-scoped tool policy", () => {
+  it("requires reauthorization when a limited bearer requests all tools", () => {
+    throws(
+      () =>
+        assertPolicyUpdateCanUseBearer(
+          { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+          "generic",
+          { version: 1, mode: "all" },
+          "generic",
+          ALL_TOOLS.map((tool) => tool.name),
+        ),
+      (error: unknown) =>
+        error instanceof PolicyReauthorizationRequiredError &&
+        error.reason === "reauthorization_required",
+    );
+  });
+
   it("treats a missing policy as the explicit legacy all-tools default", () => {
     const resolved = resolveToolPolicy(null, ALL_TOOLS);
 

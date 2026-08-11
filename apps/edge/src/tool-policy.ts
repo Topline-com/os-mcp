@@ -48,6 +48,41 @@ export class ToolPolicyError extends Error {
   }
 }
 
+export class PolicyReauthorizationRequiredError extends Error {
+  readonly reason = "reauthorization_required" as const;
+
+  constructor() {
+    super("Broadening tool access requires a new authorization.");
+    this.name = "PolicyReauthorizationRequiredError";
+  }
+}
+
+export function assertPolicyUpdateCanUseBearer(
+  currentPolicy: PersistedToolPolicy,
+  currentTarget: ConnectionClientTarget,
+  requestedPolicy: PersistedToolPolicy,
+  requestedTarget: ConnectionClientTarget,
+  canonicalToolIds: readonly string[],
+): void {
+  if (currentTarget === "copilot_studio" && requestedTarget !== "copilot_studio") {
+    throw new PolicyReauthorizationRequiredError();
+  }
+  if (requestedPolicy.mode === "all") {
+    if (currentPolicy.mode !== "all") {
+      throw new PolicyReauthorizationRequiredError();
+    }
+    return;
+  }
+
+  const currentIds =
+    currentPolicy.mode === "all"
+      ? new Set(canonicalToolIds)
+      : new Set(currentPolicy.tool_ids);
+  if (requestedPolicy.tool_ids.some((id) => !currentIds.has(id))) {
+    throw new PolicyReauthorizationRequiredError();
+  }
+}
+
 export function resolveToolPolicy(
   snapshot: ConnectionAuthorizationSnapshot | null,
   registry: readonly ToolDef[],

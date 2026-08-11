@@ -3,6 +3,7 @@ import { deepStrictEqual, match, strictEqual, throws } from "node:assert";
 
 import { ALL_TOOLS } from "./registry.js";
 import { authorizeFormHtml } from "./remote-oauth.js";
+import { PolicyReauthorizationRequiredError } from "./tool-policy.js";
 import {
   buildToolSelectionView,
   compilePolicyUpdate,
@@ -10,6 +11,20 @@ import {
 } from "./tool-selection-view.js";
 
 describe("connection tool-selection UX", () => {
+  it("classifies bearer attempts to add a hidden tool as reauthorization-required", () => {
+    throws(
+      () =>
+        compilePolicyUpdate(
+          { kind: "custom", tool_ids: ["topline_ping", "topline_get_contact"] },
+          "generic",
+          "generic",
+          ALL_TOOLS,
+          { version: 1, mode: "allow", tool_ids: ["topline_ping"] },
+        ),
+      (error: unknown) => error instanceof PolicyReauthorizationRequiredError,
+    );
+  });
+
   it("shows every preset, exact selected counts, consequences, and custom selection", () => {
     const view = buildToolSelectionView(ALL_TOOLS);
     const html = authorizeFormHtml({
@@ -26,6 +41,7 @@ describe("connection tool-selection UX", () => {
     strictEqual(view.presets.find((preset) => preset.id === "all")?.count, ALL_TOOLS.length);
     match(html, /Tools this connection can use/);
     match(html, /The server advertises and accepts only the selected tools/);
+    match(html, /Adding tools later requires a new authorization/);
     match(html, /Custom selection/);
     match(html, /Review selected tool IDs/);
     match(html, /Copilot Studio supports at most 128 tools/);
@@ -56,11 +72,24 @@ describe("connection tool-selection UX", () => {
     }));
 
     throws(
-      () => compilePolicyUpdate({ kind: "all" }, undefined, "copilot_studio", registry),
+      () =>
+        compilePolicyUpdate(
+          { kind: "all" },
+          undefined,
+          "copilot_studio",
+          registry,
+          { version: 1, mode: "all" },
+        ),
       /at most 128 tools/,
     );
     strictEqual(
-      compilePolicyUpdate({ kind: "all" }, undefined, "generic", registry).target,
+      compilePolicyUpdate(
+        { kind: "all" },
+        undefined,
+        "generic",
+        registry,
+        { version: 1, mode: "all" },
+      ).target,
       "generic",
     );
   });

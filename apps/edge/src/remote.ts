@@ -56,6 +56,7 @@ import {
   type QueryApiOperation,
 } from "./query-api-access.js";
 import {
+  PolicyReauthorizationRequiredError,
   ToolPolicyError,
   type ConnectionAuthorizationSnapshot,
   type PersistedToolPolicy,
@@ -525,6 +526,9 @@ async function handleConnectionPolicy(request: Request, env: Env): Promise<Respo
   }
 
   if (request.method === "PUT") {
+    if (active.authorization.policy_version !== body.expected_policy_version) {
+      return json(409, { error: "Policy changed or connection is unavailable. Refresh and retry." });
+    }
     let policy;
     let target;
     try {
@@ -533,8 +537,15 @@ async function handleConnectionPolicy(request: Request, env: Env): Promise<Respo
         body.target_client,
         active.authorization.client_target ?? "generic",
         ALL_TOOLS,
+        active.authorization.policy,
       ));
     } catch (error) {
+      if (error instanceof PolicyReauthorizationRequiredError) {
+        return json(403, {
+          error: "reauthorization_required",
+          message: "Broadening tool access requires a new authorization.",
+        });
+      }
       return json(400, {
         error: error instanceof Error ? error.message : "Choose a valid tool set.",
       });
