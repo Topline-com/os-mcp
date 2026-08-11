@@ -1,5 +1,5 @@
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { BRAND_NAME, SERVER_INFO } from "@topline/shared";
+import { BRAND_NAME, safeErrorFields, safeLog, SERVER_INFO } from "@topline/shared";
 import { ACTION_TOOLS } from "./registry.js";
 import { buildMcpServer } from "./mcp-server.js";
 
@@ -12,7 +12,7 @@ serveStdio(
   {
     legacy: "serve",
     onerror(error) {
-      console.error(`${BRAND_NAME} MCP transport error:`, error);
+      safeLog("error", "stdio_transport_error", { error: safeErrorFields(error) });
     },
   },
 );

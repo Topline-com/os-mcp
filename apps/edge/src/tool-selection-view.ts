@@ -79,7 +79,7 @@ export function buildToolSelectionView(registry: readonly ToolDef[]): ToolSelect
 }
 
 export function parseToolSelectionForm(
-  form: FormData,
+  form: Pick<FormData, "get" | "getAll">,
   registry: readonly ToolDef[],
 ): ParsedToolSelection {
   const preset = String(form.get("toolPreset") ?? "read_only_crm");

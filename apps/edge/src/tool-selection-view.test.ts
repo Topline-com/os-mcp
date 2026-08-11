@@ -29,11 +29,8 @@ describe("connection tool-selection UX", () => {
     const view = buildToolSelectionView(ALL_TOOLS);
     const html = authorizeFormHtml({
       brand: "Topline OS",
-      redirect_uri: "https://client.example/callback",
-      code_challenge: "challenge",
-      code_challenge_method: "S256",
-      state: "state",
-      client_id: "client",
+      continuation: "opaque-continuation",
+      csrf: "opaque-csrf",
       toolSelection: view,
     });
 

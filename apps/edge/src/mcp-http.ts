@@ -25,6 +25,10 @@ const MCP_EXPOSE_HEADERS = [
   "Mcp-Name",
 ] as const;
 
+export interface McpHttpOptions {
+  allowedOrigins?: ReadonlySet<string>;
+}
+
 function rejectedOriginResponse(): Response {
   return Response.json(
     {
@@ -93,13 +97,15 @@ function mcpPreflightResponse(request: Request, origin?: string): Response {
 export async function handleMcpHttpRequest(
   request: Request,
   dispatch: () => Promise<Response>,
+  options: McpHttpOptions = {},
 ): Promise<Response> {
   // Compare the normalized header value to exact serialized origins. Parsing
   // as a URL would accept paths, userinfo, alternate IP forms, and other
   // values that are not valid serialized Origin tuples.
   const hasOrigin = request.headers.has("Origin");
   const origin = request.headers.get("Origin") ?? "";
-  if (hasOrigin && !MCP_ALLOWED_ORIGINS.has(origin)) {
+  const allowedOrigins = options.allowedOrigins ?? MCP_ALLOWED_ORIGINS;
+  if (hasOrigin && !allowedOrigins.has(origin)) {
     return varyByOrigin(rejectedOriginResponse());
   }
   const validatedOrigin = hasOrigin ? origin : undefined;

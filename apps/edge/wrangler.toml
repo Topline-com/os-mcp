@@ -1,7 +1,7 @@
 name = "topline-os-mcp"
 main = "src/remote.ts"
 compatibility_date = "2025-04-01"
-compatibility_flags = ["nodejs_compat"]
+compatibility_flags = ["nodejs_compat", "global_fetch_strictly_public"]
 account_id = "9013139d3c5200efb4c73c5ecb36d8be"
 
 # Custom domain binding. Cloudflare auto-provisions TLS. Requires
@@ -14,6 +14,7 @@ routes = [
 # if you're reselling under a different label.
 [vars]
 TOPLINE_BRAND_NAME = "Topline OS"
+MCP_ALLOWED_ORIGINS = "https://claude.ai,https://chatgpt.com,https://chat.openai.com,https://platform.openai.com,https://os-mcp.topline.com,http://localhost:6274,http://127.0.0.1:6274,http://[::1]:6274,http://localhost:8787,http://127.0.0.1:8787,http://[::1]:8787"
 
 # TOKEN_SIGNING_SECRET is set out-of-band — NEVER commit it:
 #   wrangler secret put TOKEN_SIGNING_SECRET
@@ -25,6 +26,15 @@ TOPLINE_BRAND_NAME = "Topline OS"
 [[kv_namespaces]]
 binding = "CONNECTIONS"
 id = "f88571c17a4c47d4bf0a174d4c7dcb53"
+
+# OAuth provider records use a separate namespace so open DCR and provider
+# lifecycle scans cannot pollute or starve scheduled connection scans.
+# Deployment gate: replace the sentinel below with a newly provisioned,
+# dedicated OAuth namespace ID after explicit infrastructure approval.
+# Never point OAUTH_KV at CONNECTIONS or an unrelated shared namespace.
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "00000000000000000000000000000000"
 
 # LocationDO — per-tenant Durable Object backed by SQLite. Owns the synced
 # data warehouse for one location_id. Class ships from packages/shared-do
@@ -38,6 +48,10 @@ class_name = "LocationDO"
 [[durable_objects.bindings]]
 name = "CONNECTION_AUTH_DO"
 class_name = "ConnectionAuthDO"
+
+[[durable_objects.bindings]]
+name = "OAUTH_FLOW_DO"
+class_name = "OAuthFlowDO"
 
 # Service binding to the sync worker. Used for fire-and-forget kickoff
 # calls when a new connection is created: the edge handler calls
@@ -56,7 +70,10 @@ service = "topline-os-sync"
 tag = "v1"
 new_sqlite_classes = ["LocationDO"]
 
-# v2 is reserved by the OAuth flow-state implementation lane.
+[[migrations]]
+tag = "v2"
+new_classes = ["OAuthFlowDO"]
+
 [[migrations]]
 tag = "v3"
 new_sqlite_classes = ["ConnectionAuthDO"]

@@ -113,6 +113,23 @@ for (const origin of ALLOWED_ORIGINS) {
   });
 }
 
+test("MCP application gate can use the provider-owned exact allowlist", async () => {
+  let dispatches = 0;
+  const origin = "https://provider-client.example";
+  const response = await handleMcpHttpRequest(
+    request("POST", origin),
+    async () => {
+      dispatches += 1;
+      return new Response("ok");
+    },
+    { allowedOrigins: new Set([origin]) },
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(dispatches, 1);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), origin);
+});
+
 for (const origin of REJECTED_ORIGINS) {
   test(`MCP rejects non-allowlisted serialized Origin ${JSON.stringify(origin)}`, async () => {
     const { response, dispatches } = await handled("POST", origin);

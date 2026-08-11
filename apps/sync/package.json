@@ -10,7 +10,7 @@
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "pretest": "npm run build --workspace=@topline/shared --workspace=@topline/shared-auth --workspace=@topline/shared-schema --workspace=@topline/shared-do",
-    "test": "tsx --test src/mapping.test.ts src/connection-auth.test.ts"
+    "test": "tsx --test src/mapping.test.ts src/connection-auth.test.ts src/storage-isolation.test.ts"
   },
   "dependencies": {
     "@topline/shared": "*",

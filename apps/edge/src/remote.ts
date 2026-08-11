@@ -9,8 +9,9 @@
 // Auth backend:
 //  - Customer credentials (PIT + Location ID) are stored encrypted in the
 //    CONNECTIONS KV namespace, keyed by a UUID (connection_id / cid).
-//  - Access tokens issued by OAuth and /connect are HMAC-signed envelopes
-//    containing only { cid, exp } — no plaintext PIT leaves the worker.
+//  - OAuth grants contain only a connection ID; provider access and refresh
+//    tokens never contain the PIT. /connect issues an HMAC-signed { cid, exp }
+//    envelope for clients that cannot run OAuth.
 //  - Legacy tokens that embed { pit, locationId, exp } are still accepted
 //    so deploys don't break existing Claude / ChatGPT sessions. They keep
 //    working until they expire naturally.
@@ -20,31 +21,31 @@
 // step.
 
 import { ACTION_TOOLS, ALL_TOOLS } from "./registry.js";
-import { credentialsContext } from "@topline/shared";
+import {
+  credentialsContext,
+  safeErrorFields,
+  safeLog,
+} from "@topline/shared";
 import {
   signToken,
   verifyToken,
-  verifyPkce,
   isCidAccess,
   isLegacyAccess,
   createConnection,
   deleteConnection,
-  type AuthCodePayload,
   type AccessTokenPayload,
   type LegacyAccessTokenPayload,
 } from "@topline/shared-auth";
 import {
-  authorizeFormHtml,
   connectFormHtml,
   connectResultHtml,
 } from "./remote-oauth.js";
 import { LocationDO } from "@topline/shared-do";
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { edgeContext } from "./request-context.js";
-import { locationClient } from "./location-do-client.js";
-import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
-import { buildCatalog } from "@topline/shared-schema";
 import { handleMcpHttpRequest } from "./mcp-http.js";
 import { createRemoteMcpHandler } from "./mcp-server.js";
+import { locationClient } from "./location-do-client.js";
 import { ConnectionAuthDO } from "./connection-auth-do.js";
 import {
   authorizationStub,
@@ -59,27 +60,44 @@ import {
 } from "./query-api-access.js";
 import {
   PolicyReauthorizationRequiredError,
+  ToolPolicyError,
   type ConnectionAuthorizationSnapshot,
-  type PersistedToolPolicy,
 } from "./tool-policy.js";
-import {
-  assessClientCompatibility,
-  type ToolSelection,
-} from "./tool-presets.js";
 import {
   buildToolSelectionView,
   compilePolicyUpdate,
   parseToolSelectionForm,
 } from "./tool-selection-view.js";
+import {
+  assessClientCompatibility,
+  type ToolSelection,
+} from "./tool-presets.js";
+import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
+import { buildCatalog } from "@topline/shared-schema";
+import {
+  handleAuthorizationRequest,
+  type AuthorizationDependencies,
+  type OAuthGrantProps,
+} from "./oauth/authorization.js";
+import { OAuthFlowDO } from "./oauth/flow-do.js";
+import {
+  AUTHORIZATION_SERVER_ORIGIN,
+  MCP_RESOURCE,
+  OAUTH_SCOPE,
+  createOAuthWorker,
+  type OAuthProviderEnv,
+} from "./oauth/provider.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
 // sync worker can import the same type surface without circular deps.
-export { ConnectionAuthDO, LocationDO };
+export { ConnectionAuthDO, LocationDO, OAuthFlowDO };
 
-interface Env {
+interface Env extends OAuthProviderEnv {
   TOKEN_SIGNING_SECRET: string;
   TOPLINE_BRAND_NAME?: string;
+  OAUTH_PROVIDER?: OAuthHelpers;
+  MCP_ALLOWED_ORIGINS?: string;
   CONNECTIONS: KVNamespace;
   CONNECTION_AUTH_DO: DurableObjectNamespace<ConnectionAuthDO>;
   LOCATION_DO: DurableObjectNamespace<LocationDO>;
@@ -94,63 +112,64 @@ interface Env {
   SYNC_WORKER?: Fetcher;
 }
 
-const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days (OAuth flow)
 const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (/connect)
-const AUTH_CODE_TTL_SECONDS = 60 * 10; // 10 minutes
+const CREDENTIAL_FORM_MAX_BYTES = 16 * 1024;
+
+const oauthWorker = createOAuthWorker<Env>({
+  apiHandler: { fetch: handleOAuthMcp },
+  defaultHandler: { fetch: handleDefaultRequest },
+  async resolveExternalToken({ token, env }) {
+    const resolved = await resolveBearer(token, env);
+    return "error" in resolved ? null : { props: resolved, audience: MCP_RESOURCE };
+  },
+});
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (!env.TOKEN_SIGNING_SECRET) {
       return plain(500, "Worker is missing TOKEN_SIGNING_SECRET. Run: wrangler secret put TOKEN_SIGNING_SECRET");
     }
-    if (!env.CONNECTIONS) {
-      return plain(500, "Worker is missing CONNECTIONS KV binding. Check wrangler.toml.");
+    if (!env.CONNECTIONS || !env.CONNECTION_AUTH_DO || !env.OAUTH_KV || !env.OAUTH_FLOW_DO) {
+      return plain(500, "Worker OAuth or connection storage bindings are missing. Check wrangler.toml.");
     }
-
-    const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
-    const url = new URL(request.url);
-
-    if (url.pathname === "/mcp") {
-      return handleMcpHttpRequest(request, () => handleMcp(request, env, ctx));
-    }
-    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-
-    // Routing
-    switch (url.pathname) {
-      case "/":
-        return cors(landing(brand, url.origin));
-      case "/.well-known/oauth-authorization-server":
-      case "/.well-known/oauth-protected-resource":
-        return cors(oauthMetadata(url.origin));
-      case "/register":
-        return cors(await handleRegister(request));
-      case "/authorize":
-        return cors(await handleAuthorize(request, env, brand));
-      case "/token":
-        return cors(await handleToken(request, env, brand, ctx));
-      case "/connect":
-        return cors(await handleConnect(request, env, brand, ctx));
-      case "/connection/policy":
-        return cors(await handleConnectionPolicy(request, env));
-      case "/admin/do-info":
-        return cors(await handleAdminDoInfo(request, env));
-      case "/admin/do-query":
-        return cors(await handleAdminDoQuery(request, env));
-      case "/admin/do-exec":
-        return cors(await handleAdminDoExec(request, env));
-      case "/query/api/get-overview":
-        return cors(await handleQueryApiOverview(request, env));
-      case "/query/api/catalog":
-        return cors(await handleQueryApiCatalog(request, env));
-      case "/query/api/explain-tables":
-        return cors(await handleQueryApiExplainTables(request, env));
-      case "/query/api/execute-sql":
-        return cors(await handleQueryApiExecuteSql(request, env));
-      default:
-        return cors(plain(404, "Not found"));
-    }
+    return oauthWorker.fetch(request, env, ctx);
   },
 };
+
+async function handleDefaultRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
+  const url = new URL(request.url);
+  switch (url.pathname) {
+    case "/":
+      return landing(brand, url.origin);
+    case "/authorize":
+      return handleAuthorizationRequest(request, env, brand, authorizationDependencies(ctx));
+    case "/connect":
+      return handleConnect(request, env, brand, ctx);
+    case "/connection/policy":
+      return handlePolicyRoute(request, env);
+    case "/admin/do-info":
+      return handleAdminDoInfo(request, env);
+    case "/admin/do-query":
+      return handleAdminDoQuery(request, env);
+    case "/admin/do-exec":
+      return handleAdminDoExec(request, env);
+    case "/query/api/get-overview":
+      return handleQueryApiOverview(request, env);
+    case "/query/api/catalog":
+      return handleQueryApiCatalog(request, env);
+    case "/query/api/explain-tables":
+      return handleQueryApiExplainTables(request, env);
+    case "/query/api/execute-sql":
+      return handleQueryApiExecuteSql(request, env);
+    default:
+      return plain(404, "Not found");
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Landing page (so visitors don't see a raw 404)
@@ -191,30 +210,51 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
   }
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
-  const form = await request.formData();
-  const pit = String(form.get("pit") ?? "").trim();
-  const locationId = String(form.get("locationId") ?? "").trim();
-  const rerender = (error: string) =>
-    html(400, connectFormHtml({ brand, origin: url.origin, error, toolSelection }));
+  if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) {
+    return plain(415, "Unsupported media type");
+  }
+  const declaredLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > CREDENTIAL_FORM_MAX_BYTES) {
+    return plain(413, "Request body too large");
+  }
+  const encodedForm = await request.text();
+  if (encodedForm.length > CREDENTIAL_FORM_MAX_BYTES) {
+    return plain(413, "Request body too large");
+  }
+  const form = new URLSearchParams(encodedForm);
+  const pit = (form.get("pit") ?? "").trim();
+  const locationId = (form.get("locationId") ?? "").trim();
 
   if (!pit.startsWith("pit-")) {
-    return rerender(
-      `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
+    return html(
+      400,
+      connectFormHtml({
+        brand,
+        origin: url.origin,
+        toolSelection,
+        error: `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
+      }),
     );
   }
   if (!locationId) {
-    return rerender("Location ID is required.");
+    return html(400, connectFormHtml({ brand, origin: url.origin, toolSelection, error: "Location ID is required." }));
   }
 
   let selected;
   try {
     selected = parseToolSelectionForm(form, ALL_TOOLS);
-  } catch {
-    return rerender("Choose a valid tool set.");
-  }
-  const compatibility = assessClientCompatibility(selected.selected_count, selected.target);
-  if (!compatibility.compatible) {
-    return rerender(compatibility.error ?? "This tool set is not compatible with the selected client.");
+    const compatibility = assessClientCompatibility(selected.selected_count, selected.target);
+    if (!compatibility.compatible) throw new Error(compatibility.error);
+  } catch (error) {
+    return html(
+      400,
+      connectFormHtml({
+        brand,
+        origin: url.origin,
+        toolSelection,
+        error: error instanceof Error ? error.message : "Invalid tool selection.",
+      }),
+    );
   }
 
   const cid = await createConnection(
@@ -232,7 +272,7 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
     );
   } catch {
     await deleteConnection(env.CONNECTIONS, cid);
-    return rerender("Could not persist this connection's tool policy. Try again.");
+    return plain(500, "Connection authorization could not be initialized.");
   }
 
   // Fire the initial full backfill in the background. The cron would
@@ -249,247 +289,245 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
   return html(200, connectResultHtml({ brand, origin: url.origin, token }));
 }
 
-// ---------------------------------------------------------------------------
-// OAuth 2.1 Authorization Server metadata (RFC 8414)
-// ---------------------------------------------------------------------------
-function oauthMetadata(origin: string): Response {
-  const meta = {
-    issuer: origin,
-    authorization_endpoint: `${origin}/authorize`,
-    token_endpoint: `${origin}/token`,
-    registration_endpoint: `${origin}/register`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
-    code_challenge_methods_supported: ["S256", "plain"],
-    token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["mcp"],
+function authorizationDependencies(
+  ctx: ExecutionContext,
+): AuthorizationDependencies<Env> {
+  return {
+    async verifyCredentials(pit, locationId) {
+      const response = await fetch(
+        `https://services.leadconnectorhq.com/locations/${encodeURIComponent(locationId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${pit}`,
+            Version: "2021-07-28",
+          },
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      if (!response.ok) throw new Error("credential_verification_failed");
+    },
+    async createConnection(pit, locationId, _oauthClientId, policy, clientTarget, env) {
+      const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
+      const cid = await createConnection(
+        env.CONNECTIONS,
+        { location_id: locationId, pit, brand_name: brand, source: "oauth" },
+        env.TOKEN_SIGNING_SECRET,
+      );
+      try {
+        await initializeConnectionAuthorization(
+          env,
+          cid,
+          locationId,
+          policy,
+          clientTarget,
+        );
+      } catch (error) {
+        await deleteConnection(env.CONNECTIONS, cid);
+        throw error;
+      }
+      return cid;
+    },
+    async deleteConnection(cid, env) {
+      await deleteConnection(env.CONNECTIONS, cid);
+    },
+    async connectionCreated(cid, env) {
+      ctx.waitUntil(kickoffInitialBackfill(env, cid));
+    },
   };
-  return json(200, meta);
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic Client Registration (RFC 7591)
+// MCP JSON-RPC endpoint
 // ---------------------------------------------------------------------------
-async function handleRegister(request: Request): Promise<Response> {
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-  let body: Record<string, unknown> = {};
-  try {
-    body = (await request.json()) as Record<string, unknown>;
-  } catch {
-    return json(400, { error: "invalid_request", error_description: "Body must be JSON" });
-  }
-  const clientId = `mcp-client-${crypto.randomUUID()}`;
-  return json(201, {
-    client_id: clientId,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-    redirect_uris: (body.redirect_uris as string[] | undefined) ?? [],
-    grant_types: ["authorization_code"],
-    response_types: ["code"],
-    token_endpoint_auth_method: "none",
-  });
+interface ResolvedCredentials {
+  pit: string;
+  locationId?: string;
+  cid?: string;
+  rawPitBearer: boolean;
+  authorization: ConnectionAuthorizationSnapshot | null;
 }
 
-// ---------------------------------------------------------------------------
-// Authorization endpoint — shows form, then issues a short-lived auth code.
-// The code still embeds PIT+LocId (short TTL, single use) — the connection
-// record is created when the code is exchanged at /token.
-// ---------------------------------------------------------------------------
-async function handleAuthorize(request: Request, env: Env, brand: string): Promise<Response> {
-  const toolSelection = buildToolSelectionView(ALL_TOOLS);
-  if (request.method === "GET") {
-    const url = new URL(request.url);
-    const redirect_uri = url.searchParams.get("redirect_uri") ?? "";
-    const code_challenge = url.searchParams.get("code_challenge") ?? "";
-    const code_challenge_method = (url.searchParams.get("code_challenge_method") ?? "S256") as
-      | "S256"
-      | "plain";
-    const state = url.searchParams.get("state") ?? "";
-    const client_id = url.searchParams.get("client_id") ?? "";
+type ProviderCredentialResolution =
+  | {
+      kind: "credentials";
+      credentials: ResolvedCredentials & { locationId: string; cid: string };
+    }
+  | { kind: "not_provider" }
+  | { kind: "invalid_token" }
+  | { kind: "insufficient_scope" };
 
-    if (!redirect_uri) return plain(400, "Missing redirect_uri");
-
-    return html(
-      200,
-      authorizeFormHtml({
-        brand,
-        redirect_uri,
-        code_challenge,
-        code_challenge_method,
-        state,
-        client_id,
-        toolSelection,
-      }),
-    );
+/**
+ * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
+ *   - "pit-..."                         → raw PIT, location from header
+ *   - signed { cid, exp }               → look up connection, decrypt PIT
+ *   - signed { pit, locationId, exp }   → legacy, use embedded values
+ */
+async function resolveBearer(
+  bearer: string,
+  env: Env,
+): Promise<ResolvedCredentials | { error: string }> {
+  if (bearer.startsWith("pit-")) {
+    return { pit: bearer, rawPitBearer: true, authorization: null };
   }
 
-  if (request.method !== "POST") return plain(405, "Method not allowed");
+  // Try verifying as a signed token. The payload is either new-shape or legacy.
+  const payload = await verifyToken<unknown>(bearer, env.TOKEN_SIGNING_SECRET);
+  if (!payload) return { error: "Access token invalid or expired" };
 
-  const form = await request.formData();
-  const pit = String(form.get("pit") ?? "").trim();
-  const locationId = String(form.get("locationId") ?? "").trim();
-  const redirect_uri = String(form.get("redirect_uri") ?? "").trim();
-  const code_challenge = String(form.get("code_challenge") ?? "").trim();
-  const code_challenge_method = String(form.get("code_challenge_method") ?? "S256") as
-    | "S256"
-    | "plain";
-  const state = String(form.get("state") ?? "").trim();
-  const client_id = String(form.get("client_id") ?? "").trim();
-
-  const rerender = (error: string) =>
-    html(
-      400,
-      authorizeFormHtml({
-        brand,
-        error,
-        redirect_uri,
-        code_challenge,
-        code_challenge_method,
-        state,
-        client_id,
-        toolSelection,
-      }),
-    );
-
-  if (!pit.startsWith("pit-")) {
-    return rerender(
-      `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
-    );
-  }
-  if (!locationId) return rerender("Location ID is required.");
-  if (!redirect_uri) return plain(400, "Missing redirect_uri");
-
-  let selected;
-  try {
-    selected = parseToolSelectionForm(form, ALL_TOOLS);
-  } catch {
-    return rerender("Choose a valid tool set.");
-  }
-  const compatibility = assessClientCompatibility(selected.selected_count, selected.target);
-  if (!compatibility.compatible) {
-    return rerender(compatibility.error ?? "This tool set is not compatible with the selected client.");
-  }
-
-  const payload: AuthCodePayload & {
-    tool_policy: PersistedToolPolicy;
-    target_client: "generic" | "copilot_studio";
-  } = {
-    pit,
-    locationId,
-    redirect_uri,
-    code_challenge,
-    code_challenge_method,
-    tool_policy: selected.policy,
-    target_client: selected.target,
-    exp: Math.floor(Date.now() / 1000) + AUTH_CODE_TTL_SECONDS,
-  };
-  const code = await signToken(payload, env.TOKEN_SIGNING_SECRET);
-
-  const redirect = new URL(redirect_uri);
-  redirect.searchParams.set("code", code);
-  if (state) redirect.searchParams.set("state", state);
-  return new Response(null, { status: 302, headers: { Location: redirect.toString() } });
-}
-
-// ---------------------------------------------------------------------------
-// Token endpoint — exchange auth code (+ PKCE verifier) for access token.
-// This is where we create the ConnectionDirectory record.
-// ---------------------------------------------------------------------------
-async function handleToken(request: Request, env: Env, brand: string, ctx: ExecutionContext): Promise<Response> {
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-
-  const contentType = request.headers.get("Content-Type") ?? "";
-  let grant_type: string;
-  let code: string;
-  let code_verifier: string;
-  let redirect_uri: string;
-
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    const form = await request.formData();
-    grant_type = String(form.get("grant_type") ?? "");
-    code = String(form.get("code") ?? "");
-    code_verifier = String(form.get("code_verifier") ?? "");
-    redirect_uri = String(form.get("redirect_uri") ?? "");
-  } else {
-    let body: Record<string, string> = {};
+  if (isCidAccess(payload)) {
+    let loaded;
     try {
-      body = (await request.json()) as Record<string, string>;
+      loaded = await loadActiveConnectionAuthorization(env, payload.cid);
     } catch {
-      return json(400, { error: "invalid_request" });
+      return { error: "Access token references an unknown or revoked connection" };
     }
-    grant_type = body.grant_type ?? "";
-    code = body.code ?? "";
-    code_verifier = body.code_verifier ?? "";
-    redirect_uri = body.redirect_uri ?? "";
+    return {
+      pit: loaded.connection.pit,
+      locationId: loaded.connection.location_id,
+      cid: payload.cid,
+      rawPitBearer: false,
+      authorization: loaded.authorization,
+    };
   }
 
-  if (grant_type !== "authorization_code") {
-    return json(400, { error: "unsupported_grant_type" });
+  if (isLegacyAccess(payload)) {
+    const p = payload as LegacyAccessTokenPayload;
+    return {
+      pit: p.pit,
+      locationId: p.locationId,
+      rawPitBearer: false,
+      authorization: null,
+    };
   }
 
-  const payload = await verifyToken<
-    AuthCodePayload & {
-      tool_policy?: PersistedToolPolicy;
-      target_client?: "generic" | "copilot_studio";
-    }
-  >(
-    code,
-    env.TOKEN_SIGNING_SECRET,
-  );
-  if (!payload) return json(400, { error: "invalid_grant", error_description: "Code invalid or expired" });
-
-  if (payload.redirect_uri !== redirect_uri) {
-    return json(400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
-  }
-
-  if (payload.code_challenge) {
-    if (!code_verifier) return json(400, { error: "invalid_grant", error_description: "PKCE code_verifier required" });
-    const ok = await verifyPkce(code_verifier, payload.code_challenge, payload.code_challenge_method);
-    if (!ok) return json(400, { error: "invalid_grant", error_description: "PKCE verification failed" });
-  }
-
-  // Create the connection record and issue a cid-referencing token.
-  const cid = await createConnection(
-    env.CONNECTIONS,
-    { location_id: payload.locationId, pit: payload.pit, brand_name: brand, source: "oauth" },
-    env.TOKEN_SIGNING_SECRET,
-  );
-  try {
-    await initializeConnectionAuthorization(
-      env,
-      cid,
-      payload.locationId,
-      payload.tool_policy ?? { version: 1, mode: "all" },
-      payload.target_client ?? "generic",
-    );
-  } catch {
-    await deleteConnection(env.CONNECTIONS, cid);
-    return json(500, { error: "server_error" });
-  }
-
-  // Kick off the initial backfill immediately (same rationale as /connect
-  // — don't make the customer wait for the cron tick).
-  ctx.waitUntil(kickoffInitialBackfill(env, cid));
-
-  const accessPayload: AccessTokenPayload = {
-    cid,
-    exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_SECONDS,
-  };
-  const access_token = await signToken(accessPayload, env.TOKEN_SIGNING_SECRET);
-
-  return json(200, {
-    access_token,
-    token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    scope: "mcp",
-  });
+  return { error: "Access token payload is not recognized" };
 }
 
-// ---------------------------------------------------------------------------
-// Authenticated connection policy management. Updates keep the existing
-// bearer valid and take effect on the next stateless request. DELETE marks
-// the strongly ordered authorization record revoked before deleting KV.
-// ---------------------------------------------------------------------------
-async function handleConnectionPolicy(request: Request, env: Env): Promise<Response> {
+async function handleOAuthMcp(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const props = (ctx as ExecutionContext & {
+    props?: OAuthGrantProps | ResolvedCredentials;
+  }).props;
+  if (!props) return queryUnauthorized("Invalid access token");
+
+  let resolved: ResolvedCredentials;
+  if ("pit" in props) {
+    resolved = props;
+  } else {
+    const provider = await resolveProviderCredentials(bearerToken(request), env);
+    if (provider.kind === "credentials") {
+      resolved = provider.credentials;
+    } else if (provider.kind === "insufficient_scope") {
+      return oauthInsufficientScope();
+    } else {
+      return queryUnauthorized("Invalid OAuth access token");
+    }
+  }
+  return handleMcp(request, env, ctx, resolved);
+}
+
+function bearerToken(request: Request): string {
+  return (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+}
+
+function isOAuthGrantProps(value: unknown): value is OAuthGrantProps {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof (value as OAuthGrantProps).cid === "string" &&
+    typeof (value as OAuthGrantProps).oauthClientId === "string",
+  );
+}
+
+async function resolveProviderCredentials(
+  bearer: string,
+  env: Env,
+): Promise<ProviderCredentialResolution> {
+  if (!bearer || !env.OAUTH_PROVIDER) return { kind: "not_provider" };
+  const token = await env.OAUTH_PROVIDER.unwrapToken<OAuthGrantProps>(bearer);
+  if (!token) return { kind: "not_provider" };
+  if (!hasExactAudience(token.audience, MCP_RESOURCE)) return { kind: "invalid_token" };
+  const props = token.grant.props;
+  if (!isOAuthGrantProps(props)) return { kind: "invalid_token" };
+  const tokenScope = Array.isArray(token.scope) ? token.scope : [];
+  const grantScope = Array.isArray(token.grant.scope) ? token.grant.scope : [];
+  if (!tokenScope.includes(OAUTH_SCOPE) || !grantScope.includes(OAUTH_SCOPE)) {
+    return { kind: "insufficient_scope" };
+  }
+  if (token.userId !== props.cid || token.grant.clientId !== props.oauthClientId) {
+    return { kind: "invalid_token" };
+  }
+  let loaded;
+  try {
+    loaded = await loadActiveConnectionAuthorization(env, props.cid);
+  } catch {
+    return { kind: "invalid_token" };
+  }
+  return {
+    kind: "credentials",
+    credentials: {
+      pit: loaded.connection.pit,
+      locationId: loaded.connection.location_id,
+      cid: props.cid,
+      rawPitBearer: false,
+      authorization: loaded.authorization,
+    },
+  };
+}
+
+async function handleMcp(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  resolved: ResolvedCredentials,
+): Promise<Response> {
+  let { pit, locationId } = resolved;
+  if (!locationId) {
+    locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
+  }
+
+  const registry = resolved.rawPitBearer ? ACTION_TOOLS : ALL_TOOLS;
+  const toolAccess = buildToolAccess(resolved.authorization, registry);
+  const handler = createRemoteMcpHandler({ tools: toolAccess.advertised });
+  const allowedOrigins = new Set(
+    (env.MCP_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  );
+
+  const response = await handleMcpHttpRequest(
+    request,
+    () => edgeContext.run(
+      { location_do: env.LOCATION_DO, authorization: resolved.authorization },
+      () => credentialsContext.run(
+        { pit, locationId },
+        () => handler.fetch(request, {
+          authInfo: {
+            token: "authenticated",
+            clientId: resolved.cid ?? (resolved.rawPitBearer ? "legacy-raw-pit" : "legacy"),
+            scopes: [OAUTH_SCOPE],
+            extra: { rawPitBearer: resolved.rawPitBearer },
+          },
+        }),
+      ),
+    ),
+    { allowedOrigins },
+  );
+
+  ctx.waitUntil(handler.close());
+  if (resolved.cid && locationId) {
+    ctx.waitUntil(
+      authorizationStub(env, resolved.cid).touch(locationId),
+    );
+  }
+  return response;
+}
+
+async function handlePolicyRoute(request: Request, env: Env): Promise<Response> {
   const authHeader = request.headers.get("Authorization") ?? "";
   const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
   const payload = bearer
@@ -590,14 +628,12 @@ async function handleConnectionPolicy(request: Request, env: Env): Promise<Respo
 
 function policyManagementView(snapshot: ConnectionAuthorizationSnapshot): object {
   const catalogIds = new Set(ALL_TOOLS.map((tool) => tool.name));
-  const selectedIds =
-    snapshot.policy.mode === "all"
-      ? ALL_TOOLS.map((tool) => tool.name)
-      : snapshot.policy.tool_ids.filter((id) => catalogIds.has(id));
-  const staleIds =
-    snapshot.policy.mode === "allow"
-      ? snapshot.policy.tool_ids.filter((id) => !catalogIds.has(id))
-      : [];
+  const selectedIds = snapshot.policy.mode === "all"
+    ? ALL_TOOLS.map((tool) => tool.name)
+    : snapshot.policy.tool_ids.filter((id) => catalogIds.has(id));
+  const staleIds = snapshot.policy.mode === "allow"
+    ? snapshot.policy.tool_ids.filter((id) => !catalogIds.has(id))
+    : [];
   return {
     status: snapshot.status,
     client_target: snapshot.client_target ?? "generic",
@@ -611,112 +647,6 @@ function policyManagementView(snapshot: ConnectionAuthorizationSnapshot): object
       effective: "next_request",
     },
   };
-}
-
-/**
- * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
- *   - "pit-..."                         → raw PIT, location from header
- *   - signed { cid, exp }               → look up connection, decrypt PIT
- *   - signed { pit, locationId, exp }   → legacy, use embedded values
- */
-async function resolveBearer(
-  bearer: string,
-  env: Env,
-): Promise<
-  | {
-      pit: string;
-      locationId?: string;
-      cid?: string;
-      authorization: ConnectionAuthorizationSnapshot | null;
-    }
-  | { error: string }
-> {
-  if (bearer.startsWith("pit-")) {
-    return { pit: bearer, authorization: null };
-  }
-
-  // Try verifying as a signed token. The payload is either new-shape or legacy.
-  const payload = await verifyToken<unknown>(bearer, env.TOKEN_SIGNING_SECRET);
-  if (!payload) return { error: "Access token invalid or expired" };
-
-  if (isCidAccess(payload)) {
-    try {
-      const active = await loadActiveConnectionAuthorization(env, payload.cid);
-      return {
-        pit: active.connection.pit,
-        locationId: active.connection.location_id,
-        cid: payload.cid,
-        authorization: active.authorization,
-      };
-    } catch {
-      return { error: "Access token references an unavailable connection" };
-    }
-  }
-
-  if (isLegacyAccess(payload)) {
-    const p = payload as LegacyAccessTokenPayload;
-    return { pit: p.pit, locationId: p.locationId, authorization: null };
-  }
-
-  return { error: "Access token payload is not recognized" };
-}
-
-async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  const authHeader = request.headers.get("Authorization") ?? "";
-  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!bearer) {
-    return json(401, {
-      jsonrpc: "2.0",
-      id: null,
-      error: { code: -32001, message: "Missing Authorization header" },
-    });
-  }
-
-  const resolved = await resolveBearer(bearer, env);
-  if ("error" in resolved) {
-    return json(401, {
-      jsonrpc: "2.0",
-      id: null,
-      error: { code: -32001, message: resolved.error },
-    });
-  }
-  let { pit, locationId, cid, authorization } = resolved;
-
-  // Raw-PIT bearers only (detected by the bearer starting with "pit-").
-  // Action tools tolerate raw PITs because the CRM validates them upstream;
-  // analytics tools (SQL surface) never call the CRM, so an unvalidated PIT
-  // plus a caller-supplied location header is an auth bypass. Tracked
-  // as a flag so the MCP server factory excludes analytics tools for raw-PIT sessions.
-  const rawPitBearer = bearer.startsWith("pit-");
-
-  // For raw-PIT bearers, location may come from a side-channel header.
-  if (!locationId) {
-    locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
-  }
-
-  const toolAccess = buildToolAccess(
-    authorization,
-    rawPitBearer ? ACTION_TOOLS : ALL_TOOLS,
-  );
-  const mcpHandler = createRemoteMcpHandler({ tools: toolAccess.advertised });
-  const response = await edgeContext.run({ location_do: env.LOCATION_DO, authorization }, () =>
-    credentialsContext.run({ pit, locationId }, () =>
-      mcpHandler.fetch(request, {
-        authInfo: {
-          token: bearer,
-          clientId: cid ?? (rawPitBearer ? "legacy-raw-pit" : "legacy-embedded-token"),
-          scopes: ["mcp"],
-          extra: { rawPitBearer },
-        },
-      }),
-    ),
-  );
-  // Best-effort authorization metadata touch. It cannot overwrite policy
-  // because the same connection-scoped DO serializes both operations.
-  if (cid && locationId) {
-    ctx.waitUntil(authorizationStub(env, cid).touch(locationId).then(() => undefined));
-  }
-  return response;
 }
 
 // ---------------------------------------------------------------------------
@@ -773,16 +703,19 @@ async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> 
 // and the query runs against that connection's LocationDO.
 // ---------------------------------------------------------------------------
 
+interface QueryAuthorization {
+  locationId: string;
+  cid?: string;
+  authorization: ConnectionAuthorizationSnapshot | null;
+}
+
 async function authorizeQueryRequest(
   request: Request,
   env: Env,
   operation: QueryApiOperation,
-): Promise<{ locationId: string; cid?: string } | Response> {
-  const authHeader = request.headers.get("Authorization") ?? "";
-  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!bearer) {
-    return plain(401, "Missing Authorization: Bearer <token>");
-  }
+): Promise<QueryAuthorization | Response> {
+  const bearer = bearerToken(request);
+  if (!bearer) return queryUnauthorized("Missing Authorization: Bearer token");
 
   // The SQL surface requires a CONNECTION-BOUND bearer (cid token from
   // OAuth/connect, or the legacy signed { pit, locationId } token).
@@ -793,35 +726,94 @@ async function authorizeQueryRequest(
   // any location header would let the caller read whatever SQLite DB
   // they name. Reject at the door.
   if (bearer.startsWith("pit-")) {
-    return plain(
-      401,
+    return queryUnauthorized(
       "Raw PIT bearers are not accepted on the SQL surface. Use an OAuth-issued access token or one minted at /connect.",
     );
   }
 
-  const resolved = await resolveBearer(bearer, env);
-  if ("error" in resolved) {
-    return plain(401, resolved.error);
+  const provider = await resolveProviderCredentials(bearer, env);
+  if (provider.kind === "credentials") {
+    return requireQueryPolicy({
+      locationId: provider.credentials.locationId,
+      cid: provider.credentials.cid,
+      authorization: provider.credentials.authorization,
+    }, operation);
   }
+  if (provider.kind === "insufficient_scope") return oauthInsufficientScope();
+  if (provider.kind === "invalid_token") {
+    return queryUnauthorized("Invalid OAuth access token");
+  }
+
+  const resolved = await resolveBearer(bearer, env);
+  if ("error" in resolved) return queryUnauthorized(resolved.error);
   // After the raw-PIT guard above, resolved.locationId MUST come from
   // the signed token's payload (cid → connection record, or legacy
   // { pit, locationId }). We never fall back to the X-Topline-
   // Location-Id header on the SQL path.
   if (!resolved.locationId) {
-    return plain(
-      401,
+    return queryUnauthorized(
       "Token does not carry a location. Reconnect via OAuth or /connect to mint a connection-bound token.",
     );
   }
-  try {
-    requireQueryApiOperation(resolved.authorization, operation, ALL_TOOLS);
-  } catch {
-    return plain(403, "This operation is not available for the connection.");
-  }
-  return { locationId: resolved.locationId, cid: resolved.cid };
+  return requireQueryPolicy({
+    locationId: resolved.locationId,
+    cid: resolved.cid,
+    authorization: resolved.authorization,
+  }, operation);
 }
 
-async function handleQueryApiOverview(request: Request, env: Env): Promise<Response> {
+function requireQueryPolicy(
+  authorization: QueryAuthorization,
+  operation: QueryApiOperation,
+): QueryAuthorization | Response {
+  try {
+    requireQueryApiOperation(authorization.authorization, operation, ALL_TOOLS);
+    return authorization;
+  } catch (error) {
+    if (error instanceof ToolPolicyError) {
+      return json(403, { error: "This connection is not authorized for that operation." });
+    }
+    throw error;
+  }
+}
+
+function hasExactAudience(audience: unknown, expected: string): boolean {
+  return audience === expected
+    || (Array.isArray(audience) && audience.length === 1 && audience[0] === expected);
+}
+
+function queryUnauthorized(body: string): Response {
+  return new Response(body, {
+    status: 401,
+    headers: {
+      "Content-Type": "text/plain",
+      "Cache-Control": "no-store",
+      "WWW-Authenticate": `Bearer realm="OAuth", resource_metadata="${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp", scope="${OAUTH_SCOPE}"`,
+    },
+  });
+}
+
+function oauthInsufficientScope(): Response {
+  return new Response(
+    JSON.stringify({
+      error: "insufficient_scope",
+      error_description: `The ${OAUTH_SCOPE} scope is required`,
+    }),
+    {
+      status: 403,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "WWW-Authenticate": `Bearer realm="OAuth", resource_metadata="${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", scope="${OAUTH_SCOPE}"`,
+      },
+    },
+  );
+}
+
+async function handleQueryApiOverview(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env, "overview");
   if (auth instanceof Response) return auth;
@@ -834,7 +826,10 @@ async function handleQueryApiOverview(request: Request, env: Env): Promise<Respo
   }
 }
 
-async function handleQueryApiCatalog(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiCatalog(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env, "catalog");
   if (auth instanceof Response) return auth;
@@ -845,7 +840,10 @@ async function handleQueryApiCatalog(request: Request, env: Env): Promise<Respon
   }
 }
 
-async function handleQueryApiExplainTables(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiExplainTables(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env, "explain_tables");
   if (auth instanceof Response) return auth;
@@ -863,7 +861,10 @@ async function handleQueryApiExplainTables(request: Request, env: Env): Promise<
   }
 }
 
-async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiExecuteSql(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env, "execute_sql");
   if (auth instanceof Response) return auth;
@@ -1024,12 +1025,10 @@ async function handleAdminDoExec(request: Request, env: Env): Promise<Response> 
 // ---------------------------------------------------------------------------
 async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<void> {
   if (!env.SYNC_WORKER || !env.ADMIN_TOKEN) {
-    console.log(
-      `[kickoff] skipping connection=${connectionId} — ` +
-        (!env.SYNC_WORKER
-          ? "SYNC_WORKER binding not configured (check wrangler.toml [[services]])"
-          : "ADMIN_TOKEN secret not set on this worker"),
-    );
+    safeLog("log", "backfill_kickoff_skipped", {
+      missing_sync_binding: !env.SYNC_WORKER,
+      missing_admin_token: !env.ADMIN_TOKEN,
+    });
     return;
   }
   try {
@@ -1043,12 +1042,9 @@ async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<v
         headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
       },
     );
-    console.log(
-      `[kickoff] connection=${connectionId} backfill-all ${res.status} (sync worker)`,
-    );
+    safeLog("log", "backfill_kickoff_completed", { status: res.status });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`[kickoff] connection=${connectionId} FAILED ${msg.slice(0, 200)}`);
+    safeLog("warn", "backfill_kickoff_failed", { error: safeErrorFields(err) });
   }
 }
 
@@ -1071,14 +1067,4 @@ function html(status: number, body: string): Response {
 
 function plain(status: number, body: string): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/plain" } });
-}
-
-function cors(response: Response): Response {
-  response.headers.set("Access-Control-Allow-Origin", "*");
-  response.headers.set("Access-Control-Allow-Methods", "POST, GET, PUT, DELETE, OPTIONS");
-  response.headers.set(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Topline-Location-Id",
-  );
-  return response;
 }
