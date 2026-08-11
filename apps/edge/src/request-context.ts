@@ -13,10 +13,13 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { LocationDO } from "@topline/shared-do";
+import type { ConnectionAuthorizationSnapshot } from "./tool-policy.js";
 
 export interface EdgeRequestContext {
   /** The LocationDO namespace binding; used by SQL tools to RPC the tenant's DO. */
   location_do: DurableObjectNamespace<LocationDO>;
+  /** Immutable server-resolved connection policy for this request. */
+  authorization: ConnectionAuthorizationSnapshot | null;
 }
 
 export const edgeContext = new AsyncLocalStorage<EdgeRequestContext>();

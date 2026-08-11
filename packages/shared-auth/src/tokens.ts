@@ -107,12 +107,19 @@ export interface AccessTokenPayload {
 }
 
 /** OAuth authorization code payload (short-lived, exchanged at /token). */
+export type ConnectionToolPolicyPayload =
+  | { version: 1; mode: "all" }
+  | { version: 1; mode: "allow"; tool_ids: string[] };
+
 export interface AuthCodePayload {
   pit: string;
   locationId: string;
   redirect_uri: string;
   code_challenge: string;
   code_challenge_method: "S256" | "plain";
+  /** Optional only for pre-policy authorization codes already in flight. */
+  tool_policy?: ConnectionToolPolicyPayload;
+  target_client?: "generic" | "copilot_studio";
   exp: number;
 }
 

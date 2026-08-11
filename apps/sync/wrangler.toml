@@ -21,6 +21,13 @@ name = "LOCATION_DO"
 class_name = "LocationDO"
 script_name = "topline-os-mcp"
 
+# Authorization gate shared with the edge worker. Every cid-based sync checks
+# active/revoked state before decrypting credentials or touching LocationDO.
+[[durable_objects.bindings]]
+name = "CONNECTION_AUTH_DO"
+class_name = "ConnectionAuthDO"
+script_name = "topline-os-mcp"
+
 # Secrets required out-of-band:
 #   wrangler secret put TOKEN_SIGNING_SECRET   # same value as edge
 #   wrangler secret put ADMIN_TOKEN            # gates the manual trigger
