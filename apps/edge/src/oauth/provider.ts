@@ -118,7 +118,12 @@ export function createOAuthWorker<Env extends OAuthProviderEnv>(
 }
 
 function isBrowserSensitivePath(pathname: string): boolean {
-  return ["/mcp", "/token", "/register", "/authorize", "/connect"].includes(pathname)
+  const protectedResourceMetadata = "/.well-known/oauth-protected-resource";
+  return pathname.startsWith("/mcp")
+    || pathname === "/.well-known/oauth-authorization-server"
+    || pathname === protectedResourceMetadata
+    || pathname.startsWith(`${protectedResourceMetadata}/`)
+    || ["/token", "/register", "/authorize", "/connect"].includes(pathname)
     || pathname.startsWith("/query/api/");
 }
 

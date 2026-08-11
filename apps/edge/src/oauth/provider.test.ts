@@ -174,3 +174,57 @@ test("browser MCP requests use an exact configured Origin allowlist", async () =
   assert.notEqual(absentOrigin.status, 403);
   assert.equal(absentOrigin.headers.get("Access-Control-Allow-Origin"), null);
 });
+
+test("provider-routed MCP and metadata paths share the strict Origin decision", async () => {
+  const worker = createWorker();
+  const env = {
+    OAUTH_KV: {} as KVNamespace,
+    MCP_ALLOWED_ORIGINS: "https://trusted.example",
+  };
+  const paths = [
+    "/mcp",
+    "/mcp/",
+    "/mcp/foo",
+    "/mcp.json",
+    "/mcp-attacker",
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/",
+    "/.well-known/oauth-protected-resource/mcp",
+    "/.well-known/oauth-authorization-server",
+  ];
+
+  for (const path of paths) {
+    for (const method of ["GET", "OPTIONS"]) {
+      const hostile = await worker.fetch(
+        new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
+          method,
+          headers: { Origin: "https://attacker.example" },
+        }),
+        env,
+        executionContext,
+      );
+      assert.equal(hostile.status, 403, `${method} ${path}`);
+      assert.equal(
+        hostile.headers.get("Access-Control-Allow-Origin"),
+        null,
+        `${method} ${path}`,
+      );
+
+      const allowed = await worker.fetch(
+        new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
+          method,
+          headers: { Origin: "https://trusted.example" },
+        }),
+        env,
+        executionContext,
+      );
+      assert.notEqual(allowed.status, 403, `${method} ${path}`);
+      assert.equal(
+        allowed.headers.get("Access-Control-Allow-Origin"),
+        "https://trusted.example",
+        `${method} ${path}`,
+      );
+      assert.match(allowed.headers.get("Vary") ?? "", /(?:^|,\s*)Origin(?:,|$)/i);
+    }
+  }
+});

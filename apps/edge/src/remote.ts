@@ -650,8 +650,8 @@ async function authorizeQueryRequest(
 }
 
 function hasExactAudience(audience: unknown, expected: string): boolean {
-  const values = Array.isArray(audience) ? audience : [audience];
-  return values.some((value) => value === expected);
+  return audience === expected
+    || (Array.isArray(audience) && audience.length === 1 && audience[0] === expected);
 }
 
 function queryUnauthorized(body: string): Response {

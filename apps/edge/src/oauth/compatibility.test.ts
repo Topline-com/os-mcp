@@ -190,6 +190,69 @@ test("query APIs fail closed when provider token scope metadata is missing", asy
   );
 });
 
+test("query APIs require one exact canonical provider-token audience", async () => {
+  const connections = new MemoryKv();
+  const oauth = new MemoryKv();
+  const secret = "test-secret-that-is-long-enough-for-hmac-and-hkdf";
+  const cid = await createConnection(
+    connections as unknown as KVNamespace,
+    {
+      location_id: "location-123",
+      pit: "pit-existing-secret",
+      brand_name: "Topline OS",
+      source: "oauth",
+    },
+    secret,
+  );
+  const audiences: Record<string, unknown> = {
+    exact: MCP_RESOURCE,
+    single: [MCP_RESOURCE],
+    mixed: [MCP_RESOURCE, "https://attacker.example/other"],
+    duplicate: [MCP_RESOURCE, MCP_RESOURCE],
+    wrong: ["https://attacker.example/other"],
+  };
+  const env = {
+    TOKEN_SIGNING_SECRET: secret,
+    CONNECTIONS: connections as unknown as KVNamespace,
+    OAUTH_KV: oauth as unknown as KVNamespace,
+    OAUTH_FLOW_DO: {},
+    OAUTH_PROVIDER: {
+      async unwrapToken(token: string) {
+        const audience = audiences[token];
+        if (audience === undefined) return null;
+        return {
+          audience,
+          userId: cid,
+          scope: ["mcp"],
+          grant: {
+            clientId: "client-1",
+            scope: ["mcp"],
+            props: { cid, oauthClientId: "client-1" },
+          },
+        };
+      },
+    },
+    LOCATION_DO: {},
+  } as never;
+
+  for (const [token, expectedStatus] of [
+    ["exact", 200],
+    ["single", 200],
+    ["mixed", 401],
+    ["duplicate", 401],
+    ["wrong", 401],
+  ] as const) {
+    const response = await worker.fetch(
+      new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+        headers: { Authorization: ["Bear", "er ", token].join("") },
+      }),
+      env,
+      ctx,
+    );
+    assert.equal(response.status, expectedStatus, token);
+  }
+});
+
 test("provider-issued OAuth tokens authenticate MCP and query API routes", async () => {
   const connections = new MemoryKv();
   const oauth = new MemoryKv();
