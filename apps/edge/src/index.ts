@@ -5,7 +5,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-import { BRAND_NAME, SERVER_INFO } from "@topline/shared";
+import { BRAND_NAME, safeErrorFields, safeLog, SERVER_INFO } from "@topline/shared";
 import { ACTION_TOOLS } from "./registry.js";
 
 // Stdio only exposes ACTION_TOOLS (the CRM REST proxies). The analytics SQL
@@ -66,6 +66,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(`${BRAND_NAME} MCP failed to start:`, err);
+  safeLog("error", "stdio_start_failed", { error: safeErrorFields(err) });
   process.exit(1);
 });

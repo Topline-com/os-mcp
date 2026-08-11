@@ -1,23 +1,18 @@
 // HTML rendering for the OAuth 2.1 and /connect flows in the remote worker.
 //
-// Token primitives (signToken/verifyToken/verifyPkce) and payload types
-// (AuthCodePayload / AccessTokenPayload / LegacyAccessTokenPayload) live in
-// @topline/shared-auth — they're shared with the sync worker and any future
-// service that needs to validate inbound tokens.
+// The provider owns the OAuth protocol. This file only renders credential
+// and compatibility-token forms; it does not validate clients or issue OAuth
+// authorization codes.
 
 // --- HTML / responses ---
 
 export function authorizeFormHtml(params: {
   brand: string;
   error?: string;
-  redirect_uri: string;
-  code_challenge: string;
-  code_challenge_method: string;
-  state: string;
-  client_id: string;
+  continuation: string;
+  csrf: string;
 }): string {
-  const { brand, error, redirect_uri, code_challenge, code_challenge_method, state, client_id } =
-    params;
+  const { brand, error, continuation, csrf } = params;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -47,7 +42,7 @@ export function authorizeFormHtml(params: {
 </head>
 <body>
 <h1>Connect ${escapeHtml(brand)} to Claude</h1>
-<p class="sub">Paste your Private Integration Token and Location ID. They are encrypted at rest on this server so Claude can reach your sub-account; Claude itself receives only a signed reference token, never the raw credentials. Revoke at any time by rotating the PIT in ${escapeHtml(brand)}.</p>
+<p class="sub">Paste your Private Integration Token and Location ID. They are encrypted at rest on this server so Claude can reach your sub-account; Claude receives only an access token, never the raw credentials. Revoke at any time by rotating the PIT in ${escapeHtml(brand)}.</p>
 
 ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 
@@ -60,11 +55,8 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 </div>
 
 <form method="POST" action="/authorize">
-  <input type="hidden" name="redirect_uri" value="${escapeHtml(redirect_uri)}">
-  <input type="hidden" name="code_challenge" value="${escapeHtml(code_challenge)}">
-  <input type="hidden" name="code_challenge_method" value="${escapeHtml(code_challenge_method)}">
-  <input type="hidden" name="state" value="${escapeHtml(state)}">
-  <input type="hidden" name="client_id" value="${escapeHtml(client_id)}">
+  <input type="hidden" name="continuation" value="${escapeHtml(continuation)}">
+  <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
 
   <label for="pit">Private Integration Token</label>
   <input id="pit" name="pit" placeholder="pit-xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" required>

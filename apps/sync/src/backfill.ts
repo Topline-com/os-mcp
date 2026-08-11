@@ -22,6 +22,7 @@ import {
 import {
   toplineFetch,
   credentialsContext,
+  safeLog,
   ToplineApiError,
   type ToplineFetchOptions,
 } from "@topline/shared";
@@ -1227,14 +1228,12 @@ async function backfillPerParent(
     );
   }
   if (failedParents.length > 0) {
-    // Compact, log-friendly: count + first 3 IDs + first error. Full
-    // list is on the returned BackfillResult.failed_parents for any
-    // caller that wants it (cron logger, /sync/backfill response).
-    const sampleIds = failedParents.slice(0, 3).map((f) => f.parent_id).join(",");
-    console.log(
-      `[per_parent:${entity.table}] ${failedParents.length}/${parentsAttempted} parents failed ` +
-        `sample=[${sampleIds}] first_error=${failedParents[0]!.error.slice(0, 200)}`,
-    );
+    // Full diagnostics remain in the admin-gated response. Logs keep only
+    // aggregate counts so parent IDs and upstream response data stay private.
+    safeLog("warn", "per_parent_sync_failures", {
+      failed_parent_count: failedParents.length,
+      parents_attempted: parentsAttempted,
+    });
   }
 
   return {

@@ -9,8 +9,9 @@
 // Auth backend:
 //  - Customer credentials (PIT + Location ID) are stored encrypted in the
 //    CONNECTIONS KV namespace, keyed by a UUID (connection_id / cid).
-//  - Access tokens issued by OAuth and /connect are HMAC-signed envelopes
-//    containing only { cid, exp } — no plaintext PIT leaves the worker.
+//  - OAuth grants contain only a connection ID; provider access and refresh
+//    tokens never contain the PIT. /connect issues an HMAC-signed { cid, exp }
+//    envelope for clients that cannot run OAuth.
 //  - Legacy tokens that embed { pit, locationId, exp } are still accepted
 //    so deploys don't break existing Claude / ChatGPT sessions. They keep
 //    working until they expire naturally.
@@ -20,39 +21,58 @@
 // step.
 
 import { ALL_TOOLS, toolsByName, ANALYTICS_TOOL_NAMES } from "./registry.js";
-import { credentialsContext, ToplineApiError } from "@topline/shared";
+import {
+  credentialsContext,
+  safeErrorFields,
+  safeLog,
+  ToplineApiError,
+} from "@topline/shared";
 import {
   signToken,
   verifyToken,
-  verifyPkce,
   isCidAccess,
   isLegacyAccess,
   createConnection,
+  deleteConnection,
   loadAndDecryptConnection,
   touchConnection,
-  type AuthCodePayload,
   type AccessTokenPayload,
   type LegacyAccessTokenPayload,
 } from "@topline/shared-auth";
 import {
-  authorizeFormHtml,
   connectFormHtml,
   connectResultHtml,
 } from "./remote-oauth.js";
 import { LocationDO } from "@topline/shared-do";
+import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { edgeContext } from "./request-context.js";
 import { locationClient } from "./location-do-client.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
 import { buildCatalog } from "@topline/shared-schema";
+import {
+  handleAuthorizationRequest,
+  type AuthorizationDependencies,
+  type OAuthGrantProps,
+} from "./oauth/authorization.js";
+import { OAuthFlowDO } from "./oauth/flow-do.js";
+import {
+  AUTHORIZATION_SERVER_ORIGIN,
+  MCP_RESOURCE,
+  OAUTH_SCOPE,
+  createOAuthWorker,
+  type OAuthProviderEnv,
+} from "./oauth/provider.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
 // sync worker can import the same type surface without circular deps.
-export { LocationDO };
+export { LocationDO, OAuthFlowDO };
 
-interface Env {
+interface Env extends OAuthProviderEnv {
   TOKEN_SIGNING_SECRET: string;
   TOPLINE_BRAND_NAME?: string;
+  OAUTH_PROVIDER?: OAuthHelpers;
+  MCP_ALLOWED_ORIGINS?: string;
   CONNECTIONS: KVNamespace;
   LOCATION_DO: DurableObjectNamespace<LocationDO>;
   ADMIN_TOKEN?: string;
@@ -67,61 +87,62 @@ interface Env {
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
-const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days (OAuth flow)
 const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (/connect)
-const AUTH_CODE_TTL_SECONDS = 60 * 10; // 10 minutes
+const CREDENTIAL_FORM_MAX_BYTES = 16 * 1024;
+
+const oauthWorker = createOAuthWorker<Env>({
+  apiHandler: { fetch: handleOAuthMcp },
+  defaultHandler: { fetch: handleDefaultRequest },
+  async resolveExternalToken({ token, env }) {
+    const resolved = await resolveBearer(token, env);
+    return "error" in resolved ? null : { props: resolved, audience: MCP_RESOURCE };
+  },
+});
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (!env.TOKEN_SIGNING_SECRET) {
       return plain(500, "Worker is missing TOKEN_SIGNING_SECRET. Run: wrangler secret put TOKEN_SIGNING_SECRET");
     }
-    if (!env.CONNECTIONS) {
-      return plain(500, "Worker is missing CONNECTIONS KV binding. Check wrangler.toml.");
+    if (!env.CONNECTIONS || !env.OAUTH_KV || !env.OAUTH_FLOW_DO) {
+      return plain(500, "Worker OAuth or connection storage bindings are missing. Check wrangler.toml.");
     }
-
-    const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
-    const url = new URL(request.url);
-
-    // CORS preflight for the MCP endpoint
-    if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
-
-    // Routing
-    switch (url.pathname) {
-      case "/":
-        return cors(landing(brand, url.origin));
-      case "/.well-known/oauth-authorization-server":
-      case "/.well-known/oauth-protected-resource":
-        return cors(oauthMetadata(url.origin));
-      case "/register":
-        return cors(await handleRegister(request));
-      case "/authorize":
-        return cors(await handleAuthorize(request, env, brand));
-      case "/token":
-        return cors(await handleToken(request, env, brand, ctx));
-      case "/connect":
-        return cors(await handleConnect(request, env, brand, ctx));
-      case "/mcp":
-        return cors(await handleMcp(request, env, ctx));
-      case "/admin/do-info":
-        return cors(await handleAdminDoInfo(request, env));
-      case "/admin/do-query":
-        return cors(await handleAdminDoQuery(request, env));
-      case "/admin/do-exec":
-        return cors(await handleAdminDoExec(request, env));
-      case "/query/api/get-overview":
-        return cors(await handleQueryApiOverview(request, env));
-      case "/query/api/catalog":
-        return cors(await handleQueryApiCatalog(request, env));
-      case "/query/api/explain-tables":
-        return cors(await handleQueryApiExplainTables(request, env));
-      case "/query/api/execute-sql":
-        return cors(await handleQueryApiExecuteSql(request, env));
-      default:
-        return cors(plain(404, "Not found"));
-    }
+    return oauthWorker.fetch(request, env, ctx);
   },
 };
+
+async function handleDefaultRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
+  const url = new URL(request.url);
+  switch (url.pathname) {
+    case "/":
+      return landing(brand, url.origin);
+    case "/authorize":
+      return handleAuthorizationRequest(request, env, brand, authorizationDependencies(ctx));
+    case "/connect":
+      return handleConnect(request, env, brand, ctx);
+    case "/admin/do-info":
+      return handleAdminDoInfo(request, env);
+    case "/admin/do-query":
+      return handleAdminDoQuery(request, env);
+    case "/admin/do-exec":
+      return handleAdminDoExec(request, env);
+    case "/query/api/get-overview":
+      return handleQueryApiOverview(request, env);
+    case "/query/api/catalog":
+      return handleQueryApiCatalog(request, env);
+    case "/query/api/explain-tables":
+      return handleQueryApiExplainTables(request, env);
+    case "/query/api/execute-sql":
+      return handleQueryApiExecuteSql(request, env);
+    default:
+      return plain(404, "Not found");
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Landing page (so visitors don't see a raw 404)
@@ -161,9 +182,20 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
   }
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
-  const form = await request.formData();
-  const pit = String(form.get("pit") ?? "").trim();
-  const locationId = String(form.get("locationId") ?? "").trim();
+  if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) {
+    return plain(415, "Unsupported media type");
+  }
+  const declaredLength = Number(request.headers.get("Content-Length") ?? "0");
+  if (Number.isFinite(declaredLength) && declaredLength > CREDENTIAL_FORM_MAX_BYTES) {
+    return plain(413, "Request body too large");
+  }
+  const encodedForm = await request.text();
+  if (encodedForm.length > CREDENTIAL_FORM_MAX_BYTES) {
+    return plain(413, "Request body too large");
+  }
+  const form = new URLSearchParams(encodedForm);
+  const pit = (form.get("pit") ?? "").trim();
+  const locationId = (form.get("locationId") ?? "").trim();
 
   if (!pit.startsWith("pit-")) {
     return html(
@@ -199,193 +231,38 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
   return html(200, connectResultHtml({ brand, origin: url.origin, token }));
 }
 
-// ---------------------------------------------------------------------------
-// OAuth 2.1 Authorization Server metadata (RFC 8414)
-// ---------------------------------------------------------------------------
-function oauthMetadata(origin: string): Response {
-  const meta = {
-    issuer: origin,
-    authorization_endpoint: `${origin}/authorize`,
-    token_endpoint: `${origin}/token`,
-    registration_endpoint: `${origin}/register`,
-    response_types_supported: ["code"],
-    grant_types_supported: ["authorization_code"],
-    code_challenge_methods_supported: ["S256", "plain"],
-    token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["mcp"],
+function authorizationDependencies(
+  ctx: ExecutionContext,
+): AuthorizationDependencies<Env> {
+  return {
+    async verifyCredentials(pit, locationId) {
+      const response = await fetch(
+        `https://services.leadconnectorhq.com/locations/${encodeURIComponent(locationId)}`,
+        {
+          headers: {
+            Authorization: `Bearer ${pit}`,
+            Version: "2021-07-28",
+          },
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      if (!response.ok) throw new Error("credential_verification_failed");
+    },
+    async createConnection(pit, locationId, _oauthClientId, env) {
+      const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
+      return createConnection(
+        env.CONNECTIONS,
+        { location_id: locationId, pit, brand_name: brand, source: "oauth" },
+        env.TOKEN_SIGNING_SECRET,
+      );
+    },
+    async deleteConnection(cid, env) {
+      await deleteConnection(env.CONNECTIONS, cid);
+    },
+    async connectionCreated(cid, env) {
+      ctx.waitUntil(kickoffInitialBackfill(env, cid));
+    },
   };
-  return json(200, meta);
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic Client Registration (RFC 7591)
-// ---------------------------------------------------------------------------
-async function handleRegister(request: Request): Promise<Response> {
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-  let body: Record<string, unknown> = {};
-  try {
-    body = (await request.json()) as Record<string, unknown>;
-  } catch {
-    return json(400, { error: "invalid_request", error_description: "Body must be JSON" });
-  }
-  const clientId = `mcp-client-${crypto.randomUUID()}`;
-  return json(201, {
-    client_id: clientId,
-    client_id_issued_at: Math.floor(Date.now() / 1000),
-    redirect_uris: (body.redirect_uris as string[] | undefined) ?? [],
-    grant_types: ["authorization_code"],
-    response_types: ["code"],
-    token_endpoint_auth_method: "none",
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Authorization endpoint — shows form, then issues a short-lived auth code.
-// The code still embeds PIT+LocId (short TTL, single use) — the connection
-// record is created when the code is exchanged at /token.
-// ---------------------------------------------------------------------------
-async function handleAuthorize(request: Request, env: Env, brand: string): Promise<Response> {
-  if (request.method === "GET") {
-    const url = new URL(request.url);
-    const redirect_uri = url.searchParams.get("redirect_uri") ?? "";
-    const code_challenge = url.searchParams.get("code_challenge") ?? "";
-    const code_challenge_method = (url.searchParams.get("code_challenge_method") ?? "S256") as
-      | "S256"
-      | "plain";
-    const state = url.searchParams.get("state") ?? "";
-    const client_id = url.searchParams.get("client_id") ?? "";
-
-    if (!redirect_uri) return plain(400, "Missing redirect_uri");
-
-    return html(
-      200,
-      authorizeFormHtml({ brand, redirect_uri, code_challenge, code_challenge_method, state, client_id }),
-    );
-  }
-
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-
-  const form = await request.formData();
-  const pit = String(form.get("pit") ?? "").trim();
-  const locationId = String(form.get("locationId") ?? "").trim();
-  const redirect_uri = String(form.get("redirect_uri") ?? "").trim();
-  const code_challenge = String(form.get("code_challenge") ?? "").trim();
-  const code_challenge_method = String(form.get("code_challenge_method") ?? "S256") as
-    | "S256"
-    | "plain";
-  const state = String(form.get("state") ?? "").trim();
-  const client_id = String(form.get("client_id") ?? "").trim();
-
-  const rerender = (error: string) =>
-    html(
-      400,
-      authorizeFormHtml({
-        brand,
-        error,
-        redirect_uri,
-        code_challenge,
-        code_challenge_method,
-        state,
-        client_id,
-      }),
-    );
-
-  if (!pit.startsWith("pit-")) {
-    return rerender(
-      `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
-    );
-  }
-  if (!locationId) return rerender("Location ID is required.");
-  if (!redirect_uri) return plain(400, "Missing redirect_uri");
-
-  const payload: AuthCodePayload = {
-    pit,
-    locationId,
-    redirect_uri,
-    code_challenge,
-    code_challenge_method,
-    exp: Math.floor(Date.now() / 1000) + AUTH_CODE_TTL_SECONDS,
-  };
-  const code = await signToken(payload, env.TOKEN_SIGNING_SECRET);
-
-  const redirect = new URL(redirect_uri);
-  redirect.searchParams.set("code", code);
-  if (state) redirect.searchParams.set("state", state);
-  return new Response(null, { status: 302, headers: { Location: redirect.toString() } });
-}
-
-// ---------------------------------------------------------------------------
-// Token endpoint — exchange auth code (+ PKCE verifier) for access token.
-// This is where we create the ConnectionDirectory record.
-// ---------------------------------------------------------------------------
-async function handleToken(request: Request, env: Env, brand: string, ctx: ExecutionContext): Promise<Response> {
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-
-  const contentType = request.headers.get("Content-Type") ?? "";
-  let grant_type: string;
-  let code: string;
-  let code_verifier: string;
-  let redirect_uri: string;
-
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    const form = await request.formData();
-    grant_type = String(form.get("grant_type") ?? "");
-    code = String(form.get("code") ?? "");
-    code_verifier = String(form.get("code_verifier") ?? "");
-    redirect_uri = String(form.get("redirect_uri") ?? "");
-  } else {
-    let body: Record<string, string> = {};
-    try {
-      body = (await request.json()) as Record<string, string>;
-    } catch {
-      return json(400, { error: "invalid_request" });
-    }
-    grant_type = body.grant_type ?? "";
-    code = body.code ?? "";
-    code_verifier = body.code_verifier ?? "";
-    redirect_uri = body.redirect_uri ?? "";
-  }
-
-  if (grant_type !== "authorization_code") {
-    return json(400, { error: "unsupported_grant_type" });
-  }
-
-  const payload = await verifyToken<AuthCodePayload>(code, env.TOKEN_SIGNING_SECRET);
-  if (!payload) return json(400, { error: "invalid_grant", error_description: "Code invalid or expired" });
-
-  if (payload.redirect_uri !== redirect_uri) {
-    return json(400, { error: "invalid_grant", error_description: "redirect_uri mismatch" });
-  }
-
-  if (payload.code_challenge) {
-    if (!code_verifier) return json(400, { error: "invalid_grant", error_description: "PKCE code_verifier required" });
-    const ok = await verifyPkce(code_verifier, payload.code_challenge, payload.code_challenge_method);
-    if (!ok) return json(400, { error: "invalid_grant", error_description: "PKCE verification failed" });
-  }
-
-  // Create the connection record and issue a cid-referencing token.
-  const cid = await createConnection(
-    env.CONNECTIONS,
-    { location_id: payload.locationId, pit: payload.pit, brand_name: brand, source: "oauth" },
-    env.TOKEN_SIGNING_SECRET,
-  );
-
-  // Kick off the initial backfill immediately (same rationale as /connect
-  // — don't make the customer wait for the cron tick).
-  ctx.waitUntil(kickoffInitialBackfill(env, cid));
-
-  const accessPayload: AccessTokenPayload = {
-    cid,
-    exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_SECONDS,
-  };
-  const access_token = await signToken(accessPayload, env.TOKEN_SIGNING_SECRET);
-
-  return json(200, {
-    access_token,
-    token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
-    scope: "mcp",
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +275,22 @@ interface JsonRpcRequest {
   params?: Record<string, unknown>;
 }
 
+interface ResolvedCredentials {
+  pit: string;
+  locationId?: string;
+  cid?: string;
+  rawPitBearer: boolean;
+}
+
+type ProviderCredentialResolution =
+  | {
+      kind: "credentials";
+      credentials: ResolvedCredentials & { locationId: string; cid: string };
+    }
+  | { kind: "not_provider" }
+  | { kind: "invalid_token" }
+  | { kind: "insufficient_scope" };
+
 /**
  * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
  *   - "pit-..."                         → raw PIT, location from header
@@ -407,9 +300,9 @@ interface JsonRpcRequest {
 async function resolveBearer(
   bearer: string,
   env: Env,
-): Promise<{ pit: string; locationId?: string; cid?: string } | { error: string }> {
+): Promise<ResolvedCredentials | { error: string }> {
   if (bearer.startsWith("pit-")) {
-    return { pit: bearer };
+    return { pit: bearer, rawPitBearer: true };
   }
 
   // Try verifying as a signed token. The payload is either new-shape or legacy.
@@ -423,30 +316,103 @@ async function resolveBearer(
       env.TOKEN_SIGNING_SECRET,
     );
     if (!decrypted) return { error: "Access token references an unknown or revoked connection" };
-    return { pit: decrypted.pit, locationId: decrypted.location_id, cid: payload.cid };
+    return {
+      pit: decrypted.pit,
+      locationId: decrypted.location_id,
+      cid: payload.cid,
+      rawPitBearer: false,
+    };
   }
 
   if (isLegacyAccess(payload)) {
     const p = payload as LegacyAccessTokenPayload;
-    return { pit: p.pit, locationId: p.locationId };
+    return { pit: p.pit, locationId: p.locationId, rawPitBearer: false };
   }
 
   return { error: "Access token payload is not recognized" };
 }
 
-async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+async function handleOAuthMcp(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const props = (ctx as ExecutionContext & {
+    props?: OAuthGrantProps | ResolvedCredentials;
+  }).props;
+  if (!props) return jsonRpcError(-32001, "Invalid access token", null, 401);
+
+  let resolved: ResolvedCredentials;
+  if ("pit" in props) {
+    resolved = props;
+  } else {
+    const provider = await resolveProviderCredentials(bearerToken(request), env);
+    if (provider.kind === "credentials") {
+      resolved = provider.credentials;
+    } else if (provider.kind === "insufficient_scope") {
+      return oauthInsufficientScope();
+    } else {
+      return queryUnauthorized("Invalid OAuth access token");
+    }
+  }
+  return handleMcp(request, env, ctx, resolved);
+}
+
+function bearerToken(request: Request): string {
+  return (request.headers.get("Authorization") ?? "").replace(/^Bearer\s+/i, "").trim();
+}
+
+function isOAuthGrantProps(value: unknown): value is OAuthGrantProps {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof (value as OAuthGrantProps).cid === "string" &&
+    typeof (value as OAuthGrantProps).oauthClientId === "string",
+  );
+}
+
+async function resolveProviderCredentials(
+  bearer: string,
+  env: Env,
+): Promise<ProviderCredentialResolution> {
+  if (!bearer || !env.OAUTH_PROVIDER) return { kind: "not_provider" };
+  const token = await env.OAUTH_PROVIDER.unwrapToken<OAuthGrantProps>(bearer);
+  if (!token) return { kind: "not_provider" };
+  if (!hasExactAudience(token.audience, MCP_RESOURCE)) return { kind: "invalid_token" };
+  const props = token.grant.props;
+  if (!isOAuthGrantProps(props)) return { kind: "invalid_token" };
+  const tokenScope = Array.isArray(token.scope) ? token.scope : [];
+  const grantScope = Array.isArray(token.grant.scope) ? token.grant.scope : [];
+  if (!tokenScope.includes(OAUTH_SCOPE) || !grantScope.includes(OAUTH_SCOPE)) {
+    return { kind: "insufficient_scope" };
+  }
+  if (token.userId !== props.cid || token.grant.clientId !== props.oauthClientId) {
+    return { kind: "invalid_token" };
+  }
+  const connection = await loadAndDecryptConnection(
+    env.CONNECTIONS,
+    props.cid,
+    env.TOKEN_SIGNING_SECRET,
+  );
+  if (!connection) return { kind: "invalid_token" };
+  return {
+    kind: "credentials",
+    credentials: {
+      pit: connection.pit,
+      locationId: connection.location_id,
+      cid: props.cid,
+      rawPitBearer: false,
+    },
+  };
+}
+
+async function handleMcp(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+  resolved: ResolvedCredentials,
+): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
-
-  const authHeader = request.headers.get("Authorization") ?? "";
-  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!bearer) {
-    return jsonRpcError(-32001, "Missing Authorization header", null, 401);
-  }
-
-  const resolved = await resolveBearer(bearer, env);
-  if ("error" in resolved) {
-    return jsonRpcError(-32001, resolved.error, null, 401);
-  }
   let { pit, locationId, cid } = resolved;
 
   // Raw-PIT bearers only (detected by the bearer starting with "pit-").
@@ -454,7 +420,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   // analytics tools (SQL surface) never call the CRM, so an unvalidated PIT
   // plus a caller-supplied location header is an auth bypass. Tracked
   // as a flag so dispatch can reject analytics calls for raw-PIT sessions.
-  const rawPitBearer = bearer.startsWith("pit-");
+  const rawPitBearer = resolved.rawPitBearer;
 
   // For raw-PIT bearers, location may come from a side-channel header.
   if (!locationId) {
@@ -631,15 +597,17 @@ async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> 
 // and the query runs against that connection's LocationDO.
 // ---------------------------------------------------------------------------
 
+interface QueryAuthorization {
+  locationId: string;
+  cid?: string;
+}
+
 async function authorizeQueryRequest(
   request: Request,
   env: Env,
-): Promise<{ locationId: string; cid?: string } | Response> {
-  const authHeader = request.headers.get("Authorization") ?? "";
-  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!bearer) {
-    return plain(401, "Missing Authorization: Bearer <token>");
-  }
+): Promise<QueryAuthorization | Response> {
+  const bearer = bearerToken(request);
+  if (!bearer) return queryUnauthorized("Missing Authorization: Bearer token");
 
   // The SQL surface requires a CONNECTION-BOUND bearer (cid token from
   // OAuth/connect, or the legacy signed { pit, locationId } token).
@@ -650,30 +618,74 @@ async function authorizeQueryRequest(
   // any location header would let the caller read whatever SQLite DB
   // they name. Reject at the door.
   if (bearer.startsWith("pit-")) {
-    return plain(
-      401,
+    return queryUnauthorized(
       "Raw PIT bearers are not accepted on the SQL surface. Use an OAuth-issued access token or one minted at /connect.",
     );
   }
 
-  const resolved = await resolveBearer(bearer, env);
-  if ("error" in resolved) {
-    return plain(401, resolved.error);
+  const provider = await resolveProviderCredentials(bearer, env);
+  if (provider.kind === "credentials") {
+    return {
+      locationId: provider.credentials.locationId,
+      cid: provider.credentials.cid,
+    };
   }
+  if (provider.kind === "insufficient_scope") return oauthInsufficientScope();
+  if (provider.kind === "invalid_token") {
+    return queryUnauthorized("Invalid OAuth access token");
+  }
+
+  const resolved = await resolveBearer(bearer, env);
+  if ("error" in resolved) return queryUnauthorized(resolved.error);
   // After the raw-PIT guard above, resolved.locationId MUST come from
   // the signed token's payload (cid → connection record, or legacy
   // { pit, locationId }). We never fall back to the X-Topline-
   // Location-Id header on the SQL path.
   if (!resolved.locationId) {
-    return plain(
-      401,
+    return queryUnauthorized(
       "Token does not carry a location. Reconnect via OAuth or /connect to mint a connection-bound token.",
     );
   }
   return { locationId: resolved.locationId, cid: resolved.cid };
 }
 
-async function handleQueryApiOverview(request: Request, env: Env): Promise<Response> {
+function hasExactAudience(audience: unknown, expected: string): boolean {
+  const values = Array.isArray(audience) ? audience : [audience];
+  return values.some((value) => value === expected);
+}
+
+function queryUnauthorized(body: string): Response {
+  return new Response(body, {
+    status: 401,
+    headers: {
+      "Content-Type": "text/plain",
+      "Cache-Control": "no-store",
+      "WWW-Authenticate": `Bearer realm="OAuth", resource_metadata="${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp", scope="${OAUTH_SCOPE}"`,
+    },
+  });
+}
+
+function oauthInsufficientScope(): Response {
+  return new Response(
+    JSON.stringify({
+      error: "insufficient_scope",
+      error_description: `The ${OAUTH_SCOPE} scope is required`,
+    }),
+    {
+      status: 403,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+        "WWW-Authenticate": `Bearer realm="OAuth", resource_metadata="${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp", error="insufficient_scope", scope="${OAUTH_SCOPE}"`,
+      },
+    },
+  );
+}
+
+async function handleQueryApiOverview(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env);
   if (auth instanceof Response) return auth;
@@ -686,7 +698,10 @@ async function handleQueryApiOverview(request: Request, env: Env): Promise<Respo
   }
 }
 
-async function handleQueryApiCatalog(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiCatalog(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env);
   if (auth instanceof Response) return auth;
@@ -697,7 +712,10 @@ async function handleQueryApiCatalog(request: Request, env: Env): Promise<Respon
   }
 }
 
-async function handleQueryApiExplainTables(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiExplainTables(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env);
   if (auth instanceof Response) return auth;
@@ -715,7 +733,10 @@ async function handleQueryApiExplainTables(request: Request, env: Env): Promise<
   }
 }
 
-async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Response> {
+async function handleQueryApiExecuteSql(
+  request: Request,
+  env: Env,
+): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
   const auth = await authorizeQueryRequest(request, env);
   if (auth instanceof Response) return auth;
@@ -876,12 +897,10 @@ async function handleAdminDoExec(request: Request, env: Env): Promise<Response> 
 // ---------------------------------------------------------------------------
 async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<void> {
   if (!env.SYNC_WORKER || !env.ADMIN_TOKEN) {
-    console.log(
-      `[kickoff] skipping connection=${connectionId} — ` +
-        (!env.SYNC_WORKER
-          ? "SYNC_WORKER binding not configured (check wrangler.toml [[services]])"
-          : "ADMIN_TOKEN secret not set on this worker"),
-    );
+    safeLog("log", "backfill_kickoff_skipped", {
+      missing_sync_binding: !env.SYNC_WORKER,
+      missing_admin_token: !env.ADMIN_TOKEN,
+    });
     return;
   }
   try {
@@ -895,12 +914,9 @@ async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<v
         headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
       },
     );
-    console.log(
-      `[kickoff] connection=${connectionId} backfill-all ${res.status} (sync worker)`,
-    );
+    safeLog("log", "backfill_kickoff_completed", { status: res.status });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.log(`[kickoff] connection=${connectionId} FAILED ${msg.slice(0, 200)}`);
+    safeLog("warn", "backfill_kickoff_failed", { error: safeErrorFields(err) });
   }
 }
 
@@ -931,15 +947,4 @@ function jsonRpcResult(id: number | string | null, result: unknown): Response {
 
 function jsonRpcError(code: number, message: string, id: number | string | null, httpStatus = 200): Response {
   return json(httpStatus, { jsonrpc: "2.0", id, error: { code, message } });
-}
-
-function cors(response: Response): Response {
-  response.headers.set("Access-Control-Allow-Origin", "*");
-  response.headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  response.headers.set(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Topline-Location-Id, Mcp-Session-Id, Mcp-Protocol-Version",
-  );
-  response.headers.set("Access-Control-Expose-Headers", "Mcp-Session-Id");
-  return response;
 }

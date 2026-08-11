@@ -1,0 +1,176 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  AUTHORIZATION_SERVER_ORIGIN,
+  MCP_RESOURCE,
+  createOAuthWorker,
+} from "./provider.js";
+
+const noopHandler = {
+  fetch() {
+    return new Response("not found", { status: 404 });
+  },
+};
+
+const executionContext = {
+  waitUntil() {},
+  passThroughOnException() {},
+  props: undefined,
+} as unknown as ExecutionContext;
+
+function createWorker() {
+  return createOAuthWorker({
+    apiHandler: noopHandler,
+    defaultHandler: noopHandler,
+  });
+}
+
+test("OAuth discovery publishes separate RFC 9728 and RFC 8414 documents", async () => {
+  const worker = createWorker();
+  const env = { OAUTH_KV: {} as KVNamespace };
+
+  const protectedResponse = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp`),
+    env,
+    executionContext,
+  );
+  assert.equal(protectedResponse.status, 200);
+  const protectedMetadata = await protectedResponse.json() as Record<string, unknown>;
+  assert.equal(protectedMetadata.resource, MCP_RESOURCE);
+  assert.deepEqual(protectedMetadata.authorization_servers, [AUTHORIZATION_SERVER_ORIGIN]);
+  assert.deepEqual(protectedMetadata.scopes_supported, ["mcp"]);
+  assert.deepEqual(protectedMetadata.bearer_methods_supported, ["header"]);
+  assert.equal("issuer" in protectedMetadata, false);
+
+  const authorizationResponse = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-authorization-server`),
+    env,
+    executionContext,
+  );
+  assert.equal(authorizationResponse.status, 200);
+  const authorizationMetadata = await authorizationResponse.json() as Record<string, unknown>;
+  assert.equal(authorizationMetadata.issuer, AUTHORIZATION_SERVER_ORIGIN);
+  assert.equal(authorizationMetadata.authorization_endpoint, `${AUTHORIZATION_SERVER_ORIGIN}/authorize`);
+  assert.equal(authorizationMetadata.token_endpoint, `${AUTHORIZATION_SERVER_ORIGIN}/token`);
+  assert.equal(authorizationMetadata.registration_endpoint, `${AUTHORIZATION_SERVER_ORIGIN}/register`);
+  assert.deepEqual(authorizationMetadata.code_challenge_methods_supported, ["S256"]);
+  assert.equal(authorizationMetadata.authorization_response_iss_parameter_supported, true);
+  assert.equal(authorizationMetadata.client_id_metadata_document_supported, true);
+  assert.equal("resource" in authorizationMetadata, false);
+});
+
+test("unauthorized MCP requests advertise canonical protected-resource metadata", async () => {
+  const response = await createWorker().fetch(
+    new Request(MCP_RESOURCE, { method: "POST" }),
+    { OAUTH_KV: {} as KVNamespace },
+    executionContext,
+  );
+
+  assert.equal(response.status, 401);
+  assert.equal(
+    response.headers.get("WWW-Authenticate"),
+    `Bearer realm="OAuth", resource_metadata="${AUTHORIZATION_SERVER_ORIGIN}/.well-known/oauth-protected-resource/mcp", scope="mcp"`,
+  );
+});
+
+test("browser MCP requests use an exact configured Origin allowlist", async () => {
+  const worker = createWorker();
+  const env = {
+    OAUTH_KV: {} as KVNamespace,
+    MCP_ALLOWED_ORIGINS: "https://trusted.example,https://other.example",
+  };
+
+  const trusted = await worker.fetch(
+    new Request(MCP_RESOURCE, {
+      method: "POST",
+      headers: { Origin: "https://trusted.example" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(trusted.status, 401);
+  assert.equal(trusted.headers.get("Access-Control-Allow-Origin"), "https://trusted.example");
+  assert.match(trusted.headers.get("Vary") ?? "", /Origin/);
+
+  const untrusted = await worker.fetch(
+    new Request(MCP_RESOURCE, {
+      method: "POST",
+      headers: { Origin: "https://attacker.example" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(untrusted.status, 403);
+  assert.equal(untrusted.headers.get("Access-Control-Allow-Origin"), null);
+
+  const preflight = await worker.fetch(
+    new Request(MCP_RESOURCE, {
+      method: "OPTIONS",
+      headers: { Origin: "https://trusted.example" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get("Access-Control-Allow-Origin"), "https://trusted.example");
+  assert.match(
+    preflight.headers.get("Access-Control-Allow-Headers") ?? "",
+    /X-Topline-Location-Id/,
+  );
+
+  const query = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+      headers: { Origin: "https://trusted.example" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(query.status, 404);
+  assert.equal(query.headers.get("Access-Control-Allow-Origin"), "https://trusted.example");
+
+  const queryPreflight = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://trusted.example",
+        "Access-Control-Request-Method": "GET",
+        "Access-Control-Request-Headers": "authorization,x-topline-location-id",
+      },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(queryPreflight.status, 204);
+  assert.equal(queryPreflight.headers.get("Access-Control-Allow-Origin"), "https://trusted.example");
+  assert.match(
+    queryPreflight.headers.get("Access-Control-Allow-Headers") ?? "",
+    /X-Topline-Location-Id/,
+  );
+
+  const blockedQuery = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+      headers: { Origin: "https://evil.example" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(blockedQuery.status, 403);
+
+  const nullOrigin = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+      headers: { Origin: "null" },
+    }),
+    env,
+    executionContext,
+  );
+  assert.equal(nullOrigin.status, 403);
+  assert.equal(nullOrigin.headers.get("Access-Control-Allow-Origin"), null);
+
+  const absentOrigin = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`),
+    env,
+    executionContext,
+  );
+  assert.notEqual(absentOrigin.status, 403);
+  assert.equal(absentOrigin.headers.get("Access-Control-Allow-Origin"), null);
+});
