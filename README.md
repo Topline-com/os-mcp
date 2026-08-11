@@ -230,6 +230,8 @@ topline-com/os-mcp (monorepo)
 └── docs/                    rollout runbook + per-client setup guides
 ```
 
+See [Connection-scoped tool policies](./docs/connection-tool-policies.md) for presets, custom allowlists, update and revocation behavior, and the dated Microsoft Copilot constraints.
+
 **Runtime model.** Two entry points share one `ACTION_TOOLS` registry:
 
 - **stdio install** (`npx -y github:topline-com/os-mcp`) — runs locally as a Claude Desktop/Code subprocess. Reads `TOPLINE_PIT`, `TOPLINE_LOCATION_ID`, `TOPLINE_API_BASE_URL` from env. No hosted intermediary.

@@ -19,6 +19,7 @@
 // HKDF. Rotating it invalidates every token AND every encrypted PIT in one
 // step.
 
+import { ACTION_TOOLS, ALL_TOOLS } from "./registry.js";
 import { credentialsContext } from "@topline/shared";
 import {
   signToken,
@@ -27,8 +28,7 @@ import {
   isCidAccess,
   isLegacyAccess,
   createConnection,
-  loadAndDecryptConnection,
-  touchConnection,
+  deleteConnection,
   type AuthCodePayload,
   type AccessTokenPayload,
   type LegacyAccessTokenPayload,
@@ -44,17 +44,44 @@ import { locationClient } from "./location-do-client.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
 import { buildCatalog } from "@topline/shared-schema";
 import { handleMcpHttpRequest } from "./mcp-http.js";
-import { remoteMcpHandler } from "./mcp-server.js";
+import { createRemoteMcpHandler } from "./mcp-server.js";
+import { ConnectionAuthDO } from "./connection-auth-do.js";
+import {
+  authorizationStub,
+  initializeConnectionAuthorization,
+  loadActiveConnectionAuthorization,
+  loadConnectionAuthorizationForManagement,
+} from "./connection-auth-client.js";
+import { buildToolAccess } from "./tool-access.js";
+import {
+  requireQueryApiOperation,
+  type QueryApiOperation,
+} from "./query-api-access.js";
+import {
+  PolicyReauthorizationRequiredError,
+  type ConnectionAuthorizationSnapshot,
+  type PersistedToolPolicy,
+} from "./tool-policy.js";
+import {
+  assessClientCompatibility,
+  type ToolSelection,
+} from "./tool-presets.js";
+import {
+  buildToolSelectionView,
+  compilePolicyUpdate,
+  parseToolSelectionForm,
+} from "./tool-selection-view.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
 // sync worker can import the same type surface without circular deps.
-export { LocationDO };
+export { ConnectionAuthDO, LocationDO };
 
 interface Env {
   TOKEN_SIGNING_SECRET: string;
   TOPLINE_BRAND_NAME?: string;
   CONNECTIONS: KVNamespace;
+  CONNECTION_AUTH_DO: DurableObjectNamespace<ConnectionAuthDO>;
   LOCATION_DO: DurableObjectNamespace<LocationDO>;
   ADMIN_TOKEN?: string;
   /**
@@ -103,6 +130,8 @@ export default {
         return cors(await handleToken(request, env, brand, ctx));
       case "/connect":
         return cors(await handleConnect(request, env, brand, ctx));
+      case "/connection/policy":
+        return cors(await handleConnectionPolicy(request, env));
       case "/admin/do-info":
         return cors(await handleAdminDoInfo(request, env));
       case "/admin/do-query":
@@ -156,27 +185,36 @@ function landing(brand: string, origin: string): Response {
 // ---------------------------------------------------------------------------
 async function handleConnect(request: Request, env: Env, brand: string, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
+  const toolSelection = buildToolSelectionView(ALL_TOOLS);
   if (request.method === "GET") {
-    return html(200, connectFormHtml({ brand, origin: url.origin }));
+    return html(200, connectFormHtml({ brand, origin: url.origin, toolSelection }));
   }
   if (request.method !== "POST") return plain(405, "Method not allowed");
 
   const form = await request.formData();
   const pit = String(form.get("pit") ?? "").trim();
   const locationId = String(form.get("locationId") ?? "").trim();
+  const rerender = (error: string) =>
+    html(400, connectFormHtml({ brand, origin: url.origin, error, toolSelection }));
 
   if (!pit.startsWith("pit-")) {
-    return html(
-      400,
-      connectFormHtml({
-        brand,
-        origin: url.origin,
-        error: `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
-      }),
+    return rerender(
+      `Private Integration Token should start with "pit-". Re-copy it from ${brand} → Settings → Private Integrations.`,
     );
   }
   if (!locationId) {
-    return html(400, connectFormHtml({ brand, origin: url.origin, error: "Location ID is required." }));
+    return rerender("Location ID is required.");
+  }
+
+  let selected;
+  try {
+    selected = parseToolSelectionForm(form, ALL_TOOLS);
+  } catch {
+    return rerender("Choose a valid tool set.");
+  }
+  const compatibility = assessClientCompatibility(selected.selected_count, selected.target);
+  if (!compatibility.compatible) {
+    return rerender(compatibility.error ?? "This tool set is not compatible with the selected client.");
   }
 
   const cid = await createConnection(
@@ -184,6 +222,18 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
     { location_id: locationId, pit, brand_name: brand, source: "self-serve" },
     env.TOKEN_SIGNING_SECRET,
   );
+  try {
+    await initializeConnectionAuthorization(
+      env,
+      cid,
+      locationId,
+      selected.policy,
+      selected.target,
+    );
+  } catch {
+    await deleteConnection(env.CONNECTIONS, cid);
+    return rerender("Could not persist this connection's tool policy. Try again.");
+  }
 
   // Fire the initial full backfill in the background. The cron would
   // eventually seed this connection on its next 15-min tick, but running
@@ -245,6 +295,7 @@ async function handleRegister(request: Request): Promise<Response> {
 // record is created when the code is exchanged at /token.
 // ---------------------------------------------------------------------------
 async function handleAuthorize(request: Request, env: Env, brand: string): Promise<Response> {
+  const toolSelection = buildToolSelectionView(ALL_TOOLS);
   if (request.method === "GET") {
     const url = new URL(request.url);
     const redirect_uri = url.searchParams.get("redirect_uri") ?? "";
@@ -259,7 +310,15 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
 
     return html(
       200,
-      authorizeFormHtml({ brand, redirect_uri, code_challenge, code_challenge_method, state, client_id }),
+      authorizeFormHtml({
+        brand,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        state,
+        client_id,
+        toolSelection,
+      }),
     );
   }
 
@@ -287,6 +346,7 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
         code_challenge_method,
         state,
         client_id,
+        toolSelection,
       }),
     );
 
@@ -298,12 +358,28 @@ async function handleAuthorize(request: Request, env: Env, brand: string): Promi
   if (!locationId) return rerender("Location ID is required.");
   if (!redirect_uri) return plain(400, "Missing redirect_uri");
 
-  const payload: AuthCodePayload = {
+  let selected;
+  try {
+    selected = parseToolSelectionForm(form, ALL_TOOLS);
+  } catch {
+    return rerender("Choose a valid tool set.");
+  }
+  const compatibility = assessClientCompatibility(selected.selected_count, selected.target);
+  if (!compatibility.compatible) {
+    return rerender(compatibility.error ?? "This tool set is not compatible with the selected client.");
+  }
+
+  const payload: AuthCodePayload & {
+    tool_policy: PersistedToolPolicy;
+    target_client: "generic" | "copilot_studio";
+  } = {
     pit,
     locationId,
     redirect_uri,
     code_challenge,
     code_challenge_method,
+    tool_policy: selected.policy,
+    target_client: selected.target,
     exp: Math.floor(Date.now() / 1000) + AUTH_CODE_TTL_SECONDS,
   };
   const code = await signToken(payload, env.TOKEN_SIGNING_SECRET);
@@ -350,7 +426,15 @@ async function handleToken(request: Request, env: Env, brand: string, ctx: Execu
     return json(400, { error: "unsupported_grant_type" });
   }
 
-  const payload = await verifyToken<AuthCodePayload>(code, env.TOKEN_SIGNING_SECRET);
+  const payload = await verifyToken<
+    AuthCodePayload & {
+      tool_policy?: PersistedToolPolicy;
+      target_client?: "generic" | "copilot_studio";
+    }
+  >(
+    code,
+    env.TOKEN_SIGNING_SECRET,
+  );
   if (!payload) return json(400, { error: "invalid_grant", error_description: "Code invalid or expired" });
 
   if (payload.redirect_uri !== redirect_uri) {
@@ -369,6 +453,18 @@ async function handleToken(request: Request, env: Env, brand: string, ctx: Execu
     { location_id: payload.locationId, pit: payload.pit, brand_name: brand, source: "oauth" },
     env.TOKEN_SIGNING_SECRET,
   );
+  try {
+    await initializeConnectionAuthorization(
+      env,
+      cid,
+      payload.locationId,
+      payload.tool_policy ?? { version: 1, mode: "all" },
+      payload.target_client ?? "generic",
+    );
+  } catch {
+    await deleteConnection(env.CONNECTIONS, cid);
+    return json(500, { error: "server_error" });
+  }
 
   // Kick off the initial backfill immediately (same rationale as /connect
   // — don't make the customer wait for the cron tick).
@@ -388,6 +484,135 @@ async function handleToken(request: Request, env: Env, brand: string, ctx: Execu
   });
 }
 
+// ---------------------------------------------------------------------------
+// Authenticated connection policy management. Updates keep the existing
+// bearer valid and take effect on the next stateless request. DELETE marks
+// the strongly ordered authorization record revoked before deleting KV.
+// ---------------------------------------------------------------------------
+async function handleConnectionPolicy(request: Request, env: Env): Promise<Response> {
+  const authHeader = request.headers.get("Authorization") ?? "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  const payload = bearer
+    ? await verifyToken<unknown>(bearer, env.TOKEN_SIGNING_SECRET)
+    : null;
+  if (!isCidAccess(payload)) {
+    return json(401, { error: "Connection-bound authorization required." });
+  }
+
+  let active;
+  try {
+    active = await loadConnectionAuthorizationForManagement(env, payload.cid);
+  } catch {
+    return json(401, { error: "Connection is unavailable." });
+  }
+  const stub = authorizationStub(env, payload.cid);
+
+  if (request.method === "GET") {
+    return json(200, policyManagementView(active.authorization));
+  }
+
+  let body: {
+    expected_policy_version?: number;
+    selection?: ToolSelection;
+    target_client?: "generic" | "copilot_studio";
+  };
+  try {
+    body = (await request.json()) as typeof body;
+  } catch {
+    return json(400, { error: "Body must be JSON." });
+  }
+  if (!Number.isSafeInteger(body.expected_policy_version)) {
+    return json(400, { error: "expected_policy_version is required." });
+  }
+
+  if (request.method === "PUT") {
+    if (active.authorization.policy_version !== body.expected_policy_version) {
+      return json(409, { error: "Policy changed or connection is unavailable. Refresh and retry." });
+    }
+    let policy;
+    let target;
+    try {
+      ({ policy, target } = compilePolicyUpdate(
+        body.selection as ToolSelection,
+        body.target_client,
+        active.authorization.client_target ?? "generic",
+        ALL_TOOLS,
+        active.authorization.policy,
+      ));
+    } catch (error) {
+      if (error instanceof PolicyReauthorizationRequiredError) {
+        return json(403, {
+          error: "reauthorization_required",
+          message: "Broadening tool access requires a new authorization.",
+        });
+      }
+      return json(400, {
+        error: error instanceof Error ? error.message : "Choose a valid tool set.",
+      });
+    }
+    try {
+      const updated = await stub.updatePolicy({
+        location_id: active.connection.location_id,
+        expected_policy_version: body.expected_policy_version!,
+        policy,
+        client_target: target,
+      });
+      return json(200, policyManagementView(updated));
+    } catch {
+      return json(409, { error: "Policy changed or connection is unavailable. Refresh and retry." });
+    }
+  }
+
+  if (request.method === "DELETE") {
+    let revoked;
+    try {
+      revoked = await stub.revoke({
+        location_id: active.connection.location_id,
+        expected_policy_version: body.expected_policy_version!,
+      });
+    } catch {
+      return json(409, { error: "Policy changed or connection is unavailable. Refresh and retry." });
+    }
+    try {
+      await deleteConnection(env.CONNECTIONS, payload.cid);
+      return new Response(null, { status: 204 });
+    } catch {
+      return json(202, {
+        status: "revoked",
+        policy_version: revoked.policy_version,
+        credential_cleanup: "pending",
+      });
+    }
+  }
+
+  return plain(405, "Method not allowed");
+}
+
+function policyManagementView(snapshot: ConnectionAuthorizationSnapshot): object {
+  const catalogIds = new Set(ALL_TOOLS.map((tool) => tool.name));
+  const selectedIds =
+    snapshot.policy.mode === "all"
+      ? ALL_TOOLS.map((tool) => tool.name)
+      : snapshot.policy.tool_ids.filter((id) => catalogIds.has(id));
+  const staleIds =
+    snapshot.policy.mode === "allow"
+      ? snapshot.policy.tool_ids.filter((id) => !catalogIds.has(id))
+      : [];
+  return {
+    status: snapshot.status,
+    client_target: snapshot.client_target ?? "generic",
+    policy: snapshot.policy,
+    policy_version: snapshot.policy_version,
+    selected_count: snapshot.status === "active" ? selectedIds.length : 0,
+    stale_tool_ids: staleIds,
+    cache: {
+      scope: "private",
+      revision: snapshot.policy_version,
+      effective: "next_request",
+    },
+  };
+}
+
 /**
  * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
  *   - "pit-..."                         → raw PIT, location from header
@@ -397,9 +622,17 @@ async function handleToken(request: Request, env: Env, brand: string, ctx: Execu
 async function resolveBearer(
   bearer: string,
   env: Env,
-): Promise<{ pit: string; locationId?: string; cid?: string } | { error: string }> {
+): Promise<
+  | {
+      pit: string;
+      locationId?: string;
+      cid?: string;
+      authorization: ConnectionAuthorizationSnapshot | null;
+    }
+  | { error: string }
+> {
   if (bearer.startsWith("pit-")) {
-    return { pit: bearer };
+    return { pit: bearer, authorization: null };
   }
 
   // Try verifying as a signed token. The payload is either new-shape or legacy.
@@ -407,18 +640,22 @@ async function resolveBearer(
   if (!payload) return { error: "Access token invalid or expired" };
 
   if (isCidAccess(payload)) {
-    const decrypted = await loadAndDecryptConnection(
-      env.CONNECTIONS,
-      payload.cid,
-      env.TOKEN_SIGNING_SECRET,
-    );
-    if (!decrypted) return { error: "Access token references an unknown or revoked connection" };
-    return { pit: decrypted.pit, locationId: decrypted.location_id, cid: payload.cid };
+    try {
+      const active = await loadActiveConnectionAuthorization(env, payload.cid);
+      return {
+        pit: active.connection.pit,
+        locationId: active.connection.location_id,
+        cid: payload.cid,
+        authorization: active.authorization,
+      };
+    } catch {
+      return { error: "Access token references an unavailable connection" };
+    }
   }
 
   if (isLegacyAccess(payload)) {
     const p = payload as LegacyAccessTokenPayload;
-    return { pit: p.pit, locationId: p.locationId };
+    return { pit: p.pit, locationId: p.locationId, authorization: null };
   }
 
   return { error: "Access token payload is not recognized" };
@@ -443,7 +680,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
       error: { code: -32001, message: resolved.error },
     });
   }
-  let { pit, locationId, cid } = resolved;
+  let { pit, locationId, cid, authorization } = resolved;
 
   // Raw-PIT bearers only (detected by the bearer starting with "pit-").
   // Action tools tolerate raw PITs because the CRM validates them upstream;
@@ -457,9 +694,14 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
     locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
   }
 
-  const response = await edgeContext.run({ location_do: env.LOCATION_DO }, () =>
+  const toolAccess = buildToolAccess(
+    authorization,
+    rawPitBearer ? ACTION_TOOLS : ALL_TOOLS,
+  );
+  const mcpHandler = createRemoteMcpHandler({ tools: toolAccess.advertised });
+  const response = await edgeContext.run({ location_do: env.LOCATION_DO, authorization }, () =>
     credentialsContext.run({ pit, locationId }, () =>
-      remoteMcpHandler.fetch(request, {
+      mcpHandler.fetch(request, {
         authInfo: {
           token: bearer,
           clientId: cid ?? (rawPitBearer ? "legacy-raw-pit" : "legacy-embedded-token"),
@@ -469,8 +711,11 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
       }),
     ),
   );
-  // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
-  if (cid) ctx.waitUntil(touchConnection(env.CONNECTIONS, cid));
+  // Best-effort authorization metadata touch. It cannot overwrite policy
+  // because the same connection-scoped DO serializes both operations.
+  if (cid && locationId) {
+    ctx.waitUntil(authorizationStub(env, cid).touch(locationId).then(() => undefined));
+  }
   return response;
 }
 
@@ -531,6 +776,7 @@ async function handleAdminDoInfo(request: Request, env: Env): Promise<Response> 
 async function authorizeQueryRequest(
   request: Request,
   env: Env,
+  operation: QueryApiOperation,
 ): Promise<{ locationId: string; cid?: string } | Response> {
   const authHeader = request.headers.get("Authorization") ?? "";
   const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
@@ -567,12 +813,17 @@ async function authorizeQueryRequest(
       "Token does not carry a location. Reconnect via OAuth or /connect to mint a connection-bound token.",
     );
   }
+  try {
+    requireQueryApiOperation(resolved.authorization, operation, ALL_TOOLS);
+  } catch {
+    return plain(403, "This operation is not available for the connection.");
+  }
   return { locationId: resolved.locationId, cid: resolved.cid };
 }
 
 async function handleQueryApiOverview(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
-  const auth = await authorizeQueryRequest(request, env);
+  const auth = await authorizeQueryRequest(request, env, "overview");
   if (auth instanceof Response) return auth;
   try {
     const client = locationClient(env.LOCATION_DO, auth.locationId);
@@ -585,7 +836,7 @@ async function handleQueryApiOverview(request: Request, env: Env): Promise<Respo
 
 async function handleQueryApiCatalog(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
-  const auth = await authorizeQueryRequest(request, env);
+  const auth = await authorizeQueryRequest(request, env, "catalog");
   if (auth instanceof Response) return auth;
   try {
     return json(200, { entries: buildCatalog() });
@@ -596,7 +847,7 @@ async function handleQueryApiCatalog(request: Request, env: Env): Promise<Respon
 
 async function handleQueryApiExplainTables(request: Request, env: Env): Promise<Response> {
   if (request.method !== "GET") return plain(405, "Method not allowed");
-  const auth = await authorizeQueryRequest(request, env);
+  const auth = await authorizeQueryRequest(request, env, "explain_tables");
   if (auth instanceof Response) return auth;
   const url = new URL(request.url);
   const tables = url.searchParams.getAll("table");
@@ -614,7 +865,7 @@ async function handleQueryApiExplainTables(request: Request, env: Env): Promise<
 
 async function handleQueryApiExecuteSql(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return plain(405, "Method not allowed");
-  const auth = await authorizeQueryRequest(request, env);
+  const auth = await authorizeQueryRequest(request, env, "execute_sql");
   if (auth instanceof Response) return auth;
 
   let body: { sql?: string } = {};
@@ -824,7 +1075,7 @@ function plain(status: number, body: string): Response {
 
 function cors(response: Response): Response {
   response.headers.set("Access-Control-Allow-Origin", "*");
-  response.headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+  response.headers.set("Access-Control-Allow-Methods", "POST, GET, PUT, DELETE, OPTIONS");
   response.headers.set(
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization, X-Topline-Location-Id",

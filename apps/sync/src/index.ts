@@ -22,6 +22,7 @@ import {
   type BackfillResult,
   type IncrementalResult,
 } from "./backfill.js";
+import { loadAuthorizedSyncConnection } from "./connection-auth.js";
 
 interface Env extends SyncEnv {
   ADMIN_TOKEN?: string;
@@ -159,13 +160,12 @@ async function handleClearCursor(request: Request, env: Env): Promise<Response> 
   if (!connectionId) return plain(400, "Missing ?connection_id=<uuid>");
   if (!entity) return plain(400, "Missing ?entity=<table>");
 
-  const { loadAndDecryptConnection } = await import("@topline/shared-auth");
-  const connection = await loadAndDecryptConnection(
-    env.CONNECTIONS,
-    connectionId,
-    env.TOKEN_SIGNING_SECRET,
-  );
-  if (!connection) return json(404, { error: `Unknown connection: ${connectionId}` });
+  let connection;
+  try {
+    connection = await loadAuthorizedSyncConnection(env, connectionId);
+  } catch {
+    return json(404, { error: "Connection is unavailable." });
+  }
 
   const doId = env.LOCATION_DO.idFromName(connection.location_id);
   const stub = env.LOCATION_DO.get(doId);

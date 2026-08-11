@@ -5,6 +5,8 @@
 // @topline/shared-auth — they're shared with the sync worker and any future
 // service that needs to validate inbound tokens.
 
+import type { ToolSelectionView } from "./tool-selection-view.js";
+
 // --- HTML / responses ---
 
 export function authorizeFormHtml(params: {
@@ -15,9 +17,18 @@ export function authorizeFormHtml(params: {
   code_challenge_method: string;
   state: string;
   client_id: string;
+  toolSelection: ToolSelectionView;
 }): string {
-  const { brand, error, redirect_uri, code_challenge, code_challenge_method, state, client_id } =
-    params;
+  const {
+    brand,
+    error,
+    redirect_uri,
+    code_challenge,
+    code_challenge_method,
+    state,
+    client_id,
+    toolSelection,
+  } = params;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -72,10 +83,86 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
   <label for="locationId">Location ID</label>
   <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required>
 
+  ${toolSelectionControlsHtml(toolSelection)}
+
   <button type="submit">Connect</button>
 </form>
 </body>
 </html>`;
+}
+
+function toolSelectionControlsHtml(view: ToolSelectionView): string {
+  const options = view.presets
+    .map(
+      (preset) =>
+        `<option value="${escapeHtml(preset.id)}" data-count="${preset.count}" data-tools="${escapeHtml(JSON.stringify(preset.tool_ids))}" ${
+          preset.id === view.default_preset ? "selected" : ""
+        }>${escapeHtml(preset.label)} — ${preset.count} tools</option>`,
+    )
+    .join("");
+  const customTools = view.custom_tools
+    .map(
+      (tool) =>
+        `<label style="display:block;margin-top:6px;font-weight:400;font-family:monospace"><input type="checkbox" name="toolIds" value="${escapeHtml(tool.id)}" style="width:auto;margin:0 8px 0 0">${escapeHtml(tool.label)}</label>`,
+    )
+    .join("");
+
+  return `<fieldset style="margin-top:24px;border:1px solid #999;border-radius:8px;padding:14px">
+    <legend style="font-weight:600">Tools this connection can use</legend>
+    <label for="toolPreset">Tool set</label>
+    <select id="toolPreset" name="toolPreset" style="width:100%;box-sizing:border-box;padding:10px 12px;margin-top:6px">
+      ${options}
+      <option value="custom" data-count="0">Custom selection</option>
+    </select>
+    <p id="toolPolicyDescription" style="font-size:13px;margin:8px 0 0">The server advertises and accepts only the selected tools. A connection bearer can keep or reduce this set. Adding tools later requires a new authorization.</p>
+    <div id="customTools" hidden style="max-height:220px;overflow:auto;border:1px solid #999;padding:8px 12px;margin-top:8px">${customTools}</div>
+    <label for="targetClient">Client compatibility</label>
+    <select id="targetClient" name="targetClient" style="width:100%;box-sizing:border-box;padding:10px 12px;margin-top:6px">
+      <option value="generic">Generic MCP client</option>
+      <option value="copilot_studio">Microsoft Copilot Studio</option>
+    </select>
+    <p style="font-size:12px;color:#555;margin:6px 0 0">The target is saved with this connection. Removing a Copilot Studio target requires a new authorization. A Copilot Studio all-tools policy fails closed if future catalog growth would exceed 128 tools.</p>
+    <p id="toolCount" style="font-size:13px;margin:8px 0 0"></p>
+    <p id="toolWarning" role="alert" style="font-size:13px;margin:8px 0 0;color:#8a5600;font-weight:600"></p>
+    <details style="margin-top:8px"><summary>Review selected tool IDs</summary><pre id="selectedTools" style="white-space:pre-wrap;font-size:11px;max-height:180px;overflow:auto"></pre></details>
+  </fieldset>
+  <script>
+  (() => {
+    const form = document.currentScript.closest("form");
+    const preset = form.querySelector("#toolPreset");
+    const target = form.querySelector("#targetClient");
+    const custom = form.querySelector("#customTools");
+    const countEl = form.querySelector("#toolCount");
+    const warning = form.querySelector("#toolWarning");
+    const selectedTools = form.querySelector("#selectedTools");
+    const submit = form.querySelector('button[type="submit"]');
+    const update = () => {
+      const isCustom = preset.value === "custom";
+      custom.hidden = !isCustom;
+      const count = isCustom
+        ? custom.querySelectorAll('input[type="checkbox"]:checked').length
+        : Number(preset.selectedOptions[0].dataset.count || 0);
+      const selectedIds = isCustom
+        ? Array.from(custom.querySelectorAll('input[type="checkbox"]:checked')).map((input) => input.value)
+        : JSON.parse(preset.selectedOptions[0].dataset.tools || "[]");
+      countEl.textContent = count + " tools selected.";
+      selectedTools.textContent = selectedIds.join("\n") || "No tools selected.";
+      if (target.value === "copilot_studio" && count > 128) {
+        warning.textContent = "Copilot Studio supports at most 128 tools. Reduce this selection before connecting.";
+        submit.disabled = true;
+      } else {
+        warning.textContent = count > 30
+          ? "Microsoft recommends 25–30 tools for Copilot Studio performance and selection quality."
+          : "";
+        submit.disabled = false;
+      }
+    };
+    preset.addEventListener("change", update);
+    target.addEventListener("change", update);
+    custom.addEventListener("change", update);
+    update();
+  })();
+  </script>`;
 }
 
 function escapeHtml(s: string): string {
@@ -93,8 +180,13 @@ function escapeHtml(s: string): string {
 // their PIT + Location ID, gets back a single long-lived signed access token.
 // ---------------------------------------------------------------------------
 
-export function connectFormHtml(params: { brand: string; origin: string; error?: string }): string {
-  const { brand, origin, error } = params;
+export function connectFormHtml(params: {
+  brand: string;
+  origin: string;
+  error?: string;
+  toolSelection: ToolSelectionView;
+}): string {
+  const { brand, origin, error, toolSelection } = params;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -144,6 +236,8 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 
   <label for="locationId">Location ID</label>
   <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required>
+
+  ${toolSelectionControlsHtml(toolSelection)}
 
   <button type="submit">Generate token</button>
 </form>

@@ -15,10 +15,7 @@
 // table so retries and scheduled re-runs resume from the right
 // place.
 
-import {
-  loadAndDecryptConnection,
-  type DecryptedConnection,
-} from "@topline/shared-auth";
+import { type DecryptedConnection } from "@topline/shared-auth";
 import {
   toplineFetch,
   credentialsContext,
@@ -28,6 +25,7 @@ import {
 import { ENTITY_BY_TABLE, type EntityManifest } from "@topline/shared-schema";
 import type { LocationDO, UpsertResult, QueryResult, SyncState } from "@topline/shared-do";
 import { mapRow, getByPath } from "./mapping.js";
+import { loadAuthorizedSyncConnection } from "./connection-auth.js";
 
 /**
  * Minimal RPC surface of LocationDO that sync actually uses. Declaring it
@@ -87,6 +85,7 @@ function locationStub(
 export interface SyncEnv {
   TOKEN_SIGNING_SECRET: string;
   CONNECTIONS: KVNamespace;
+  CONNECTION_AUTH_DO: DurableObjectNamespace;
   LOCATION_DO: DurableObjectNamespace<LocationDO>;
 }
 
@@ -167,14 +166,7 @@ export async function backfillEntity(
     return unsupportedResult(started, entityTable, connectionId, "", `Unknown entity: ${entityTable}`);
   }
 
-  const connection = await loadAndDecryptConnection(
-    env.CONNECTIONS,
-    connectionId,
-    env.TOKEN_SIGNING_SECRET,
-  );
-  if (!connection) {
-    throw new Error(`Unknown or revoked connection: ${connectionId}`);
-  }
+  const connection = await loadAuthorizedSyncConnection(env, connectionId);
 
   // Refuse entities with unverified contracts. The manifest flags these
   // as pagination: "unknown" precisely so the sync worker can bail
@@ -1636,14 +1628,7 @@ export async function incrementalEntity(
     };
   }
 
-  const connection = await loadAndDecryptConnection(
-    env.CONNECTIONS,
-    connectionId,
-    env.TOKEN_SIGNING_SECRET,
-  );
-  if (!connection) {
-    throw new Error(`Unknown or revoked connection: ${connectionId}`);
-  }
+  const connection = await loadAuthorizedSyncConnection(env, connectionId);
 
   const stub = locationStub(env.LOCATION_DO, connection.location_id);
   const state = await stub.getSyncState();

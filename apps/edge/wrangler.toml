@@ -33,6 +33,12 @@ id = "f88571c17a4c47d4bf0a174d4c7dcb53"
 name = "LOCATION_DO"
 class_name = "LocationDO"
 
+# ConnectionAuthDO — one strongly ordered authorization record per cid.
+# Stores active/revoked state plus the versioned tool policy; no PITs.
+[[durable_objects.bindings]]
+name = "CONNECTION_AUTH_DO"
+class_name = "ConnectionAuthDO"
+
 # Service binding to the sync worker. Used for fire-and-forget kickoff
 # calls when a new connection is created: the edge handler calls
 # env.SYNC_WORKER.fetch(...) via ctx.waitUntil so the customer's initial
@@ -49,6 +55,11 @@ service = "topline-os-sync"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["LocationDO"]
+
+# v2 is reserved by the OAuth flow-state implementation lane.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["ConnectionAuthDO"]
 
 [observability]
 enabled = true
