@@ -48,12 +48,17 @@ import { tools as spendTools } from "./tools/spend.js";
 import { tools as formSubmissionTools } from "./tools/form_submissions.js";
 import { tools as dashboardTools } from "./tools/dashboard.js";
 
+/** Canonical wire order for every tool listing. */
+function canonicalToolOrder(tools: readonly ToolDef[]): ToolDef[] {
+  return [...tools].sort((left, right) => left.name.localeCompare(right.name));
+}
+
 /**
  * Runtime-independent the CRM action tools. Safe to run from stdio (local
  * Claude Desktop / Code install) because they only need the shared
  * HTTP client + credentialsContext.
  */
-export const ACTION_TOOLS: ToolDef[] = [
+export const ACTION_TOOLS: ToolDef[] = canonicalToolOrder([
   ...pingTools,
   ...setupCheckTools,
   ...passthroughTools,
@@ -80,20 +85,20 @@ export const ACTION_TOOLS: ToolDef[] = [
   ...spendTools,
   ...formSubmissionTools,
   ...dashboardTools,
-];
+]);
 
 /**
  * Worker-only analytics tools (SQL surface). Require apps/edge's
  * request context + LOCATION_DO binding; not usable from stdio.
  */
-export const ANALYTICS_TOOLS: ToolDef[] = [
+export const ANALYTICS_TOOLS: ToolDef[] = canonicalToolOrder([
   ...sqlTools,
   ...compositeTools,
   ...referenceTools,
-];
+]);
 
 /**
- * Name set for category checks at dispatch time (e.g., rejecting
+ * Name set for connection-time tool filtering (e.g., excluding
  * raw-PIT bearers for analytics tools).
  */
 export const ANALYTICS_TOOL_NAMES: ReadonlySet<string> = new Set(
@@ -101,7 +106,10 @@ export const ANALYTICS_TOOL_NAMES: ReadonlySet<string> = new Set(
 );
 
 /** Every tool available to the Worker (action + analytics). */
-export const ALL_TOOLS: ToolDef[] = [...ACTION_TOOLS, ...ANALYTICS_TOOLS];
+export const ALL_TOOLS: ToolDef[] = canonicalToolOrder([
+  ...ACTION_TOOLS,
+  ...ANALYTICS_TOOLS,
+]);
 
 // Sanity check: reject duplicate tool names at startup.
 const seen = new Set<string>();
@@ -111,5 +119,3 @@ for (const t of ALL_TOOLS) {
   }
   seen.add(t.name);
 }
-
-export const toolsByName = new Map<string, ToolDef>(ALL_TOOLS.map((t) => [t.name, t]));

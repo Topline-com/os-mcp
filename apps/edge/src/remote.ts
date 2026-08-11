@@ -19,8 +19,7 @@
 // HKDF. Rotating it invalidates every token AND every encrypted PIT in one
 // step.
 
-import { ALL_TOOLS, toolsByName, ANALYTICS_TOOL_NAMES } from "./registry.js";
-import { credentialsContext, ToplineApiError } from "@topline/shared";
+import { credentialsContext } from "@topline/shared";
 import {
   signToken,
   verifyToken,
@@ -44,6 +43,8 @@ import { edgeContext } from "./request-context.js";
 import { locationClient } from "./location-do-client.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
 import { buildCatalog } from "@topline/shared-schema";
+import { applyMcpCors, mcpPreflightResponse } from "./mcp-http.js";
+import { remoteMcpHandler } from "./mcp-server.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
 // The class implementation lives in packages/shared-do so the (future)
@@ -66,7 +67,6 @@ interface Env {
   SYNC_WORKER?: Fetcher;
 }
 
-const PROTOCOL_VERSION = "2024-11-05";
 const ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days (OAuth flow)
 const SELFSERVE_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 365; // 1 year (/connect)
 const AUTH_CODE_TTL_SECONDS = 60 * 10; // 10 minutes
@@ -84,6 +84,9 @@ export default {
     const url = new URL(request.url);
 
     // CORS preflight for the MCP endpoint
+    if (request.method === "OPTIONS" && url.pathname === "/mcp") {
+      return mcpPreflightResponse(request);
+    }
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
     // Routing
@@ -102,7 +105,7 @@ export default {
       case "/connect":
         return cors(await handleConnect(request, env, brand, ctx));
       case "/mcp":
-        return cors(await handleMcp(request, env, ctx));
+        return applyMcpCors(request, await handleMcp(request, env, ctx));
       case "/admin/do-info":
         return cors(await handleAdminDoInfo(request, env));
       case "/admin/do-query":
@@ -388,16 +391,6 @@ async function handleToken(request: Request, env: Env, brand: string, ctx: Execu
   });
 }
 
-// ---------------------------------------------------------------------------
-// MCP JSON-RPC endpoint
-// ---------------------------------------------------------------------------
-interface JsonRpcRequest {
-  jsonrpc: string;
-  id?: number | string | null;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
 /**
  * Resolve a bearer string to (pit, locationId, cid?). Three shapes:
  *   - "pit-..."                         → raw PIT, location from header
@@ -435,17 +428,23 @@ async function resolveBearer(
 }
 
 async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  if (request.method !== "POST") return plain(405, "Method not allowed");
-
   const authHeader = request.headers.get("Authorization") ?? "";
   const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
   if (!bearer) {
-    return jsonRpcError(-32001, "Missing Authorization header", null, 401);
+    return json(401, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32001, message: "Missing Authorization header" },
+    });
   }
 
   const resolved = await resolveBearer(bearer, env);
   if ("error" in resolved) {
-    return jsonRpcError(-32001, resolved.error, null, 401);
+    return json(401, {
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32001, message: resolved.error },
+    });
   }
   let { pit, locationId, cid } = resolved;
 
@@ -453,7 +452,7 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
   // Action tools tolerate raw PITs because the CRM validates them upstream;
   // analytics tools (SQL surface) never call the CRM, so an unvalidated PIT
   // plus a caller-supplied location header is an auth bypass. Tracked
-  // as a flag so dispatch can reject analytics calls for raw-PIT sessions.
+  // as a flag so the MCP server factory excludes analytics tools for raw-PIT sessions.
   const rawPitBearer = bearer.startsWith("pit-");
 
   // For raw-PIT bearers, location may come from a side-channel header.
@@ -461,120 +460,21 @@ async function handleMcp(request: Request, env: Env, ctx: ExecutionContext): Pro
     locationId = request.headers.get("X-Topline-Location-Id")?.trim() || undefined;
   }
 
-  let rpc: JsonRpcRequest;
-  try {
-    rpc = (await request.json()) as JsonRpcRequest;
-  } catch {
-    return jsonRpcError(-32700, "Parse error", null);
-  }
-
-  if (rpc.jsonrpc !== "2.0") {
-    return jsonRpcError(-32600, "Invalid Request", rpc.id ?? null);
-  }
-
-  try {
-    const response = await edgeContext.run({ location_do: env.LOCATION_DO }, () =>
-      credentialsContext.run({ pit, locationId }, async () => {
-        return dispatch(rpc, env, { rawPitBearer });
+  const response = await edgeContext.run({ location_do: env.LOCATION_DO }, () =>
+    credentialsContext.run({ pit, locationId }, () =>
+      remoteMcpHandler.fetch(request, {
+        authInfo: {
+          token: bearer,
+          clientId: cid ?? (rawPitBearer ? "legacy-raw-pit" : "legacy-embedded-token"),
+          scopes: ["mcp"],
+          extra: { rawPitBearer },
+        },
       }),
-    );
-    // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
-    if (cid) ctx.waitUntil(touchConnection(env.CONNECTIONS, cid));
-    return response;
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const code = err instanceof ToplineApiError ? -32002 : -32603;
-    return jsonRpcError(code, message, rpc.id ?? null);
-  }
-}
-
-async function dispatch(
-  rpc: JsonRpcRequest,
-  env: Env,
-  auth: { rawPitBearer: boolean },
-): Promise<Response> {
-  const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
-  const serverName = `${brand.toLowerCase().replace(/\s+/g, "-")}-mcp`;
-
-  switch (rpc.method) {
-    case "initialize":
-      return jsonRpcResult(rpc.id ?? null, {
-        protocolVersion: PROTOCOL_VERSION,
-        capabilities: { tools: {} },
-        serverInfo: { name: serverName, version: "0.1.0" },
-      });
-
-    case "notifications/initialized":
-    case "notifications/cancelled":
-      return new Response(null, { status: 202 });
-
-    case "ping":
-      return jsonRpcResult(rpc.id ?? null, {});
-
-    case "tools/list": {
-      // Hide analytics tools from raw-PIT sessions. tools/call will
-      // reject them anyway (see below), but filtering them out of the
-      // list avoids confusing the client into trying them.
-      const visible = auth.rawPitBearer
-        ? ALL_TOOLS.filter((t) => !ANALYTICS_TOOL_NAMES.has(t.name))
-        : ALL_TOOLS;
-      return jsonRpcResult(rpc.id ?? null, {
-        tools: visible.map(({ name, description, inputSchema }) => ({
-          name,
-          description,
-          inputSchema,
-        })),
-      });
-    }
-
-    case "tools/call": {
-      const params = rpc.params as { name?: string; arguments?: Record<string, unknown> } | undefined;
-      const name = params?.name;
-      if (!name) return jsonRpcError(-32602, "Missing tool name", rpc.id ?? null);
-      const tool = toolsByName.get(name);
-      if (!tool) {
-        return jsonRpcResult(rpc.id ?? null, {
-          isError: true,
-          content: [{ type: "text", text: `Unknown tool: ${name}` }],
-        });
-      }
-      // Analytics tools (the SQL surface) don't touch the CRM and therefore
-      // can't implicitly validate a raw-PIT bearer the way action tools
-      // do. Block them under raw-PIT sessions — caller must upgrade to
-      // an OAuth-issued cid token or a /connect-minted signed bearer.
-      if (auth.rawPitBearer && ANALYTICS_TOOL_NAMES.has(name)) {
-        return jsonRpcResult(rpc.id ?? null, {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: `Tool '${name}' is not available under a raw PIT bearer. The analytics / SQL surface requires a connection-bound token. Use an OAuth-issued access token or mint one at /connect.`,
-            },
-          ],
-        });
-      }
-      try {
-        const result = await tool.handler((params?.arguments ?? {}) as Record<string, unknown>);
-        return jsonRpcResult(rpc.id ?? null, {
-          content: [
-            {
-              type: "text",
-              text: typeof result === "string" ? result : JSON.stringify(result, null, 2),
-            },
-          ],
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return jsonRpcResult(rpc.id ?? null, {
-          isError: true,
-          content: [{ type: "text", text: message }],
-        });
-      }
-    }
-
-    default:
-      return jsonRpcError(-32601, `Method not found: ${rpc.method}`, rpc.id ?? null);
-  }
+    ),
+  );
+  // Best-effort last_verified_at update for cid-based tokens. Non-blocking.
+  if (cid) ctx.waitUntil(touchConnection(env.CONNECTIONS, cid));
+  return response;
 }
 
 // ---------------------------------------------------------------------------
@@ -925,21 +825,12 @@ function plain(status: number, body: string): Response {
   return new Response(body, { status, headers: { "Content-Type": "text/plain" } });
 }
 
-function jsonRpcResult(id: number | string | null, result: unknown): Response {
-  return json(200, { jsonrpc: "2.0", id, result });
-}
-
-function jsonRpcError(code: number, message: string, id: number | string | null, httpStatus = 200): Response {
-  return json(httpStatus, { jsonrpc: "2.0", id, error: { code, message } });
-}
-
 function cors(response: Response): Response {
   response.headers.set("Access-Control-Allow-Origin", "*");
   response.headers.set("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
   response.headers.set(
     "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Topline-Location-Id, Mcp-Session-Id, Mcp-Protocol-Version",
+    "Content-Type, Authorization, X-Topline-Location-Id",
   );
-  response.headers.set("Access-Control-Expose-Headers", "Mcp-Session-Id");
   return response;
 }

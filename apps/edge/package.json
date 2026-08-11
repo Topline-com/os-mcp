@@ -12,10 +12,10 @@
     "worker:deploy": "wrangler deploy",
     "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "pretest": "npm run build --workspace=@topline/shared --workspace=@topline/shared-auth --workspace=@topline/shared-schema --workspace=@topline/shared-do",
-    "test": "tsx --test src/sql-safety.test.ts src/write-tools.test.ts src/composite.test.ts"
+    "test": "tsx --test src/sql-safety.test.ts src/write-tools.test.ts src/composite.test.ts src/mcp-server.test.ts src/mcp-http.test.ts src/stdio-transport.test.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "@topline/shared": "*",
     "@topline/shared-auth": "*",
     "@topline/shared-do": "*",
@@ -23,12 +23,13 @@
     "node-sql-parser": "^5.4.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240405.0",
+    "@cloudflare/workers-types": "5.20260811.1",
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/node": "^20.12.0",
-    "esbuild": "^0.28.0",
-    "tsx": "^4.21.0",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.12",
     "typescript": "^5.4.0",
-    "wrangler": "^3.60.0"
+    "wrangler": "4.121.0"
   },
   "engines": {
     "node": ">=22"
