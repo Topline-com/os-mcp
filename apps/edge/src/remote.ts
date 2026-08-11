@@ -43,7 +43,7 @@ import { edgeContext } from "./request-context.js";
 import { locationClient } from "./location-do-client.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
 import { buildCatalog } from "@topline/shared-schema";
-import { applyMcpCors, mcpPreflightResponse } from "./mcp-http.js";
+import { handleMcpHttpRequest } from "./mcp-http.js";
 import { remoteMcpHandler } from "./mcp-server.js";
 
 // Re-export the DO class so wrangler can bind it to this Worker script.
@@ -83,9 +83,8 @@ export default {
     const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
     const url = new URL(request.url);
 
-    // CORS preflight for the MCP endpoint
-    if (request.method === "OPTIONS" && url.pathname === "/mcp") {
-      return mcpPreflightResponse(request);
+    if (url.pathname === "/mcp") {
+      return handleMcpHttpRequest(request, () => handleMcp(request, env, ctx));
     }
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
 
@@ -104,8 +103,6 @@ export default {
         return cors(await handleToken(request, env, brand, ctx));
       case "/connect":
         return cors(await handleConnect(request, env, brand, ctx));
-      case "/mcp":
-        return applyMcpCors(request, await handleMcp(request, env, ctx));
       case "/admin/do-info":
         return cors(await handleAdminDoInfo(request, env));
       case "/admin/do-query":
