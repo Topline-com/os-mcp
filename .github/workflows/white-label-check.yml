@@ -12,17 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check for vendor-name leakage
-        run: |
-          # The public repo cannot reference the underlying CRM by name.
-          # Fail if any tracked file contains "GHL", "GoHighLevel", "HighLevel",
-          # or "LeadConnector" (case-insensitive). Excludes this workflow itself
-          # (which must contain the strings to grep for) plus generated dirs.
-          if git grep -i -E -- 'gohighlevel|highlevel|leadconnector|(^|[^a-zA-Z0-9])GHL([^a-zA-Z0-9]|$)' \
-              ':!node_modules' \
-              ':!dist' \
-              ':!*.lock' \
-              ':!.github/workflows/white-label-check.yml'; then
-            echo "::error::Vendor-name leakage detected. The public repo cannot reference the underlying CRM by name."
-            exit 1
-          fi
-          echo "OK — no vendor-name references found."
+        run: bash scripts/check-white-label.sh
+
+      - name: Verify white-label guard behavior
+        run: bash scripts/check-white-label.sh --self-test

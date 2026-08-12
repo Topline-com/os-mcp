@@ -73,6 +73,7 @@ import {
   type ToolSelection,
 } from "./tool-presets.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
+import { verifyCredentials } from "./credential-verification.js";
 import { buildCatalog } from "@topline/shared-schema";
 import {
   handleAuthorizationRequest,
@@ -293,19 +294,7 @@ function authorizationDependencies(
   ctx: ExecutionContext,
 ): AuthorizationDependencies<Env> {
   return {
-    async verifyCredentials(pit, locationId) {
-      const response = await fetch(
-        `https://services.leadconnectorhq.com/locations/${encodeURIComponent(locationId)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${pit}`,
-            Version: "2021-07-28",
-          },
-          signal: AbortSignal.timeout(10_000),
-        },
-      );
-      if (!response.ok) throw new Error("credential_verification_failed");
-    },
+    verifyCredentials,
     async createConnection(pit, locationId, _oauthClientId, policy, clientTarget, env) {
       const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
       const cid = await createConnection(

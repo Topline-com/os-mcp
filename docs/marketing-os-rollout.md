@@ -8,7 +8,6 @@ counterpart to `/Users/alexskatell/.claude/plans/does-my-mcp-include-lively-ligh
 
 | PR | Pillar | Title | Deps |
 |---|---|---|---|
-| #8 | Pre-flight | White-label scrub (vendor names + env-driven base URL) | — |
 | #9 | P1A | Social Planner tools (4 umbrella) | — |
 | #10 | P1D | Agent Studio tools (3 umbrella) | — |
 | #11 | P1C | Email Campaigns tools (4 umbrella, paths best-effort) | — |
@@ -21,25 +20,24 @@ counterpart to `/Users/alexskatell/.claude/plans/does-my-mcp-include-lively-ligh
 
 ## Suggested merge order
 
-1. **#8 — White-label scrub** first. Sets the env-var pattern + scrubs vendor names.
-2. **Parallel: #9, #10, #11, #12, #15** — independent Pillar-1 sub-PRs + attribution views.
-3. **#13 — P2 UTM** — foundation for downstream.
-4. **#14 — P3 Spend** — depends on #13.
-5. **Parallel: #16 (P6 Forms), #17 (P5 Dashboard)** — depend on #13/#14.
+1. **Parallel: #9, #10, #11, #12, #15** — independent Pillar-1 sub-PRs + attribution views.
+2. **#13 — P2 UTM** — foundation for downstream.
+3. **#14 — P3 Spend** — depends on #13.
+4. **Parallel: #16 (P6 Forms), #17 (P5 Dashboard)** — depend on #13/#14.
 
 Each merge step expects the previous batch to be in `main` first.
 
-## ⚠️ Worker secrets — set these BEFORE merging #8
+## ⚠️ Worker secrets — set these before deployment
 
-The white-label scrub (#8) replaced the hardcoded API base URL with the
+The white-label scrub replaced the hardcoded API base URL with the
 `TOPLINE_API_BASE_URL` env var. The default in source is the placeholder
-`https://api.example.com`. If you merge #8 without setting the secret on
+`https://api.example.com`. If you deploy without setting the secret on
 each deployed Cloudflare Worker first, every API call 530s because the
 Worker hits the placeholder host.
 
 **On every Worker deployment** (`topline-os-mcp` edge worker AND
 `topline-os-sync` sync worker) — set the secret before the deploy
-triggered by #8 finishes:
+before deployment:
 
 Substitute `<CRM_API_URL>` below with the actual upstream API base URL
 Topline provides during onboarding (not committed to this repo — see
@@ -152,9 +150,11 @@ needed for the P4 attribution view. Idempotent — safe to re-run.
 
 Run these against the live PIT after each pillar lands.
 
-### After #8 (white-label scrub)
+### White-label release gate
 
-- The `.github/workflows/white-label-check.yml` CI job (canonical vendor-name grep) returns zero matches on every PR.
+- `bash scripts/check-white-label.sh` scans tracked source and documentation and returns zero matches.
+- `bash scripts/check-white-label.sh --self-test` proves clean-tree success, forbidden-name failure, and scan-error failure.
+- The `.github/workflows/white-label-check.yml` CI job runs both commands on every pull request and push to `main`; any match or scan error blocks release.
 - `npm run build` + `npm run test` + `npm run worker:typecheck` clean.
 - `topline_setup_check` still green.
 
@@ -224,7 +224,6 @@ If a network returns no rows, double-check (a) the integration is connected in t
 
 ## Known follow-ups (not blocking these merges)
 
-- **CI grep guard.** `.github/workflows/white-label-check.yml` is ready but the current `gh` OAuth token lacks `workflow` scope. After `gh auth refresh -s workflow`, force-push the file to PR #8 (or land as a follow-up PR).
 - **Homepage form UTM capture.** P4 attribution falls back to `contacts.source` until web pages set the six `utm_*_first/last` custom fields on form submission. Requires a small browser-side JS snippet, out of scope for these PRs.
 - **Worker-mode dashboard SQL execution.** P5's `topline_get_marketing_dashboard` returns SQL strings rather than running them, because the SQL surface needs the LocationDO context. A follow-up will fold the SQL execution into the dashboard tool when run in Worker mode.
 - **D1 persistence for spend.** P3 ships live-fetch only. A follow-up will sync spend transactions into a partitioned D1 table so historical data is queryable via `topline_execute_query`.

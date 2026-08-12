@@ -71,7 +71,7 @@ export function getLocationId(override?: string): string {
   );
 }
 
-function buildUrl(path: string, query?: FetchOptions["query"]): string {
+export function toplineApiUrl(path: string, query?: FetchOptions["query"]): string {
   const trimmed = path.startsWith("/") ? path : `/${path}`;
   const url = new URL(`${BASE_URL}${trimmed}`);
   if (query) {
@@ -114,7 +114,7 @@ export async function toplineFetch<T = unknown>(
 ): Promise<T> {
   const pit = requirePit();
   const method = opts.method ?? "GET";
-  const url = buildUrl(path, opts.query);
+  const url = toplineApiUrl(path, opts.query);
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${pit}`,
