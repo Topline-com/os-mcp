@@ -130,15 +130,14 @@ function isBrowserSensitivePath(pathname: string): boolean {
 function isAllowedOrigin(
   origin: string,
   pathname: string,
-  method: string,
+  _method: string,
   env: OAuthProviderEnv,
 ): boolean {
-  if ((pathname === "/authorize" || pathname === "/connect") && method === "POST") {
-    // The credential forms post same-origin only. The consent/connect form
-    // pages themselves may be loaded (GET/OPTIONS) from any allowlisted
-    // browser origin so Claude.ai / ChatGPT connectors can embed them.
-    return origin === AUTHORIZATION_SERVER_ORIGIN;
-  }
+  // GET/OPTIONS load the consent form from connector UIs. POST submits it.
+  // Both must honor the same allowlist — Claude's popup/iframe submit sends
+  // Origin: https://claude.ai, not the authorization-server origin.
+  // CSRF is the one-time continuation + csrf fields, not this Origin check.
+  if (origin === AUTHORIZATION_SERVER_ORIGIN) return true;
   const allowed = new Set(
     (env.MCP_ALLOWED_ORIGINS ?? "")
       .split(",")

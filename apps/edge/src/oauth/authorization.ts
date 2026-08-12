@@ -33,6 +33,7 @@ interface ConsentFlowNamespace {
 interface AuthorizationEnv {
   OAUTH_PROVIDER?: OAuthHelpers;
   OAUTH_FLOW_DO?: ConsentFlowNamespace;
+  MCP_ALLOWED_ORIGINS?: string;
 }
 
 export interface AuthorizationDependencies<Env> {
@@ -128,7 +129,7 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
   brand: string,
   dependencies: AuthorizationDependencies<Env>,
 ): Promise<Response> {
-  if (request.headers.get("Origin") !== AUTHORIZATION_SERVER_ORIGIN) {
+  if (!isTrustedAuthorizationOrigin(request.headers.get("Origin"), env)) {
     return new Response("Forbidden", { status: 403 });
   }
   if (!request.headers.get("Content-Type")?.startsWith("application/x-www-form-urlencoded")) {
@@ -216,6 +217,23 @@ function localAuthorizationError(description: string): Response {
     status: 400,
     headers: { "Content-Type": "text/plain; charset=utf-8" },
   });
+}
+
+function isTrustedAuthorizationOrigin(
+  origin: string | null,
+  env: AuthorizationEnv,
+): boolean {
+  // Missing Origin: top-level form POST from some browsers/popups. CSRF is
+  // the one-time continuation + csrf pair minted on GET /authorize.
+  if (!origin) return true;
+  if (origin === AUTHORIZATION_SERVER_ORIGIN) return true;
+  const allowed = new Set(
+    (env.MCP_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  return allowed.has(origin);
 }
 
 function stringField(form: URLSearchParams, name: string): string | null {

@@ -191,11 +191,12 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   assert.doesNotMatch(body, /name="(?:client_id|redirect_uri|code_challenge|code_challenge_method|state|resource)"/);
 });
 
-test("credential POST requires same-origin CSRF and consumes the continuation once", async () => {
+test("credential POST requires a trusted origin and consumes the continuation once", async () => {
   const redirectUri = "https://client.example/callback";
   const env = {
     OAUTH_KV: new MemoryKv() as unknown as KVNamespace,
     OAUTH_FLOW_DO: new MemoryFlowNamespace(),
+    MCP_ALLOWED_ORIGINS: "https://claude.ai,https://claude.com",
   } as unknown as TestEnv;
   let creates = 0;
   let createdPolicy: unknown;
@@ -245,7 +246,7 @@ test("credential POST requires same-origin CSRF and consumes the continuation on
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        Origin: AUTHORIZATION_SERVER_ORIGIN,
+        Origin: "https://claude.ai",
       },
       body,
     }),

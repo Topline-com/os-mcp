@@ -243,7 +243,7 @@ test("provider-routed MCP and metadata paths share the strict Origin decision", 
   }
 });
 
-test("authorize and connect forms load from allowlisted browser origins but POST stays same-origin", async () => {
+test("authorize and connect forms load and submit from allowlisted browser origins", async () => {
   const worker = createWorker();
   const env = {
     OAUTH_KV: {} as KVNamespace,
@@ -315,7 +315,8 @@ test("authorize and connect forms load from allowlisted browser origins but POST
     );
     assert.equal(hostileGet.status, 403, `GET ${path} from attacker`);
 
-    // POST: credential submission remains same-origin-only (CSRF boundary).
+    // POST from an allowlisted connector origin is the Claude Connect click.
+    // CSRF is the one-time continuation + csrf pair, not same-origin Origin.
     const claudePost = await worker.fetch(
       new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
         method: "POST",
@@ -325,7 +326,18 @@ test("authorize and connect forms load from allowlisted browser origins but POST
       env,
       executionContext,
     );
-    assert.equal(claudePost.status, 403, `POST ${path} from claude.ai must stay forbidden`);
+    assert.notEqual(claudePost.status, 403, `POST ${path} from claude.ai must pass the Origin gate`);
+
+    const attackerPost = await worker.fetch(
+      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
+        method: "POST",
+        headers: { Origin: "https://attacker.example", "Content-Type": "application/x-www-form-urlencoded" },
+        body: "pit=pit-test&locationId=loc",
+      }),
+      env,
+      executionContext,
+    );
+    assert.equal(attackerPost.status, 403, `POST ${path} from attacker must stay forbidden`);
   }
 });
 
