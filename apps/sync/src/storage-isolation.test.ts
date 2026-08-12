@@ -30,7 +30,8 @@ test("OAuth storage is distinct from the connection directory scanned by sync", 
 
   assert.equal(edgeConnections, syncConnections);
   assert.notEqual(oauth, edgeConnections);
-  assert.equal(oauth, "00000000000000000000000000000000");
+  assert.match(oauth, /^[0-9a-f]{32}$/);
+  assert.notEqual(oauth, "00000000000000000000000000000000");
   assert.match(syncSource, /env\.CONNECTIONS\.list\(/);
   assert.doesNotMatch(syncSource, /OAUTH_KV/);
 });

@@ -34,7 +34,7 @@ id = "f88571c17a4c47d4bf0a174d4c7dcb53"
 # Never point OAUTH_KV at CONNECTIONS or an unrelated shared namespace.
 [[kv_namespaces]]
 binding = "OAUTH_KV"
-id = "00000000000000000000000000000000"
+id = "a5828dec03184923998f940a946aef21"
 
 # LocationDO — per-tenant Durable Object backed by SQLite. Owns the synced
 # data warehouse for one location_id. Class ships from packages/shared-do
