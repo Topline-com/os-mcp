@@ -14,7 +14,7 @@ routes = [
 # if you're reselling under a different label.
 [vars]
 TOPLINE_BRAND_NAME = "Topline OS"
-MCP_ALLOWED_ORIGINS = "https://claude.ai,https://chatgpt.com,https://chat.openai.com,https://platform.openai.com,https://os-mcp.topline.com,http://localhost:6274,http://127.0.0.1:6274,http://[::1]:6274,http://localhost:8787,http://127.0.0.1:8787,http://[::1]:8787"
+MCP_ALLOWED_ORIGINS = "https://claude.ai,https://chatgpt.com,https://chat.openai.com,https://platform.openai.com,https://copilotstudio.microsoft.com,https://make.powerapps.com,https://make.powerautomate.com,https://m365.cloud.microsoft,https://copilot.cloud.microsoft,https://teams.microsoft.com,https://www.office.com,https://os-mcp.topline.com,http://localhost:6274,http://127.0.0.1:6274,http://[::1]:6274,http://localhost:8787,http://127.0.0.1:8787,http://[::1]:8787"
 
 # TOKEN_SIGNING_SECRET is set out-of-band — NEVER commit it:
 #   wrangler secret put TOKEN_SIGNING_SECRET

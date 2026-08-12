@@ -247,30 +247,49 @@ test("authorize and connect forms load from allowlisted browser origins but POST
   const worker = createWorker();
   const env = {
     OAUTH_KV: {} as KVNamespace,
-    MCP_ALLOWED_ORIGINS: "https://claude.ai,https://chatgpt.com,https://os-mcp.topline.com",
+    MCP_ALLOWED_ORIGINS: [
+      "https://claude.ai",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+      "https://platform.openai.com",
+      "https://copilotstudio.microsoft.com",
+      "https://make.powerapps.com",
+      "https://make.powerautomate.com",
+      "https://m365.cloud.microsoft",
+      "https://copilot.cloud.microsoft",
+      "https://teams.microsoft.com",
+      "https://www.office.com",
+      "https://os-mcp.topline.com",
+    ].join(","),
   };
+  const clientOrigins = [
+    "https://claude.ai",
+    "https://chatgpt.com",
+    "https://chat.openai.com",
+    "https://platform.openai.com",
+    "https://copilotstudio.microsoft.com",
+    "https://make.powerapps.com",
+    "https://make.powerautomate.com",
+    "https://m365.cloud.microsoft",
+    "https://copilot.cloud.microsoft",
+    "https://teams.microsoft.com",
+    "https://www.office.com",
+  ];
 
-  // GET: Claude/ChatGPT connector UIs must be able to load the consent and
-  // connect forms from their own origin (regression: previously 403).
+  // GET: connector UIs must be able to load the consent and connect forms
+  // from their own origin (regression: previously 403 for every client).
   for (const path of ["/authorize", "/connect"]) {
-    const claudeGet = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        headers: { Origin: "https://claude.ai" },
-      }),
-      env,
-      executionContext,
-    );
-    assert.notEqual(claudeGet.status, 403, `GET ${path} from claude.ai`);
-    assert.equal(claudeGet.headers.get("Access-Control-Allow-Origin"), "https://claude.ai");
-
-    const chatgptGet = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        headers: { Origin: "https://chatgpt.com" },
-      }),
-      env,
-      executionContext,
-    );
-    assert.notEqual(chatgptGet.status, 403, `GET ${path} from chatgpt.com`);
+    for (const clientOrigin of clientOrigins) {
+      const clientGet = await worker.fetch(
+        new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
+          headers: { Origin: clientOrigin },
+        }),
+        env,
+        executionContext,
+      );
+      assert.notEqual(clientGet.status, 403, `GET ${path} from ${clientOrigin}`);
+      assert.equal(clientGet.headers.get("Access-Control-Allow-Origin"), clientOrigin);
+    }
 
     // OPTIONS preflight from a client origin passes the gate too.
     const preflight = await worker.fetch(
@@ -305,5 +324,51 @@ test("authorize and connect forms load from allowlisted browser origins but POST
       executionContext,
     );
     assert.equal(claudePost.status, 403, `POST ${path} from claude.ai must stay forbidden`);
+  }
+});
+
+test("MCP path allowlist covers Claude, OpenAI, and Microsoft connector origins", async () => {
+  const worker = createWorker();
+  const env = {
+    OAUTH_KV: {} as KVNamespace,
+    MCP_ALLOWED_ORIGINS: [
+      "https://claude.ai",
+      "https://chatgpt.com",
+      "https://chat.openai.com",
+      "https://platform.openai.com",
+      "https://copilotstudio.microsoft.com",
+      "https://make.powerapps.com",
+      "https://make.powerautomate.com",
+      "https://m365.cloud.microsoft",
+      "https://copilot.cloud.microsoft",
+      "https://teams.microsoft.com",
+      "https://www.office.com",
+    ].join(","),
+  };
+  const clientOrigins = [
+    "https://claude.ai",
+    "https://chatgpt.com",
+    "https://chat.openai.com",
+    "https://platform.openai.com",
+    "https://copilotstudio.microsoft.com",
+    "https://make.powerapps.com",
+    "https://make.powerautomate.com",
+    "https://m365.cloud.microsoft",
+    "https://copilot.cloud.microsoft",
+    "https://teams.microsoft.com",
+    "https://www.office.com",
+  ];
+
+  for (const clientOrigin of clientOrigins) {
+    const response = await worker.fetch(
+      new Request(MCP_RESOURCE, {
+        method: "POST",
+        headers: { Origin: clientOrigin },
+      }),
+      env,
+      executionContext,
+    );
+    assert.notEqual(response.status, 403, `POST ${MCP_RESOURCE} from ${clientOrigin}`);
+    assert.equal(response.headers.get("Access-Control-Allow-Origin"), clientOrigin);
   }
 });
