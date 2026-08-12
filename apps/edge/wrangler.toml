@@ -72,7 +72,7 @@ new_sqlite_classes = ["LocationDO"]
 
 [[migrations]]
 tag = "v2"
-new_classes = ["OAuthFlowDO"]
+new_sqlite_classes = ["OAuthFlowDO"]
 
 [[migrations]]
 tag = "v3"

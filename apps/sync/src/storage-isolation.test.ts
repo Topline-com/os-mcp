@@ -17,6 +17,15 @@ function bindingId(config: string, binding: string): string {
   return id;
 }
 
+function migrationBlock(config: string, tag: string): string {
+  const blocks = config.split("[[migrations]]").slice(1);
+  const block = blocks.find((candidate) =>
+    new RegExp(`\\btag\\s*=\\s*"${tag}"`).test(candidate),
+  );
+  assert.ok(block, `missing ${tag} Durable Object migration`);
+  return block;
+}
+
 test("OAuth storage is distinct from the connection directory scanned by sync", async () => {
   const [edgeConfig, syncConfig, syncSource] = await Promise.all([
     readFile(edgeConfigUrl, "utf8"),
@@ -34,4 +43,16 @@ test("OAuth storage is distinct from the connection directory scanned by sync", 
   assert.notEqual(oauth, "00000000000000000000000000000000");
   assert.match(syncSource, /env\.CONNECTIONS\.list\(/);
   assert.doesNotMatch(syncSource, /OAUTH_KV/);
+});
+
+test("Durable Object migration history provisions every new class with SQLite", async () => {
+  const edgeConfig = await readFile(edgeConfigUrl, "utf8");
+
+  assert.match(migrationBlock(edgeConfig, "v1"), /new_sqlite_classes\s*=\s*\["LocationDO"\]/);
+  assert.match(migrationBlock(edgeConfig, "v2"), /new_sqlite_classes\s*=\s*\["OAuthFlowDO"\]/);
+  assert.match(
+    migrationBlock(edgeConfig, "v3"),
+    /new_sqlite_classes\s*=\s*\["ConnectionAuthDO"\]/,
+  );
+  assert.doesNotMatch(edgeConfig, /^new_classes\s*=/m);
 });
