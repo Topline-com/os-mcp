@@ -248,7 +248,7 @@ test("legacy initialize remains explicitly supported", async () => {
 
   assert.equal(response.status, 200);
   assert.equal(body.result.protocolVersion, "2025-06-18");
-  assert.equal(body.result.serverInfo.version, "0.1.0");
+  assert.equal(body.result.serverInfo.version, "0.2.0");
 });
 
 test("malformed modern metadata cannot downgrade into the legacy path", async () => {

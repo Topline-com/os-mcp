@@ -28,7 +28,7 @@ All clients use the same pattern:
    - Transport: `HTTP (Streamable)`
    - Server URL: `https://os-mcp.topline.com/mcp`
    - Headers: add one — name `Authorization`, value `Bearer <your token>`
-3. The node auto-discovers all 48 tools. Pick one per node.
+3. The node discovers the tools allowed by the connection policy. Pick one per node.
 
 ### Zapier
 
@@ -114,6 +114,6 @@ If the `summary` field says all scope areas are OK, you're live.
 
 ## Rotating / revoking
 
-- **Single client:** generate a fresh token from `/connect` and swap it in. The old one still works until it expires (or you rotate the PIT).
+- **Single `/connect` client:** call `DELETE /connection/policy` with that client's bearer token, then generate and install a fresh token.
 - **All tokens for one sub-account:** rotate the PIT in Topline OS → Settings → Private Integrations. Every token ever issued with the old PIT fails on the next request.
 - **All tokens globally (across all users):** rotate the worker's `TOKEN_SIGNING_SECRET`. Every token ever signed becomes invalid immediately. See [deploy-cloudflare-worker.md](./deploy-cloudflare-worker.md#rotating-the-signing-secret).

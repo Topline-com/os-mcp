@@ -9,4 +9,4 @@ const out = ALL_TOOLS.map((t) => ({
   category: ANALYTICS_TOOL_NAMES.has(t.name) ? "analytics" : "action",
 }));
 
-process.stdout.write(JSON.stringify({ tools: out, count: out.length }, null, 2));
+process.stdout.write(`${JSON.stringify({ tools: out, count: out.length }, null, 2)}\n`);

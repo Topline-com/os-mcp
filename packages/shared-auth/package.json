@@ -1,6 +1,6 @@
 {
   "name": "@topline/shared-auth",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Auth primitives: token signing/verification, PIT encryption, ConnectionDirectory.",
   "private": true,
   "type": "module",

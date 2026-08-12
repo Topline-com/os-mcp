@@ -235,9 +235,11 @@ See [Connection-scoped tool policies](./docs/connection-tool-policies.md) for pr
 **Runtime model.** Two entry points share one `ACTION_TOOLS` registry:
 
 - **stdio install** (`npx -y github:topline-com/os-mcp`) — runs locally as a Claude Desktop/Code subprocess. Reads `TOPLINE_PIT`, `TOPLINE_LOCATION_ID`, `TOPLINE_API_BASE_URL` from env. No hosted intermediary.
-- **remote install** (`https://os-mcp.topline.com/mcp`) — Cloudflare Worker. Per-request credentials via `Authorization: Bearer <pit-or-minted-token>` + `X-Topline-Location-Id`.
+- **remote install** (`https://os-mcp.topline.com/mcp`) — Cloudflare Worker. OAuth and `/connect` clients use connection-bound bearer tokens; raw PIT + `X-Topline-Location-Id` remains available for compatible direct clients.
 
 **Per-tenant isolation.** LocationDO architecture: one Durable Object instance per `location_id`, each with its own embedded SQLite database. No shared query engine — cross-tenant leakage is impossible by construction. Sync worker pulls into each DO on a 15-min cron; SQL surface (`topline_execute_query`) reads only from the calling tenant's DO.
+
+**Remote authorization.** OAuth clients, grants, and tokens live in a dedicated `OAUTH_KV` namespace. PITs remain encrypted in `CONNECTIONS`. SQLite-backed `OAuthFlowDO` enforces one-time consent and authorization-code redemption, while SQLite-backed `ConnectionAuthDO` stores each connection's active tool policy and revocation state.
 
 **Tool dispatch.** `ACTION_TOOLS` proxy CRM REST endpoints via `toplineFetch`, work in both stdio and remote. `ANALYTICS_TOOLS` are the SQL surface and need the LocationDO binding, so they only run in the Worker.
 
@@ -393,9 +395,9 @@ If `ad_publishing_google` or `ad_publishing_linkedin` fail in setup_check after 
 
 ## Security
 
-- The PIT lives only in the user's local Claude config.
-- The MCP runs locally as a subprocess of Claude. No hosted intermediary.
-- Revoke any token any time from Settings → Private Integrations.
+- Local stdio installs keep the PIT in the user's local client config and run as a subprocess with no hosted intermediary.
+- Hosted OAuth and `/connect` flows store the PIT encrypted in the connection directory; clients receive a connection-bound bearer token instead of the PIT.
+- Revoke a `/connect` token through its policy endpoint. OAuth clients should disconnect the connector. Rotate the PIT in Settings → Private Integrations to invalidate every connection that uses it.
 
 ## License
 

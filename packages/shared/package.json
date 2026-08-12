@@ -1,6 +1,6 @@
 {
   "name": "@topline/shared",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared primitives for Topline OS MCP (CRM API client, branding, JSON schema helpers).",
   "private": true,
   "type": "module",

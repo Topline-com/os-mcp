@@ -17,11 +17,23 @@ npm install
 npx wrangler login
 
 # 3. Generate and store the token-signing secret.
-#    This secret signs OAuth access tokens. Generate a fresh 32-byte secret
-#    and paste it when prompted. Treat it like a database password.
+#    Generate a fresh 32-byte secret and paste it when prompted.
 openssl rand -hex 32
 npx wrangler secret put TOKEN_SIGNING_SECRET
 ```
+
+## Storage preflight
+
+The edge Worker requires separate `CONNECTIONS` and `OAUTH_KV` namespaces. It also owns the SQLite-backed `LocationDO`, `OAuthFlowDO`, and `ConnectionAuthDO` classes. Keep all Wrangler migration entries append-only.
+
+Run both dry-runs before deployment and inspect their binding tables:
+
+```bash
+npx wrangler deploy --dry-run --config apps/edge/wrangler.toml
+npx wrangler deploy --dry-run --config apps/sync/wrangler.toml
+```
+
+Confirm that `OAUTH_KV` and `CONNECTIONS` are different, and that the sync Worker has no OAuth storage binding.
 
 ## Deploy
 
@@ -69,18 +81,20 @@ curl -X POST http://127.0.0.1:8787/mcp \
 | Path | Purpose |
 |---|---|
 | `GET  /` | Landing page |
-| `GET  /.well-known/oauth-authorization-server` | OAuth 2.1 metadata (RFC 8414) |
+| `GET  /.well-known/oauth-authorization-server` | Authorization-server metadata (RFC 8414) |
+| `GET  /.well-known/oauth-protected-resource/mcp` | Protected-resource metadata (RFC 9728) |
 | `POST /register` | Dynamic Client Registration (RFC 7591) |
-| `GET  /authorize` | HTML form for user to paste PIT + Location ID |
-| `POST /authorize` | Form submission → issues signed auth code |
-| `POST /token` | Auth code + PKCE verifier → signed access token |
+| `GET  /authorize` | Validated OAuth consent and credential form |
+| `POST /authorize` | Form submission and connection creation |
+| `POST /token` | Authorization-code and refresh-token exchange |
 | `POST /mcp` | MCP JSON-RPC endpoint (requires Bearer auth) |
 
 ## How auth works (short version)
 
-- Claude web users → OAuth flow → signed access token (HMAC-SHA256) containing `{pit, locationId, exp}` → sent as Bearer on every `/mcp` call.
-- Direct clients (mcp-inspector, curl, custom integrations) → `Authorization: Bearer pit-...` with a raw PIT + `X-Topline-Location-Id` header.
-- No server-side storage. If you rotate `TOKEN_SIGNING_SECRET`, all existing OAuth sessions invalidate and users re-authorize on next call.
+- OAuth clients use DCR or CIMD, exact redirect-URI validation, S256 PKCE, one-time authorization codes, and access tokens bound to the canonical `/mcp` resource.
+- The PIT is encrypted in `CONNECTIONS`. OAuth clients, grants, and tokens live in the dedicated `OAUTH_KV` namespace.
+- Each connection's active tool policy and revocation state live in `ConnectionAuthDO`. The same policy filters `tools/list` and gates `tools/call`.
+- Direct clients can use a `/connect` bearer token. Raw PIT + `X-Topline-Location-Id` remains available for compatible clients and exposes action tools only.
 
 ## Rotating the signing secret
 
@@ -89,7 +103,11 @@ openssl rand -hex 32
 npx wrangler secret put TOKEN_SIGNING_SECRET
 ```
 
-All previously-issued access tokens become invalid. Users will be prompted to reconnect.
+Signed `/connect` and legacy tokens become invalid. OAuth-provider sessions may also require reconnection because connection credentials use the same secret for encryption.
+
+## Rollback limit
+
+Wrangler migrations `v2` and `v3` introduce `OAuthFlowDO` and `ConnectionAuthDO`. Cloudflare cannot roll back to a version from before those Durable Object lifecycle changes. Recover by deploying a forward fix that preserves all three class exports, bindings, and migration entries.
 
 ## Logs
 

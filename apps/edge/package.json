@@ -1,6 +1,6 @@
 {
   "name": "@topline-ai/edge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Topline OS MCP edge — stdio + Cloudflare Worker entry points.",
   "private": true,
   "type": "module",

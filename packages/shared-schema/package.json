@@ -1,6 +1,6 @@
 {
   "name": "@topline/shared-schema",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Authoritative entity manifest + source-audit framework for the synced data warehouse.",
   "private": true,
   "type": "module",

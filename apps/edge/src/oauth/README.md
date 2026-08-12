@@ -13,15 +13,8 @@ The provider's grant props contain only a connection ID and OAuth client ID. PIT
 
 ## Storage migration and rollback
 
-`CONNECTIONS` and `OAUTH_KV` must be different KV namespaces. The sync worker lists only `CONNECTIONS`, so OAuth clients, grants, tokens, and open DCR traffic cannot consume connection-scan pages or subrequests. `apps/edge/wrangler.toml` intentionally contains an all-zero `OAUTH_KV` sentinel; a deploy must fail closed until an operator receives explicit infrastructure approval, creates a dedicated namespace, and replaces the sentinel with its ID. Do not reuse `AUTH_CACHE` or another shared namespace.
+`CONNECTIONS` and `OAUTH_KV` must remain different KV namespaces. The sync worker lists only `CONNECTIONS`, so OAuth clients, grants, tokens, and open DCR traffic cannot consume connection-scan pages or subrequests. Production has a dedicated `OAUTH_KV`; do not reuse `CONNECTIONS`, `AUTH_CACHE`, or another shared namespace.
 
-Before the first approved deploy:
-
-1. Create a dedicated namespace with `wrangler kv namespace create topline-os-mcp-OAUTH`.
-2. Replace only the `OAUTH_KV` sentinel in `apps/edge/wrangler.toml`; leave the `CONNECTIONS` ID unchanged.
-3. Run the edge and sync Wrangler dry-runs and verify their binding tables show different IDs.
-4. Deploy only after the separate production approval gate.
-
-No production namespace was created or mutated by this change. Existing encrypted PIT records remain in `CONNECTIONS` and need no data migration. If any canary ever ran the provider with `OAUTH_KV` incorrectly bound to `CONNECTIONS`, stop before rollout: export and verify the provider-prefixed OAuth records into the dedicated namespace, then remove only those verified OAuth keys from `CONNECTIONS` under a separately approved cleanup. Never bulk-delete the connection directory.
+Before any deployment, run edge and sync Wrangler dry-runs and confirm the binding tables keep `OAUTH_KV` separate from `CONNECTIONS`. Existing encrypted PIT records remain in `CONNECTIONS` and need no data migration. Never bulk-delete the connection directory.
 
 The `v2` Wrangler migration introduces `OAuthFlowDO`; `v3` introduces the SQLite-backed `ConnectionAuthDO` (`v1` introduced `LocationDO`). Cloudflare cannot roll a deployment back across either Durable Object lifecycle change. After `v3` reaches production, restore older request behavior with a forward deployment that retains both class exports, both bindings, and the full migration history. Leave both KV namespaces intact. If storage configuration must be restored, rebind only to the previous dedicated OAuth namespace. Never point `OAUTH_KV` at `CONNECTIONS`. Provider-issued sessions may require reauthorization if their dedicated namespace is unavailable, while cid, legacy signed, and raw-PIT compatibility paths continue to use the encrypted connection directory.

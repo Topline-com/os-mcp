@@ -46,13 +46,13 @@ You'll get back a structured report. If `summary` says all scope areas OK, you'r
 
 | Symptom | Fix |
 |---|---|
-| "Access token invalid or expired" | Reconnect the connector (Settings → Connectors → Topline OS → Reconnect). Tokens last 30 days. |
+| "Access token invalid or expired" | Reconnect the connector (Settings → Connectors → Topline OS → Reconnect). |
 | Setup check returns `forbidden` on some scope | Edit the Private Integration, click Select All, save, regenerate token, reconnect. |
 | "Private Integration Token should start with 'pit-'" in the popup | You copied the integration name instead of the token. Re-copy from the token field. |
 | Connector shows but tools don't appear | Click Refresh on the connector. If still empty, remove and re-add. |
 
 ## Security
 
-- The PIT and Location ID are encoded into a Claude-issued access token, HMAC-signed by the MCP Worker, and sent on each request.
-- Nothing is stored server-side. Rotating the Worker's signing secret invalidates all sessions immediately.
+- The Worker stores the PIT encrypted in a connection record. Claude receives an OAuth access token bound to that connection and the exact MCP resource.
+- The server checks the connection's active tool policy on both `tools/list` and `tools/call`.
 - Revoke the PIT at any time from **Settings → Private Integrations** in Topline OS.

@@ -5,6 +5,13 @@ import type { ToolDef } from "../apps/edge/src/tools/types.js";
 
 type Group = { id: string; title: string; blurb: string; match: (name: string) => boolean };
 
+const RELEASE = {
+  version: "v0.2.0",
+  date: "2026-08-11",
+  overview:
+    "The first public release adds MCP 2026 transport support, hardened OAuth, and connection-scoped tool authorization while retaining legacy client compatibility.",
+} as const;
+
 const GROUPS: Group[] = [
   { id: "setup", title: "Setup & diagnostics", blurb: "Verify your PIT and probe every scope.", match: (n) => ["topline_ping", "topline_setup_check", "topline_request"].includes(n) },
   { id: "contacts", title: "Contacts", blurb: "Create, search, and update contacts and their tags, notes, tasks, and workflow enrollments.", match: (n) => /^topline_(search_contacts|get_contact|create_contact|upsert_contact|update_contact|delete_contact|add_contact_tags|remove_contact_tags|add_contact_to_workflow|remove_contact_from_workflow|list_contact_)/.test(n) },
@@ -19,13 +26,25 @@ const GROUPS: Group[] = [
   { id: "tags", title: "Tags", blurb: "Create, rename, and delete tags on the sub-account.", match: (n) => /^topline_(list_tags|create_tag|update_tag|delete_tag)$/.test(n) },
   { id: "users", title: "Users", blurb: "List sub-account users and fetch user records.", match: (n) => /^topline_(list_users|get_user)$/.test(n) },
   { id: "location", title: "Location (sub-account)", blurb: "Sub-account metadata: name, address, timezone, business info.", match: (n) => /^topline_get_location$/.test(n) },
-  { id: "forms", title: "Forms & surveys", blurb: "List forms and surveys and read their submissions.", match: (n) => /(form|survey)/.test(n) },
+  { id: "forms", title: "Forms & surveys", blurb: "List forms and surveys and read their submissions.", match: (n) => /^topline_(list_forms|list_form_submissions|list_surveys|list_survey_submissions)$/.test(n) },
+  { id: "social", title: "Social planner", blurb: "Manage social posts, connected accounts, OAuth flows, and CSV imports.", match: (n) => /^topline_social_/.test(n) },
+  { id: "agents", title: "Agent Studio", blurb: "Manage agents, versions, publishing, and legacy agent endpoints.", match: (n) => /^topline_agent($|_)/.test(n) },
+  { id: "email", title: "Email campaigns", blurb: "Manage email templates, campaigns, recipients, and campaign reporting.", match: (n) => /^topline_email_/.test(n) },
+  { id: "ads", title: "Ad publishing", blurb: "Manage Facebook, Google, and LinkedIn ad integrations, campaigns, targeting, and reporting.", match: (n) => /^topline_(fb|google|linkedin)_/.test(n) },
+  { id: "attribution", title: "Marketing configuration & UTM", blurb: "Configure attribution fields and create, register, retrieve, and validate campaign UTMs.", match: (n) => /^topline_(get_marketing_config|set_marketing_config|init_attribution_fields|register_campaign_utm|get_campaign_utm|list_campaign_utms|build_utm_url|lint_utm)$/.test(n) },
+  { id: "spend", title: "Spend", blurb: "Read and reconcile channel spend and manage spend classification rules.", match: (n) => /^topline_(list_spend_providers|list_spend_transactions|get_channel_spend|list_spend_classification_rules|add_spend_classification_rule|reconcile_spend)$/.test(n) },
+  { id: "notifications", title: "Form notifications", blurb: "Read Slack notification configuration and dispatch form-submission notifications.", match: (n) => /^topline_(get_slack_config|notify_slack|dispatch_form_submission)$/.test(n) },
+  { id: "dashboard", title: "Marketing dashboard", blurb: "Build the configured marketing dashboard payload.", match: (n) => /^topline_get_marketing_dashboard$/.test(n) },
   { id: "analytics", title: "Analytics (SQL)", blurb: "Read-only SQL surface over the sub-account data warehouse. Worker-only.", match: (n) => ANALYTICS_TOOL_NAMES.has(n) },
 ];
 
 function pickGroup(t: ToolDef): Group {
-  for (const g of GROUPS) if (g.match(t.name)) return g;
-  throw new Error(`No group for tool: ${t.name}`);
+  const matches = GROUPS.filter((group) => group.match(t.name));
+  if (matches.length !== 1) {
+    const ids = matches.map((group) => group.id).join(", ") || "none";
+    throw new Error(`Expected exactly one group for ${t.name}; matched: ${ids}`);
+  }
+  return matches[0];
 }
 
 const grouped = new Map<string, ToolDef[]>();
@@ -176,6 +195,7 @@ const html = `<!doctype html>
     aside.sidebar { background: var(--panel); border-right: 1px solid var(--border); padding: 24px 20px; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
     aside.sidebar h1 { font-size: 16px; margin: 0 0 4px; }
     aside.sidebar .tag { font-size: 11px; color: var(--muted); display: block; margin-bottom: 20px; }
+    .release { color: var(--muted); margin: 0 0 16px; }
     aside.sidebar h4 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 18px 0 6px; }
     aside.sidebar h4 a { color: var(--muted); }
     aside.sidebar ul { list-style: none; padding: 0; margin: 0; }
@@ -221,13 +241,14 @@ const html = `<!doctype html>
   <div class="layout">
     <aside class="sidebar">
       <h1>Topline OS MCP</h1>
-      <span class="tag">Tool reference</span>
+      <span class="tag">${RELEASE.version} tool reference</span>
       ${sidebar}
     </aside>
     <main>
       <header class="hero">
         <h1>Topline OS MCP — Tool reference</h1>
         <p>Native reference for every tool exposed by the <a href="https://github.com/Topline-com/os-mcp">Topline-com/os-mcp</a> server. Each tool is callable over MCP via <code>tools/call</code> with the arguments listed below.</p>
+        <p class="release"><strong>Release ${RELEASE.version}</strong> · <time datetime="${RELEASE.date}">${RELEASE.date}</time><br />${RELEASE.overview}</p>
         <div class="stats">
           <div class="stat"><strong>${ALL_TOOLS.length}</strong> tools total</div>
           <div class="stat"><strong>${totalActions}</strong> action tools</div>
@@ -245,4 +266,4 @@ const html = `<!doctype html>
 </html>
 `;
 
-process.stdout.write(html);
+process.stdout.write(html.replace(/[ \t]+$/gm, ""));

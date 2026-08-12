@@ -26,7 +26,7 @@ Remote MCP requests with a `cid` bearer check `ConnectionAuthDO` before the encr
 
 ## Update, cache, and revocation semantics
 
-A connection-bound bearer can manage its policy at `/connection/policy`. `GET` returns the current policy, client target, revision, selected count, stale IDs, and private-cache revision. `PUT` accepts an expected revision plus an `all`, preset, or custom selection, but the bearer may only keep or narrow its current canonical tool set. It may add the stricter Copilot Studio target, but it cannot remove that target. Successful narrowing applies to the next stateless request and keeps the existing credential valid.
+A locally signed `cid` bearer from `/connect` can manage its policy at `/connection/policy`. OAuth-provider tokens cannot use this management route; those clients disconnect and reauthorize instead. `GET` returns the current policy, client target, revision, selected count, stale IDs, and private-cache revision. `PUT` accepts an expected revision plus an `all`, preset, or custom selection, but the bearer may only keep or narrow its current canonical tool set. It may add the stricter Copilot Studio target, but it cannot remove that target. Successful narrowing applies to the next stateless request and keeps the existing credential valid.
 
 Any tool addition, a change from an allowlist to `all`, or a change that removes the Copilot Studio constraint returns `403` with `error: "reauthorization_required"`. The authorization object, policy revision, and saved snapshot remain unchanged. Preset names, custom ordering, omitted target values, and stale expected revisions do not bypass this check. A stale revision returns `409` before the server evaluates the requested policy.
 
