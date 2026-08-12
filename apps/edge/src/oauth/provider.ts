@@ -98,7 +98,7 @@ export function createOAuthWorker<Env extends OAuthProviderEnv>(
       const url = new URL(request.url);
       const origin = request.headers.get("Origin");
       if (origin && isBrowserSensitivePath(url.pathname)) {
-        if (!isAllowedOrigin(origin, url.pathname, env)) {
+        if (!isAllowedOrigin(origin, url.pathname, request.method, env)) {
           return new Response("Forbidden", { status: 403 });
         }
         if (request.method === "OPTIONS") return preflightResponse(request, origin);
@@ -130,9 +130,13 @@ function isBrowserSensitivePath(pathname: string): boolean {
 function isAllowedOrigin(
   origin: string,
   pathname: string,
+  method: string,
   env: OAuthProviderEnv,
 ): boolean {
-  if (pathname === "/authorize" || pathname === "/connect") {
+  if ((pathname === "/authorize" || pathname === "/connect") && method === "POST") {
+    // The credential forms post same-origin only. The consent/connect form
+    // pages themselves may be loaded (GET/OPTIONS) from any allowlisted
+    // browser origin so Claude.ai / ChatGPT connectors can embed them.
     return origin === AUTHORIZATION_SERVER_ORIGIN;
   }
   const allowed = new Set(
