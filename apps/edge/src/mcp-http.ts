@@ -1,5 +1,6 @@
 const MCP_ALLOWED_ORIGINS = new Set([
   "https://claude.ai",
+  "https://claude.com",
   "https://chatgpt.com",
   "https://chat.openai.com",
   "https://platform.openai.com",

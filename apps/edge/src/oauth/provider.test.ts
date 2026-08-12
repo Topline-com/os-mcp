@@ -249,6 +249,7 @@ test("authorize and connect forms load from allowlisted browser origins but POST
     OAUTH_KV: {} as KVNamespace,
     MCP_ALLOWED_ORIGINS: [
       "https://claude.ai",
+      "https://claude.com",
       "https://chatgpt.com",
       "https://chat.openai.com",
       "https://platform.openai.com",
@@ -264,6 +265,7 @@ test("authorize and connect forms load from allowlisted browser origins but POST
   };
   const clientOrigins = [
     "https://claude.ai",
+    "https://claude.com",
     "https://chatgpt.com",
     "https://chat.openai.com",
     "https://platform.openai.com",
@@ -333,6 +335,7 @@ test("MCP path allowlist covers Claude, OpenAI, and Microsoft connector origins"
     OAUTH_KV: {} as KVNamespace,
     MCP_ALLOWED_ORIGINS: [
       "https://claude.ai",
+      "https://claude.com",
       "https://chatgpt.com",
       "https://chat.openai.com",
       "https://platform.openai.com",
@@ -347,6 +350,7 @@ test("MCP path allowlist covers Claude, OpenAI, and Microsoft connector origins"
   };
   const clientOrigins = [
     "https://claude.ai",
+    "https://claude.com",
     "https://chatgpt.com",
     "https://chat.openai.com",
     "https://platform.openai.com",
