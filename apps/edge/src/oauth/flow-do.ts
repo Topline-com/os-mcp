@@ -3,6 +3,7 @@ import type { AuthRequest } from "@cloudflare/workers-oauth-provider";
 
 const FLOW_KEY = "flow";
 const BACKFILL_KICKOFF_LEASE_MS = 30_000;
+const BACKFILL_KICKOFF_DELAY_MS = 1_000;
 const EXPIRY_RETRY_MS = 60_000;
 
 interface FlowTransaction {
@@ -142,7 +143,7 @@ export class OAuthFlowState {
       } satisfies ConsentRecord);
       return true;
     });
-    if (completed) await this.storage.setAlarm?.(Date.now());
+    if (completed) await this.storage.setAlarm?.(Date.now() + BACKFILL_KICKOFF_DELAY_MS);
     return completed;
   }
 

@@ -111,6 +111,7 @@ test("successful consent schedules durable backfill kickoff", async () => {
   await flow.createConsent(authRequest, "connection-1", "csrf-hash", now + 60_000);
   await flow.reserveConsent("csrf-hash", "submission-a", "lease-a", "connection-1", now);
   const before = storage.alarms.length;
+  const completedAt = Date.now();
   assert.equal(
     await flow.completeConsent(
       "submission-a",
@@ -120,6 +121,7 @@ test("successful consent schedules durable backfill kickoff", async () => {
     true,
   );
   assert.equal(storage.alarms.length, before + 1);
+  assert.ok(storage.alarms.at(-1)! >= completedAt + 1_000);
 });
 
 test("terminal consent abort cannot be reopened by retry or stale owner", async () => {
