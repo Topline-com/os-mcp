@@ -173,7 +173,10 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
 
   try {
     await dependencies.verifyCredentials(pit, locationId, env);
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message === "topline_api_base_url_missing") {
+      return new Response("Server is missing TOPLINE_API_BASE_URL", { status: 500 });
+    }
     return new Response("Credentials could not be verified", { status: 401 });
   }
 
@@ -216,5 +219,6 @@ function localAuthorizationError(description: string): Response {
 }
 
 function stringField(form: URLSearchParams, name: string): string | null {
-  return form.get(name);
+  const value = form.get(name)?.trim();
+  return value || null;
 }

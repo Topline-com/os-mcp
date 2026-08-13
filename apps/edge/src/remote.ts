@@ -96,6 +96,7 @@ export { ConnectionAuthDO, LocationDO, OAuthFlowDO };
 
 interface Env extends OAuthProviderEnv {
   TOKEN_SIGNING_SECRET: string;
+  TOPLINE_API_BASE_URL?: string;
   TOPLINE_BRAND_NAME?: string;
   OAUTH_PROVIDER?: OAuthHelpers;
   MCP_ALLOWED_ORIGINS?: string;
@@ -127,6 +128,8 @@ const oauthWorker = createOAuthWorker<Env>({
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (env.TOPLINE_API_BASE_URL) process.env.TOPLINE_API_BASE_URL = env.TOPLINE_API_BASE_URL;
+    if (env.TOPLINE_BRAND_NAME) process.env.TOPLINE_BRAND_NAME = env.TOPLINE_BRAND_NAME;
     if (!env.TOKEN_SIGNING_SECRET) {
       return plain(500, "Worker is missing TOKEN_SIGNING_SECRET. Run: wrangler secret put TOKEN_SIGNING_SECRET");
     }

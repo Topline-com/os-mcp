@@ -1,8 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { BRAND_NAME } from "./branding.js";
 
-const BASE_URL = process.env.TOPLINE_API_BASE_URL || "https://api.example.com";
+const PLACEHOLDER_API_BASE_URL = "https://api.example.com";
 const API_VERSION = process.env.TOPLINE_API_VERSION || "2021-07-28";
+
+export function getToplineApiBaseUrl(): string {
+  return (process.env.TOPLINE_API_BASE_URL || PLACEHOLDER_API_BASE_URL).replace(/\/$/, "");
+}
 
 export interface RequestCredentials {
   pit: string;
@@ -73,7 +77,7 @@ export function getLocationId(override?: string): string {
 
 export function toplineApiUrl(path: string, query?: FetchOptions["query"]): string {
   const trimmed = path.startsWith("/") ? path : `/${path}`;
-  const url = new URL(`${BASE_URL}${trimmed}`);
+  const url = new URL(`${getToplineApiBaseUrl()}${trimmed}`);
   if (query) {
     for (const [k, v] of Object.entries(query)) {
       if (v === undefined || v === null) continue;
