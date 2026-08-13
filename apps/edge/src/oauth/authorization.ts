@@ -125,7 +125,7 @@ export async function handleAuthorizationRequest<Env extends AuthorizationEnv>(
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Cache-Control": "no-store",
-          "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
+          "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}'; frame-ancestors 'none'; base-uri 'none'`,
           "Referrer-Policy": "no-referrer",
         },
       },

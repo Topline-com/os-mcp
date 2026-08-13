@@ -195,9 +195,15 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   assert.match(body, /name="targetClient"/);
   const scriptNonce = body.match(/<script nonce="([^"]+)">/)?.[1];
   assert.ok(scriptNonce, "authorization form script must carry a nonce");
+  const contentSecurityPolicy = response.headers.get("Content-Security-Policy") ?? "";
   assert.match(
-    response.headers.get("Content-Security-Policy") ?? "",
+    contentSecurityPolicy,
     new RegExp(`script-src 'nonce-${scriptNonce}'`),
+  );
+  assert.doesNotMatch(
+    contentSecurityPolicy,
+    /(?:^|;)\s*form-action\b/,
+    "authorization-form CSP must not block the cross-origin OAuth callback redirect",
   );
   assert.match(body, /form\.addEventListener\("submit"/);
   assert.match(body, /submit\.disabled = true/);
