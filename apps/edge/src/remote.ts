@@ -73,7 +73,6 @@ import {
   type ToolSelection,
 } from "./tool-presets.js";
 import { sanitizeQuery, enforceExposedTables, SqlSafetyError } from "./sql-safety.js";
-import { verifyCredentials } from "./credential-verification.js";
 import { buildCatalog } from "@topline/shared-schema";
 import {
   handleAuthorizationRequest,
@@ -297,7 +296,6 @@ function authorizationDependencies(
   ctx: ExecutionContext,
 ): AuthorizationDependencies<Env> {
   return {
-    verifyCredentials,
     async createConnection(pit, locationId, _oauthClientId, policy, clientTarget, env) {
       const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
       const cid = await createConnection(

@@ -36,7 +36,6 @@ interface AuthorizationEnv {
 }
 
 export interface AuthorizationDependencies<Env> {
-  verifyCredentials(pit: string, locationId: string, env: Env): Promise<void>;
   createConnection(
     pit: string,
     locationId: string,
@@ -169,23 +168,6 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
     }
   } catch {
     return localAuthorizationError("Invalid tool selection");
-  }
-
-  try {
-    await dependencies.verifyCredentials(pit, locationId, env);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    if (message === "topline_api_base_url_missing") {
-      return new Response("Server is missing TOPLINE_API_BASE_URL", { status: 500 });
-    }
-    if (message === "credential_verification_unreachable") {
-      return new Response("Could not reach Topline OS to verify credentials", { status: 502 });
-    }
-    const statusMatch = /^credential_verification_failed:(\d+)$/.exec(message);
-    if (statusMatch) {
-      return new Response(`Credentials could not be verified (CRM ${statusMatch[1]})`, { status: 401 });
-    }
-    return new Response("Credentials could not be verified", { status: 401 });
   }
 
   const flowId = env.OAUTH_FLOW_DO.idFromName(continuation);

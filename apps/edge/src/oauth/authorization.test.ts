@@ -70,7 +70,6 @@ function testDependencies(
   overrides: Partial<AuthorizationDependencies<TestEnv>> = {},
 ): AuthorizationDependencies<TestEnv> {
   return {
-    async verifyCredentials() {},
     async createConnection() { return "cid-test"; },
     async deleteConnection() {},
     async connectionCreated() {},
@@ -191,7 +190,7 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   assert.doesNotMatch(body, /name="(?:client_id|redirect_uri|code_challenge|code_challenge_method|state|resource)"/);
 });
 
-test("credential POST consumes the continuation once", async () => {
+test("credential POST creates the connection without a CRM preflight and consumes once", async () => {
   const redirectUri = "https://client.example/callback";
   const env = {
     OAUTH_KV: new MemoryKv() as unknown as KVNamespace,
