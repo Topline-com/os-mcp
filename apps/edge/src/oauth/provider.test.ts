@@ -243,101 +243,31 @@ test("provider-routed MCP and metadata paths share the strict Origin decision", 
   }
 });
 
-test("authorize and connect forms load and submit from allowlisted browser origins", async () => {
+test("authorize and connect do not Origin-gate the consent form", async () => {
   const worker = createWorker();
-  const env = {
-    OAUTH_KV: {} as KVNamespace,
-    MCP_ALLOWED_ORIGINS: [
-      "https://claude.ai",
-      "https://claude.com",
-      "https://chatgpt.com",
-      "https://chat.openai.com",
-      "https://platform.openai.com",
-      "https://copilotstudio.microsoft.com",
-      "https://make.powerapps.com",
-      "https://make.powerautomate.com",
-      "https://m365.cloud.microsoft",
-      "https://copilot.cloud.microsoft",
-      "https://teams.microsoft.com",
-      "https://www.office.com",
-      "https://os-mcp.topline.com",
-    ].join(","),
-  };
-  const clientOrigins = [
-    "https://claude.ai",
-    "https://claude.com",
-    "https://chatgpt.com",
-    "https://chat.openai.com",
-    "https://platform.openai.com",
-    "https://copilotstudio.microsoft.com",
-    "https://make.powerapps.com",
-    "https://make.powerautomate.com",
-    "https://m365.cloud.microsoft",
-    "https://copilot.cloud.microsoft",
-    "https://teams.microsoft.com",
-    "https://www.office.com",
-  ];
-
-  // GET: connector UIs must be able to load the consent and connect forms
-  // from their own origin (regression: previously 403 for every client).
+  const env = { OAUTH_KV: {} as KVNamespace };
   for (const path of ["/authorize", "/connect"]) {
-    for (const clientOrigin of clientOrigins) {
-      const clientGet = await worker.fetch(
+    for (const origin of ["https://claude.ai", "https://attacker.example", "null"]) {
+      const get = await worker.fetch(
         new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-          headers: { Origin: clientOrigin },
+          headers: { Origin: origin },
         }),
         env,
         executionContext,
       );
-      assert.notEqual(clientGet.status, 403, `GET ${path} from ${clientOrigin}`);
-      assert.equal(clientGet.headers.get("Access-Control-Allow-Origin"), clientOrigin);
+      assert.notEqual(get.status, 403, `GET ${path} from ${origin}`);
+
+      const post = await worker.fetch(
+        new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
+          method: "POST",
+          headers: { Origin: origin, "Content-Type": "application/x-www-form-urlencoded" },
+          body: "pit=pit-test&locationId=loc",
+        }),
+        env,
+        executionContext,
+      );
+      assert.notEqual(post.status, 403, `POST ${path} from ${origin}`);
     }
-
-    // OPTIONS preflight from a client origin passes the gate too.
-    const preflight = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        method: "OPTIONS",
-        headers: { Origin: "https://claude.ai", "Access-Control-Request-Method": "GET" },
-      }),
-      env,
-      executionContext,
-    );
-    assert.equal(preflight.status, 204, `OPTIONS ${path} from claude.ai`);
-    assert.equal(preflight.headers.get("Access-Control-Allow-Origin"), "https://claude.ai");
-
-    // Hostile origins stay blocked on GET.
-    const hostileGet = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        headers: { Origin: "https://attacker.example" },
-      }),
-      env,
-      executionContext,
-    );
-    assert.equal(hostileGet.status, 403, `GET ${path} from attacker`);
-
-    // POST from an allowlisted connector origin is the Claude Connect click.
-    // CSRF is the one-time continuation + csrf pair, not same-origin Origin.
-    const claudePost = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        method: "POST",
-        headers: { Origin: "https://claude.ai", "Content-Type": "application/x-www-form-urlencoded" },
-        body: "pit=pit-test&locationId=loc",
-      }),
-      env,
-      executionContext,
-    );
-    assert.notEqual(claudePost.status, 403, `POST ${path} from claude.ai must pass the Origin gate`);
-
-    const attackerPost = await worker.fetch(
-      new Request(`${AUTHORIZATION_SERVER_ORIGIN}${path}`, {
-        method: "POST",
-        headers: { Origin: "https://attacker.example", "Content-Type": "application/x-www-form-urlencoded" },
-        body: "pit=pit-test&locationId=loc",
-      }),
-      env,
-      executionContext,
-    );
-    assert.equal(attackerPost.status, 403, `POST ${path} from attacker must stay forbidden`);
   }
 });
 

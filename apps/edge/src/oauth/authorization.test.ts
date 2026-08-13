@@ -191,12 +191,11 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   assert.doesNotMatch(body, /name="(?:client_id|redirect_uri|code_challenge|code_challenge_method|state|resource)"/);
 });
 
-test("credential POST requires a trusted origin and consumes the continuation once", async () => {
+test("credential POST consumes the continuation once", async () => {
   const redirectUri = "https://client.example/callback";
   const env = {
     OAUTH_KV: new MemoryKv() as unknown as KVNamespace,
     OAUTH_FLOW_DO: new MemoryFlowNamespace(),
-    MCP_ALLOWED_ORIGINS: "https://claude.ai,https://claude.com",
   } as unknown as TestEnv;
   let creates = 0;
   let createdPolicy: unknown;
@@ -225,21 +224,6 @@ test("credential POST requires a trusted origin and consumes the continuation on
     toolPreset: "analytics",
     targetClient: "copilot_studio",
   });
-
-  const crossOrigin = await worker.fetch(
-    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/authorize`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Origin: "https://attacker.example",
-      },
-      body,
-    }),
-    env,
-    executionContext,
-  );
-  assert.equal(crossOrigin.status, 403);
-  assert.equal(creates, 0);
 
   const submit = () => worker.fetch(
     new Request(`${AUTHORIZATION_SERVER_ORIGIN}/authorize`, {
