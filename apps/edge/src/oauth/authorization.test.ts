@@ -194,6 +194,15 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   assert.match(body, /name="csrf"/);
   assert.match(body, /name="toolPreset"/);
   assert.match(body, /name="targetClient"/);
+  const scriptNonce = body.match(/<script nonce="([^"]+)">/)?.[1];
+  assert.ok(scriptNonce, "authorization form script must carry a nonce");
+  assert.match(
+    response.headers.get("Content-Security-Policy") ?? "",
+    new RegExp(`script-src 'nonce-${scriptNonce}'`),
+  );
+  assert.match(body, /form\.addEventListener\("submit"/);
+  assert.match(body, /submit\.disabled = true/);
+  assert.match(body, /Connecting…/);
   assert.doesNotMatch(body, /name="(?:client_id|redirect_uri|code_challenge|code_challenge_method|state|resource)"/);
 });
 

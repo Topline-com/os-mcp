@@ -31,6 +31,7 @@ describe("connection tool-selection UX", () => {
       brand: "Topline OS",
       continuation: "opaque-continuation",
       csrf: "opaque-csrf",
+      scriptNonce: "test-nonce",
       toolSelection: view,
     });
 

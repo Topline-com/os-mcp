@@ -13,9 +13,10 @@ export function authorizeFormHtml(params: {
   error?: string;
   continuation: string;
   csrf: string;
+  scriptNonce: string;
   toolSelection: ToolSelectionView;
 }): string {
-  const { brand, error, continuation, csrf, toolSelection } = params;
+  const { brand, error, continuation, csrf, scriptNonce, toolSelection } = params;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -67,7 +68,7 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
   <label for="locationId">Location ID</label>
   <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required>
 
-  ${toolSelectionControlsHtml(toolSelection)}
+  ${toolSelectionControlsHtml(toolSelection, scriptNonce)}
 
   <button type="submit">Connect</button>
 </form>
@@ -75,7 +76,7 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 </html>`;
 }
 
-function toolSelectionControlsHtml(view: ToolSelectionView): string {
+function toolSelectionControlsHtml(view: ToolSelectionView, scriptNonce?: string): string {
   const options = view.presets
     .map(
       (preset) =>
@@ -110,7 +111,7 @@ function toolSelectionControlsHtml(view: ToolSelectionView): string {
     <p id="toolWarning" role="alert" style="font-size:13px;margin:8px 0 0;color:#8a5600;font-weight:600"></p>
     <details style="margin-top:8px"><summary>Review selected tool IDs</summary><pre id="selectedTools" style="white-space:pre-wrap;font-size:11px;max-height:180px;overflow:auto"></pre></details>
   </fieldset>
-  <script>
+  <script${scriptNonce ? ` nonce="${escapeHtml(scriptNonce)}"` : ""}>
   (() => {
     const form = document.currentScript.closest("form");
     const preset = form.querySelector("#toolPreset");
@@ -144,6 +145,10 @@ function toolSelectionControlsHtml(view: ToolSelectionView): string {
     preset.addEventListener("change", update);
     target.addEventListener("change", update);
     custom.addEventListener("change", update);
+    form.addEventListener("submit", () => {
+      submit.disabled = true;
+      submit.textContent = "Connecting…";
+    });
     update();
   })();
   </script>`;
