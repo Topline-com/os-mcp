@@ -72,6 +72,7 @@ export async function createConnection(
   kv: KVNamespace,
   input: NewConnectionInput,
   signingSecret: string,
+  connectionId?: string,
 ): Promise<string> {
   const enc = await encryptPit(input.pit, signingSecret);
   const now = new Date().toISOString();
@@ -84,7 +85,7 @@ export async function createConnection(
     last_verified_at: now,
     source: input.source,
   };
-  const id = randomId();
+  const id = connectionId ?? randomId();
   await kv.put(id, JSON.stringify(record));
   return id;
 }

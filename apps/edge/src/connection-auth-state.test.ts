@@ -74,6 +74,37 @@ describe("connection authorization state", () => {
     }
   });
 
+  it("accepts only an identical authorization initialization replay", () => {
+    const repository = new MemoryRepository();
+    const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);
+    const policy: PersistedToolPolicy = {
+      version: 1,
+      mode: "allow",
+      tool_ids: ["topline_ping"],
+    };
+    const initial = service.initialize("loc-a", policy, NOW, "copilot_studio");
+    const replay = service.initialize(
+      "loc-a",
+      policy,
+      "2026-08-12T00:00:00.000Z",
+      "copilot_studio",
+    );
+    deepStrictEqual(replay, initial);
+
+    for (const attempt of [
+      () => service.initialize("loc-b", policy, NOW, "copilot_studio"),
+      () => service.initialize("loc-a", { version: 1, mode: "all" }, NOW, "copilot_studio"),
+      () => service.initialize("loc-a", policy, NOW, "generic"),
+    ]) {
+      throws(
+        attempt,
+        (error: unknown) =>
+          error instanceof ConnectionAuthorizationStateError &&
+          error.reason === "already_initialized",
+      );
+    }
+  });
+
   it("bootstraps an existing credential to active/all exactly once", () => {
     const repository = new MemoryRepository();
     const service = new ConnectionAuthorizationService(repository, CANONICAL_TOOL_IDS);

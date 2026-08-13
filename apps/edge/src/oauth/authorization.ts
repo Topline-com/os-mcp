@@ -21,8 +21,31 @@ const CONSENT_TTL_MS = 30 * 60 * 1000;
 const AUTHORIZATION_FORM_MAX_BYTES = 16 * 1024;
 
 interface ConsentFlowStub {
-  createConsent(request: AuthRequest, csrfHash: string, expiresAt: number): Promise<boolean>;
-  consumeConsent(csrfHash: string, now: number): Promise<AuthRequest | null>;
+  createConsent(
+    request: AuthRequest,
+    connectionId: string,
+    csrfHash: string,
+    expiresAt: number,
+  ): Promise<boolean>;
+  reserveConsent(
+    csrfHash: string,
+    submissionHash: string,
+    processingLeaseHash: string,
+    connectionId: string,
+    now: number,
+  ): Promise<
+    | { status: "reserved"; request: AuthRequest }
+    | { status: "processing" }
+    | { status: "completed"; redirectTo: string }
+    | { status: "invalid" }
+  >;
+  completeConsent(
+    submissionHash: string,
+    processingLeaseHash: string,
+    redirectTo: string,
+  ): Promise<boolean>;
+  abortConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean>;
+  releaseConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean>;
 }
 
 interface ConsentFlowNamespace {
@@ -37,6 +60,7 @@ interface AuthorizationEnv {
 
 export interface AuthorizationDependencies<Env> {
   createConnection(
+    connectionId: string,
     pit: string,
     locationId: string,
     oauthClientId: string,
@@ -45,7 +69,6 @@ export interface AuthorizationDependencies<Env> {
     env: Env,
   ): Promise<string>;
   deleteConnection(cid: string, env: Env): Promise<void>;
-  connectionCreated(cid: string, env: Env): Promise<void>;
 }
 
 export interface OAuthGrantProps {
@@ -83,6 +106,7 @@ export async function handleAuthorizationRequest<Env extends AuthorizationEnv>(
     const flowId = env.OAUTH_FLOW_DO.idFromName(continuation);
     const created = await env.OAUTH_FLOW_DO.get(flowId).createConsent(
       oauthRequest,
+      continuation,
       csrfHash,
       Date.now() + CONSENT_TTL_MS,
     );
@@ -173,21 +197,41 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
   }
 
   const flowId = env.OAUTH_FLOW_DO.idFromName(continuation);
-  const oauthRequest = await env.OAUTH_FLOW_DO.get(flowId).consumeConsent(
-    await sha256Base64Url(csrf),
-    Date.now(),
+  const flow = env.OAUTH_FLOW_DO.get(flowId);
+  const csrfHash = await sha256Base64Url(csrf);
+  const submissionHash = await sha256Base64Url(encodedForm);
+  const processingLeaseHash = await sha256Base64Url(randomSecret());
+  const reservation = await reserveConsentWithRetry(
+    flow,
+    csrfHash,
+    submissionHash,
+    processingLeaseHash,
+    continuation,
   );
-  if (!oauthRequest) return localAuthorizationError("Authorization continuation is invalid or expired");
+  if (reservation.status === "completed") {
+    return Response.redirect(reservation.redirectTo, 302);
+  }
+  if (reservation.status === "processing") {
+    return new Response("Authorization is still processing. Please wait and try again.", {
+      status: 409,
+      headers: { "Retry-After": "2" },
+    });
+  }
+  if (reservation.status === "invalid") {
+    return localAuthorizationError("Authorization continuation is invalid or expired");
+  }
+  const oauthRequest = reservation.request;
 
-  const cid = await dependencies.createConnection(
-    pit,
-    locationId,
-    oauthRequest.clientId,
-    selected.policy,
-    selected.target,
-    env,
-  );
   try {
+    const cid = await dependencies.createConnection(
+      continuation,
+      pit,
+      locationId,
+      oauthRequest.clientId,
+      selected.policy,
+      selected.target,
+      env,
+    );
     const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
       request: oauthRequest,
       userId: cid,
@@ -195,12 +239,41 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
       scope: oauthRequest.scope,
       props: { cid, oauthClientId: oauthRequest.clientId } satisfies OAuthGrantProps,
     });
-    await dependencies.connectionCreated(cid, env);
+    if (!await flow.completeConsent(submissionHash, processingLeaseHash, redirectTo)) {
+      await flow.abortConsent(submissionHash, processingLeaseHash);
+      await dependencies.deleteConnection(continuation, env);
+      return new Response("OAuth authorization state could not be completed", { status: 503 });
+    }
     return Response.redirect(redirectTo, 302);
   } catch (error) {
-    await dependencies.deleteConnection(cid, env);
+    // Any failure after reservation is terminal for this continuation. The
+    // deterministic ID may already exist, and provider completion may already
+    // have persisted a grant/code, so releasing it for reuse is unsafe.
+    await flow.abortConsent(submissionHash, processingLeaseHash);
+    await dependencies.deleteConnection(continuation, env);
     throw error;
   }
+}
+
+async function reserveConsentWithRetry(
+  flow: ConsentFlowStub,
+  csrfHash: string,
+  submissionHash: string,
+  processingLeaseHash: string,
+  connectionId: string,
+): Promise<Awaited<ReturnType<ConsentFlowStub["reserveConsent"]>>> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const reservation = await flow.reserveConsent(
+      csrfHash,
+      submissionHash,
+      processingLeaseHash,
+      connectionId,
+      Date.now(),
+    );
+    if (reservation.status !== "processing") return reservation;
+    if (attempt < 39) await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return { status: "processing" };
 }
 
 function localAuthorizationError(description: string): Response {

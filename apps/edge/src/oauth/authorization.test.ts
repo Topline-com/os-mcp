@@ -72,7 +72,6 @@ function testDependencies(
   return {
     async createConnection() { return "cid-test"; },
     async deleteConnection() {},
-    async connectionCreated() {},
     ...overrides,
   };
 }
@@ -218,9 +217,9 @@ test("credential POST creates the connection without a CRM preflight and consume
   const worker = createWorker(testDependencies({
     async createConnection(...args: unknown[]) {
       creates += 1;
-      createdPolicy = args[3];
-      createdTarget = args[4];
-      return "cid-test";
+      createdPolicy = args[4];
+      createdTarget = args[5];
+      return String(args[0]);
     },
   }));
   const clientId = await registerClient(worker, env, redirectUri);
@@ -252,14 +251,18 @@ test("credential POST creates the connection without a CRM preflight and consume
     env,
     executionContext,
   );
-  const authorized = await submit();
+  const [authorized, replay] = await Promise.all([submit(), submit()]);
   assert.equal(authorized.status, 302);
+  assert.equal(replay.status, 302);
+  assert.equal(replay.headers.get("Location"), authorized.headers.get("Location"));
   const redirect = new URL(authorized.headers.get("Location") ?? "");
   assert.equal(redirect.origin + redirect.pathname, redirectUri);
   assert.ok(redirect.searchParams.get("code"));
   assert.equal(redirect.searchParams.get("state"), "state-123");
   assert.equal(redirect.searchParams.get("iss"), AUTHORIZATION_SERVER_ORIGIN);
   assert.equal(creates, 1);
+  const consentFlow = [...(env.OAUTH_FLOW_DO as unknown as MemoryFlowNamespace).flows.values()][0];
+  assert.equal(consentFlow?.consent?.backfillStatus, "pending");
   assert.deepEqual(createdPolicy, {
     version: 1,
     mode: "allow",
@@ -280,9 +283,54 @@ test("credential POST creates the connection without a CRM preflight and consume
   });
   assert.equal(createdTarget, "copilot_studio");
 
+  const completedReplay = await submit();
+  assert.equal(completedReplay.status, 302);
+  assert.equal(completedReplay.headers.get("Location"), authorized.headers.get("Location"));
+  assert.equal(creates, 1);
+  assert.equal(consentFlow?.consent?.backfillStatus, "pending");
+});
+
+test("connection creation failure terminalizes the continuation before cleanup", async () => {
+  const redirectUri = "https://client.example/callback";
+  const env = {
+    OAUTH_KV: new MemoryKv() as unknown as KVNamespace,
+    OAUTH_FLOW_DO: new MemoryFlowNamespace(),
+  } as unknown as TestEnv;
+  const deleted: string[] = [];
+  const worker = createWorker(testDependencies({
+    async createConnection() {
+      throw new Error("connection persistence failed");
+    },
+    async deleteConnection(connectionId) { deleted.push(connectionId); },
+  }));
+  const clientId = await registerClient(worker, env, redirectUri);
+  const url = authorizationUrl(clientId, redirectUri);
+  url.searchParams.set("code_challenge", "A".repeat(43));
+  url.searchParams.set("code_challenge_method", "S256");
+  const formResponse = await worker.fetch(new Request(url), env, executionContext);
+  const form = await formResponse.text();
+  const body = new URLSearchParams({
+    continuation: hiddenValue(form, "continuation"),
+    csrf: hiddenValue(form, "csrf"),
+    pit: "pit-test-secret",
+    locationId: "location-123",
+  });
+  const submit = () => worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    }),
+    env,
+    executionContext,
+  );
+
+  await assert.rejects(async () => submit(), /connection persistence failed/);
+  const flow = [...(env.OAUTH_FLOW_DO as unknown as MemoryFlowNamespace).flows.values()][0];
+  assert.equal(flow?.consent?.status, "expiring");
+  assert.deepEqual(deleted, [body.get("continuation")]);
   const replay = await submit();
   assert.equal(replay.status, 400);
-  assert.equal(creates, 1);
 });
 
 test("concurrent authorization-code redemption has one winner and replay fails", async () => {
@@ -386,26 +434,137 @@ class MemoryFlowNamespace {
 }
 
 class MemoryFlow {
-  consent?: { request: unknown; csrfHash: string; expiresAt: number; consumed: boolean };
+  consent?: {
+    request: unknown;
+    connectionId: string;
+    csrfHash: string;
+    expiresAt: number;
+    status: "pending" | "processing" | "completed" | "expiring";
+    submissionHash?: string;
+    processingLeaseHash?: string;
+    redirectTo?: string;
+    backfillStatus?: "pending" | "processing" | "completed";
+    backfillLeaseHash?: string;
+  };
   code?: { leaseHash: string; expiresAt: number; status: "pending" | "spent" };
 
-  async createConsent(request: unknown, csrfHash: string, expiresAt: number): Promise<boolean> {
+  async createConsent(
+    request: unknown,
+    connectionId: string,
+    csrfHash: string,
+    expiresAt: number,
+  ): Promise<boolean> {
     if (this.consent) return false;
-    this.consent = { request, csrfHash, expiresAt, consumed: false };
+    this.consent = { request, connectionId, csrfHash, expiresAt, status: "pending" };
     return true;
   }
 
-  async consumeConsent(csrfHash: string, now: number): Promise<unknown | null> {
+  async reserveConsent(
+    csrfHash: string,
+    submissionHash: string,
+    processingLeaseHash: string,
+    _connectionId: string,
+    now: number,
+  ): Promise<
+    | { status: "reserved"; request: unknown }
+    | { status: "processing" }
+    | { status: "completed"; redirectTo: string }
+    | { status: "invalid" }
+  > {
     if (
       !this.consent ||
-      this.consent.consumed ||
       this.consent.csrfHash !== csrfHash ||
       this.consent.expiresAt <= now
     ) {
-      return null;
+      return { status: "invalid" };
     }
-    this.consent.consumed = true;
-    return this.consent.request;
+    if (this.consent.submissionHash && this.consent.submissionHash !== submissionHash) {
+      return { status: "invalid" };
+    }
+    if (this.consent.status === "processing") return { status: "processing" };
+    if (this.consent.status === "expiring") return { status: "invalid" };
+    if (this.consent.status === "completed") {
+      return this.consent.redirectTo
+        ? { status: "completed", redirectTo: this.consent.redirectTo }
+        : { status: "invalid" };
+    }
+    this.consent.status = "processing";
+    this.consent.submissionHash = submissionHash;
+    this.consent.processingLeaseHash = processingLeaseHash;
+    return { status: "reserved", request: this.consent.request };
+  }
+
+  async completeConsent(
+    submissionHash: string,
+    processingLeaseHash: string,
+    redirectTo: string,
+  ): Promise<boolean> {
+    if (
+      !this.consent ||
+      this.consent.status !== "processing" ||
+      this.consent.submissionHash !== submissionHash ||
+      this.consent.processingLeaseHash !== processingLeaseHash
+    ) return false;
+    this.consent.status = "completed";
+    this.consent.redirectTo = redirectTo;
+    this.consent.backfillStatus = "pending";
+    return true;
+  }
+
+  async abortConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean> {
+    if (
+      !this.consent ||
+      !["processing", "completed", "expiring"].includes(this.consent.status) ||
+      this.consent.submissionHash !== submissionHash ||
+      this.consent.processingLeaseHash !== processingLeaseHash
+    ) return false;
+    this.consent.status = "expiring";
+    return true;
+  }
+
+  async releaseConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean> {
+    if (
+      !this.consent ||
+      this.consent.status !== "processing" ||
+      this.consent.submissionHash !== submissionHash ||
+      this.consent.processingLeaseHash !== processingLeaseHash
+    ) return false;
+    this.consent.status = "pending";
+    this.consent.processingLeaseHash = undefined;
+    return true;
+  }
+
+  async reserveBackfill(leaseHash: string): Promise<
+    | { status: "reserved"; connectionId: string }
+    | { status: "processing" | "completed" | "invalid" }
+  > {
+    if (!this.consent || this.consent.status !== "completed") return { status: "invalid" };
+    if (this.consent.backfillStatus === "completed") return { status: "completed" };
+    if (this.consent.backfillStatus === "processing") return { status: "processing" };
+    this.consent.backfillStatus = "processing";
+    this.consent.backfillLeaseHash = leaseHash;
+    return { status: "reserved", connectionId: this.consent.connectionId };
+  }
+
+  async completeBackfill(leaseHash: string): Promise<boolean> {
+    if (
+      !this.consent ||
+      this.consent.backfillStatus !== "processing" ||
+      this.consent.backfillLeaseHash !== leaseHash
+    ) return false;
+    this.consent.backfillStatus = "completed";
+    return true;
+  }
+
+  async releaseBackfill(leaseHash: string): Promise<boolean> {
+    if (
+      !this.consent ||
+      this.consent.backfillStatus !== "processing" ||
+      this.consent.backfillLeaseHash !== leaseHash
+    ) return false;
+    this.consent.backfillStatus = "pending";
+    this.consent.backfillLeaseHash = undefined;
+    return true;
   }
 
   async reserveCode(

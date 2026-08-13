@@ -82,7 +82,15 @@ export class ConnectionAuthorizationService {
     now = new Date().toISOString(),
     clientTarget: ConnectionClientTarget = "generic",
   ): ConnectionAuthorizationSnapshot {
-    if (this.repository.read() !== null) {
+    const current = this.readCurrent();
+    if (current) {
+      assertPolicy(policy);
+      const sameInitialization =
+        current.status === "active" &&
+        current.location_id === requireLocation(locationId) &&
+        (current.client_target ?? "generic") === requireClientTarget(clientTarget) &&
+        JSON.stringify(current.policy) === JSON.stringify(policy);
+      if (sameInitialization) return current;
       throw new ConnectionAuthorizationStateError("already_initialized");
     }
     const snapshot: ConnectionAuthorizationSnapshot = {

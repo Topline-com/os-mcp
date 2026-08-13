@@ -22,8 +22,37 @@ const TOKEN_REQUEST_MAX_BYTES = 16 * 1024;
 const AUTHORIZATION_CODE_TTL_MS = 10 * 60 * 1000;
 
 interface OAuthFlowStub {
-  createConsent(request: AuthRequest, csrfHash: string, expiresAt: number): Promise<boolean>;
-  consumeConsent(csrfHash: string, now: number): Promise<AuthRequest | null>;
+  createConsent(
+    request: AuthRequest,
+    connectionId: string,
+    csrfHash: string,
+    expiresAt: number,
+  ): Promise<boolean>;
+  reserveConsent(
+    csrfHash: string,
+    submissionHash: string,
+    processingLeaseHash: string,
+    connectionId: string,
+    now: number,
+  ): Promise<
+    | { status: "reserved"; request: AuthRequest }
+    | { status: "processing" }
+    | { status: "completed"; redirectTo: string }
+    | { status: "invalid" }
+  >;
+  completeConsent(
+    submissionHash: string,
+    processingLeaseHash: string,
+    redirectTo: string,
+  ): Promise<boolean>;
+  abortConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean>;
+  releaseConsent(submissionHash: string, processingLeaseHash: string): Promise<boolean>;
+  reserveBackfill(leaseHash: string, now: number): Promise<
+    | { status: "reserved"; connectionId: string }
+    | { status: "processing" | "completed" | "invalid" }
+  >;
+  completeBackfill(leaseHash: string): Promise<boolean>;
+  releaseBackfill(leaseHash: string): Promise<boolean>;
   reserveCode(
     leaseHash: string,
     expiresAt: number,

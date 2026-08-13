@@ -293,15 +293,16 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
 }
 
 function authorizationDependencies(
-  ctx: ExecutionContext,
+  _ctx: ExecutionContext,
 ): AuthorizationDependencies<Env> {
   return {
-    async createConnection(pit, locationId, _oauthClientId, policy, clientTarget, env) {
+    async createConnection(connectionId, pit, locationId, _oauthClientId, policy, clientTarget, env) {
       const brand = env.TOPLINE_BRAND_NAME?.trim() || "Topline OS";
       const cid = await createConnection(
         env.CONNECTIONS,
         { location_id: locationId, pit, brand_name: brand, source: "oauth" },
         env.TOKEN_SIGNING_SECRET,
+        connectionId,
       );
       try {
         await initializeConnectionAuthorization(
@@ -319,9 +320,6 @@ function authorizationDependencies(
     },
     async deleteConnection(cid, env) {
       await deleteConnection(env.CONNECTIONS, cid);
-    },
-    async connectionCreated(cid, env) {
-      ctx.waitUntil(kickoffInitialBackfill(env, cid));
     },
   };
 }
@@ -1032,9 +1030,11 @@ async function kickoffInitialBackfill(env: Env, connectionId: string): Promise<v
         headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
       },
     );
+    if (!res.ok) throw new Error(`Backfill kickoff failed with status ${res.status}`);
     safeLog("log", "backfill_kickoff_completed", { status: res.status });
   } catch (err) {
     safeLog("warn", "backfill_kickoff_failed", { error: safeErrorFields(err) });
+    throw err;
   }
 }
 
