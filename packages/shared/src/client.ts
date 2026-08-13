@@ -124,6 +124,7 @@ export async function toplineFetch<T = unknown>(
     Authorization: `Bearer ${pit}`,
     Version: API_VERSION,
     Accept: "application/json",
+    "User-Agent": "ToplineOS-MCP/0.2",
   };
   let body: string | undefined;
   if (opts.body !== undefined && method !== "GET") {

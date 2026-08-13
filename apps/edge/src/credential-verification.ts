@@ -1,23 +1,42 @@
-import { getToplineApiBaseUrl } from "@topline/shared";
-
 const PLACEHOLDER_API_BASE_URL = "https://api.example.com";
 
-export async function verifyCredentials(pit: string, locationId: string): Promise<void> {
+export interface CredentialVerificationEnv {
+  TOPLINE_API_BASE_URL?: string;
+}
+
+function apiBaseUrl(env?: CredentialVerificationEnv): string {
+  return (env?.TOPLINE_API_BASE_URL || process.env.TOPLINE_API_BASE_URL || PLACEHOLDER_API_BASE_URL)
+    .trim()
+    .replace(/\/$/, "");
+}
+
+export async function verifyCredentials(
+  pit: string,
+  locationId: string,
+  env?: CredentialVerificationEnv,
+): Promise<void> {
   const cleanPit = pit.trim();
   const cleanLocationId = locationId.trim();
-  const base = getToplineApiBaseUrl();
+  const base = apiBaseUrl(env);
   if (!base || base === PLACEHOLDER_API_BASE_URL) {
     throw new Error("topline_api_base_url_missing");
   }
-  const response = await fetch(
-    `${base}/locations/${encodeURIComponent(cleanLocationId)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${cleanPit}`,
-        Version: "2021-07-28",
+  let response: Response;
+  try {
+    response = await fetch(
+      `${base}/locations/${encodeURIComponent(cleanLocationId)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${cleanPit}`,
+          Version: "2021-07-28",
+          Accept: "application/json",
+          "User-Agent": "ToplineOS-MCP/0.2",
+        },
+        signal: AbortSignal.timeout(10_000),
       },
-      signal: AbortSignal.timeout(10_000),
-    },
-  );
-  if (!response.ok) throw new Error("credential_verification_failed");
+    );
+  } catch {
+    throw new Error("credential_verification_unreachable");
+  }
+  if (!response.ok) throw new Error(`credential_verification_failed:${response.status}`);
 }
