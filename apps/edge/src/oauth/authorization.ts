@@ -17,7 +17,7 @@ import { randomSecret, sha256Base64Url } from "./crypto.js";
 
 export { sha256Base64Url } from "./crypto.js";
 
-const CONSENT_TTL_MS = 5 * 60 * 1000;
+const CONSENT_TTL_MS = 30 * 60 * 1000;
 const AUTHORIZATION_FORM_MAX_BYTES = 16 * 1024;
 
 interface ConsentFlowStub {

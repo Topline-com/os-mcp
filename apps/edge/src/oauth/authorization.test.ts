@@ -177,10 +177,17 @@ test("valid persisted clients receive only an opaque one-time continuation form"
   url.searchParams.set("code_challenge", "A".repeat(43));
   url.searchParams.set("code_challenge_method", "S256");
 
+  const startedAt = Date.now();
   const response = await worker.fetch(new Request(url), env, executionContext);
   const body = await response.text();
 
   assert.equal(response.status, 200);
+  const flow = [...(env.OAUTH_FLOW_DO as unknown as MemoryFlowNamespace).flows.values()][0];
+  assert.ok(flow?.consent, "consent flow was not created");
+  assert.ok(
+    flow.consent.expiresAt >= startedAt + 30 * 60 * 1000,
+    "consent form must remain valid for at least 30 minutes",
+  );
   assert.match(body, /name="pit"/);
   assert.match(body, /name="locationId"/);
   assert.match(body, /name="continuation"/);
