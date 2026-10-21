@@ -6,10 +6,10 @@ import type { ToolDef } from "../apps/edge/src/tools/types.js";
 type Group = { id: string; title: string; blurb: string; match: (name: string) => boolean };
 
 const RELEASE = {
-  version: "v0.2.0",
-  date: "2026-08-11",
+  version: "v0.2.1",
+  date: "2026-10-21",
   overview:
-    "The first public release adds MCP 2026 transport support, hardened OAuth, and connection-scoped tool authorization while retaining legacy client compatibility.",
+    "This patch reduces unchanged appointment writes, improves sync recovery and retry handling, and fixes OAuth connection flows. Remaining sync verification is tracked in issue #31.",
 } as const;
 
 const GROUPS: Group[] = [

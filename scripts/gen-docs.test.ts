@@ -4,7 +4,7 @@ import test from "node:test";
 
 import { ALL_TOOLS } from "../apps/edge/src/registry.js";
 
-test("generated reference covers the full registry and identifies v0.2.0", () => {
+test("generated reference covers the full registry and identifies v0.2.1", () => {
   const generated = spawnSync(
     process.execPath,
     ["--import", "tsx", "scripts/gen-docs.ts"],
@@ -12,8 +12,8 @@ test("generated reference covers the full registry and identifies v0.2.0", () =>
   );
 
   assert.equal(generated.status, 0, generated.stderr);
-  assert.match(generated.stdout, /Release v0\.2\.0/);
-  assert.match(generated.stdout, /datetime="2026-08-11"/);
+  assert.match(generated.stdout, /Release v0\.2\.1/);
+  assert.match(generated.stdout, /datetime="2026-10-21"/);
 
   for (const tool of ALL_TOOLS) {
     const occurrences = generated.stdout.split(`id="${tool.name}"`).length - 1;
