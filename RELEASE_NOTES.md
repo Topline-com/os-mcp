@@ -1,83 +1,42 @@
-# Topline OS MCP v0.2.0
+# Topline OS MCP v0.2.1
 
-Released: 2026-08-11
+Released: 2026-10-21
 
-v0.2.0 is the first public release of Topline OS MCP. It ships the local stdio server, the hosted Cloudflare Worker, 127 registered Worker tools, per-tenant analytics storage, and connection-scoped tool authorization.
+v0.2.1 collects fixes since v0.2.0. The functional changes are already live through commit `2fb26d1`; this release records that deployed behavior.
 
-## Compatibility
+## Fixes
 
-The hosted endpoint supports both MCP protocol generations used by current clients:
+- **OAuth connections:** fix browser-origin compatibility and callback redirects, keep consent forms valid for 30 minutes, prevent duplicate submissions, and make consent retries idempotent. Remove the blocking credential preflight and defer background backfill kickoff until after consent completes.
+- **CRM requests:** read the configured API base URL at request time and send a User-Agent on CRM requests and credential probes.
+- **Sync writes and retries ([#29](https://github.com/Topline-com/os-mcp/pull/29)):** skip appointment-row and index writes when content is unchanged, reconcile changed appointments atomically, persist retry cooldowns for failing parents, repair legacy row-count caches, and commit pagination completion with its watermark. Shared leases fence mutations against stale or overlapping runs.
+- **RPC recovery ([#30](https://github.com/Topline-com/os-mcp/pull/30)):** forward Durable Object RPC calls through a local closure instead of `.bind`, fixing the runtime failure while preserving lease fencing.
 
-- MCP `2026-07-28`, including stateless `server/discover`, modern request metadata, standard transport headers, and private cache hints.
-- MCP `2025-06-18`, including `initialize`, `notifications/initialized`, and Streamable HTTP compatibility.
+## Sync behavior
 
-The stdio server supports the modern protocol and remains available to Claude Desktop, Claude Code, and Codex through the existing `npx` install. Raw PIT bearer clients keep the action-only compatibility path. OAuth and `/connect` clients use connection-bound bearer tokens.
+Private integration tokens continue to use polling with the existing 2020–2030 appointment history. No new credentials or webhook setup are required. Appointments omitted from a calendar response are retained; returned cancellation and status changes still update normally.
 
-## OAuth and authorization
+Appointment `_synced_at` now means the last material row write. Use `topline_warehouse_freshness` or the entity's `last_success_at` for completed-check freshness. Partial or failed sweeps do not count as completed checks.
 
-OAuth now uses `@cloudflare/workers-oauth-provider` for client registration, CIMD lookup, authorization-server and protected-resource metadata, grants, access and refresh tokens, resource matching, and token validation.
+## Validation and remaining checks
 
-The release adds:
+382 standard tests and nine real-workerd regression cases passed. Local workerd measurements for 1,000 identical appointments fell from 6,000 appointment-storage writes to zero; changing one appointment produced six appointment-storage writes. Metadata and lease bookkeeping are separate.
 
-- Dynamic Client Registration compatibility and CIMD support.
-- Exact client and redirect-URI validation before the credential form renders.
-- S256 PKCE for public clients; plain PKCE and the implicit flow are disabled.
-- One-time consent continuations and one-time authorization-code redemption guarded by `OAuthFlowDO`.
-- Access tokens bound to the canonical `https://os-mcp.topline.com/mcp` resource.
-- Exact browser Origin checks, bounded token request bodies, and explicit MCP CORS headers.
-- Encrypted PIT connection records. OAuth grant data contains the connection ID and OAuth client ID, not the PIT.
+Passive observation of the deployed version on October 21, 16:14:50–16:30 UTC returned four appointment summaries and three errors. Observed results included 4,647 unchanged appointments, `data_rows_written=0`, `row_count=5373`, and 40 failed/pending parents. No full cron completion returned.
 
-Each hosted connection now owns a server-side tool policy. The server filters `tools/list` and independently checks the same policy before `tools/call` dispatch. Presets cover read-only CRM, sales, marketing, analytics, and all tools; custom allowlists are also supported. Revoked, malformed, unsupported, and cross-tenant policy records fail closed.
-
-## Storage and lifecycle
-
-OAuth clients, grants, and tokens use a dedicated `OAUTH_KV` namespace. It must remain separate from the encrypted `CONNECTIONS` directory.
-
-The edge Worker owns three SQLite-backed Durable Object classes:
-
-- `LocationDO` stores each tenant's synced analytics data.
-- `OAuthFlowDO` serializes consent and authorization-code redemption.
-- `ConnectionAuthDO` stores each connection's active policy, revision, and revocation state.
-
-Wrangler migrations `v2` and `v3` add `OAuthFlowDO` and `ConnectionAuthDO`. Cloudflare cannot roll back across those Durable Object lifecycle changes. Any recovery from a pre-v2/v3 behavior regression must be a forward fix that preserves all three class exports, bindings, and migration entries.
-
-## Production verification
-
-The functional code underlying v0.2.0 was deployed to production on 2026-08-11 before the release-only version and documentation commit. The verification covered:
-
-- Edge-first, then sync Worker deployment.
-- Applied `v2` and `v3` Durable Object migrations with SQLite storage.
-- Separate `OAUTH_KV` and `CONNECTIONS` bindings.
-- Hosted landing and OAuth metadata responses.
-- Rejection of an unapproved browser Origin.
-- MCP `2026-07-28` discovery and deterministic raw-PIT action-tool listing.
-- MCP `2025-06-18` initialization and deterministic raw-PIT action-tool listing.
-- Setup authentication and location checks.
-- The sync Worker's unauthenticated authorization gate.
-
-The production setup check passed 18 of 19 scope probes. The LinkedIn ad-publishing OAuth-data probe returned an upstream HTTP 422 response. This is a known LinkedIn integration limitation, not an MCP transport, OAuth, or deployment failure.
+`data_rows_written` is not an account-billing measurement. Account billing and complete sync freshness remain unverified; these observations do not establish full sync health. Follow-up is tracked in [#31](https://github.com/Topline-com/os-mcp/issues/31).
 
 ## Install and upgrade
 
-Hosted clients using `https://os-mcp.topline.com/mcp` need no local upgrade. Reconnect only if the client reports an expired or invalid token.
+Hosted clients using `https://os-mcp.topline.com/mcp` are already updated and need no local upgrade.
 
-Claude Desktop, Claude Code, and Codex installations that already run:
+Local Claude Desktop, Claude Code, and Codex installations keep the existing command:
 
 ```text
 npx -y github:topline-com/os-mcp
 ```
 
-should fully quit and reopen the client. The next process launch installs the current repository version.
+Fully quit and reopen the client to relaunch the local server. No new installation mechanism is introduced.
 
-For a local development checkout:
+For deployment recovery, preserve lease fencing and roll forward with both Workers. Never restore the old unfenced sync Worker or remove its lease record to bypass fencing. See [Sync operations](https://github.com/Topline-com/os-mcp/blob/v0.2.1/docs/sync-operations.md).
 
-```text
-git pull
-npm ci
-npm run test
-npm run build
-npm run worker:typecheck
-npm run worker:typecheck -w @topline-ai/sync
-```
-
-Do not remove or renumber existing Wrangler migrations during an upgrade. Keep `OAUTH_KV` separate from `CONNECTIONS`.
+[Full changelog](https://github.com/Topline-com/os-mcp/compare/v0.2.0...v0.2.1)
