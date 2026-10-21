@@ -63,6 +63,7 @@ import {
   assertSyncFence,
   assertParentAssociation,
   upsertRows as storeRows,
+  rebaselineRowCounts,
   reconcileAppointmentSnapshot as reconcileSnapshot,
   pruneStaleRows as pruneRows,
   markParentBackfillComplete as completeParent,
@@ -251,6 +252,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     this.ensurePerParentStateColumn("retry_due_at", "TEXT");
     this.ensurePerParentStateColumn("status", "TEXT NOT NULL DEFAULT 'pending'");
     this.ensureSyncStateColumn("last_success_at", "TEXT");
+    this.ensureSyncStateColumn("row_count_verified", "INTEGER NOT NULL DEFAULT 0");
     // drain_started_at on _parent_sync_state: stamped when a parent
     // first starts syncing (pre-existing rows: NULL via additive
     // migration). Used by the per-parent snapshot-and-swap at
@@ -300,6 +302,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     for (const entity of ALL_ENTITIES) {
       this.reconcileTable(entity);
     }
+
+    // Repair legacy caches once before cadence/drift decisions read them.
+    rebaselineRowCounts(this.ctx.storage);
 
     // Indexes are name-keyed; CREATE INDEX IF NOT EXISTS is the correct
     // idempotent primitive. Reapply every time — no-op if already present,
@@ -567,6 +572,22 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       `UPDATE _sync_state SET cursor = NULL WHERE entity = ?`,
       entity,
     );
+  }
+
+  /** Commit pagination completion and its filter watermark as one state change. */
+  async completeSyncEntity(entity: string, watermark: string | undefined, token: string): Promise<void> {
+    this.ensureInitialized();
+    this.ctx.storage.transactionSync(() => {
+      const sql = this.ctx.storage.sql;
+      const lease = assertSyncFence(sql, token);
+      if (!lease || lease.entity !== entity) throw new Error("Sync completion entity mismatch");
+      sql.exec(`INSERT INTO _sync_state(entity, cursor, watermark, backfill_complete, last_sync_at, drain_started_at)
+        VALUES (?, NULL, ?, 1, ?, NULL)
+        ON CONFLICT(entity) DO UPDATE SET cursor = NULL,
+          watermark = COALESCE(excluded.watermark, _sync_state.watermark),
+          backfill_complete = 1, last_sync_at = excluded.last_sync_at, drain_started_at = NULL`,
+        entity, watermark ?? null, new Date().toISOString());
+    });
   }
 
   /** Snapshot of per-entity sync state. */

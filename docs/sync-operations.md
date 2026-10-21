@@ -13,6 +13,11 @@ appointment-row or index writes. New and changed appointments are written in an
 atomic calendar reconciliation, and parent metadata records the completed check.
 Other entities refresh only the unindexed observation timestamp when their
 content is unchanged, preserving their existing drain-cleanup behavior.
+Legacy row-count caches are reconciled once during initialization, then maintained
+from logical inserts and deletions. The durable verification flag avoids repeated
+full-table counts on later refreshes or restarts. Completing a paginated drain
+commits its cursor reset and watermark together, so an interruption cannot pair
+an old pagination cursor with a new incremental filter.
 
 Appointment `_synced_at` records the last material write. Use
 `topline_warehouse_freshness` or the entity's `last_success_at` for check freshness.

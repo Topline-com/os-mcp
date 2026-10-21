@@ -135,11 +135,25 @@ export function assertParentAssociation(entity: string, parentTable: string): En
   return manifest;
 }
 
-function cachedRowCount(sql: SyncSql, table: string): { count: number; missing: boolean } {
-  const row = sql.exec<{ row_count: number }>("SELECT row_count FROM _sync_state WHERE entity = ?", table).toArray()[0];
+/** Rebaseline pre-transactional caches once, without changing freshness or CRM rows. */
+export function rebaselineRowCounts(storage: SyncStorage): void {
+  storage.transactionSync(() => {
+    const { sql } = storage;
+    const legacy = sql.exec<{ entity: string }>("SELECT entity FROM _sync_state WHERE row_count_verified = 0").toArray();
+    for (const { entity } of legacy) {
+      if (!ENTITY_BY_TABLE.has(entity)) continue;
+      const count = sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(entity)}`).one().n;
+      sql.exec(`-- destructive: repair derived count metadata only; no CRM records are changed or deleted.
+        UPDATE _sync_state SET row_count = ?, row_count_verified = 1 WHERE entity = ?`, count, entity);
+    }
+  });
+}
+
+function cachedRowCount(sql: SyncSql, table: string): { count: number; needsRefresh: boolean } {
+  const row = sql.exec<{ row_count: number; row_count_verified: number }>("SELECT row_count, row_count_verified FROM _sync_state WHERE entity = ?", table).toArray()[0];
   return {
-    count: row?.row_count ?? sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).one().n,
-    missing: row === undefined,
+    count: row?.row_count_verified === 1 ? row.row_count : sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).one().n,
+    needsRefresh: row?.row_count_verified !== 1,
   };
 }
 
@@ -192,10 +206,10 @@ function upsertContent(sql: SyncSql, entity: EntityManifest, rows: ReadonlyArray
   }
   result.row_count_after += result.inserted;
   result.data_rows_written = result.rows_written;
-  if (rows.length > 0 || cached.missing) {
-    result.metadata_rows_written += write(sql, `INSERT INTO _sync_state(entity, last_sync_at, row_count) VALUES (?, ?, ?)
-      ON CONFLICT(entity) DO UPDATE SET last_sync_at = excluded.last_sync_at, row_count = excluded.row_count
-      WHERE _sync_state.last_sync_at IS NOT excluded.last_sync_at OR _sync_state.row_count IS NOT excluded.row_count`, entity.table, now, result.row_count_after);
+  if (rows.length > 0 || cached.needsRefresh) {
+    result.metadata_rows_written += write(sql, `INSERT INTO _sync_state(entity, last_sync_at, row_count, row_count_verified) VALUES (?, ?, ?, 1)
+      ON CONFLICT(entity) DO UPDATE SET last_sync_at = excluded.last_sync_at, row_count = excluded.row_count, row_count_verified = 1
+      WHERE _sync_state.last_sync_at IS NOT excluded.last_sync_at OR _sync_state.row_count IS NOT excluded.row_count OR _sync_state.row_count_verified IS NOT 1`, entity.table, now, result.row_count_after);
   }
   return result;
 }

@@ -109,7 +109,7 @@ beforeEach(() => {
     entity TEXT PRIMARY KEY, cursor TEXT, watermark TEXT,
     backfill_complete INTEGER NOT NULL DEFAULT 0,
     last_sync_at TEXT, last_success_at TEXT, row_count INTEGER NOT NULL DEFAULT 0,
-    drain_started_at TEXT, upstream_total INTEGER
+    drain_started_at TEXT, upstream_total INTEGER, row_count_verified INTEGER NOT NULL DEFAULT 0
   )`);
   db.exec(SYNC_LEASE_DDL);
   db.exec(PARENT_SYNC_STATE_DDL);

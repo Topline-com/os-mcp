@@ -38,6 +38,7 @@ type LocationDOStub = Omit<LeaseStore, "getSyncState"> & {
   getSyncState(): Promise<SyncState>;
   setSyncCursor(entity: string, cursor: string): Promise<void>;
   clearSyncCursor(entity: string): Promise<void>;
+  completeSyncEntity(entity: string, watermark?: string): Promise<void>;
   setSyncWatermark(entity: string, watermark: string): Promise<void>;
   markBackfillComplete(entity: string): Promise<void>;
   resetBackfill(entity: string): Promise<void>;
@@ -377,7 +378,6 @@ async function backfillStandardCursor(
       }
     }
     await setWatermarkAndComplete(stub, entity);
-    await stub.clearDrainMarker(entity.table);
   }
 
   return {
@@ -396,27 +396,20 @@ async function backfillStandardCursor(
 }
 
 /**
- * After a complete backfill (empty_page stop), record:
- *   1. Clear the pagination cursor — a completed backfill is NOT a
- *      partial one to resume. Leaving a stale cursor means a later
- *      /sync/backfill resumes from the last page of the previous
- *      complete run instead of doing a true full refresh.
- *   2. Set the incremental watermark from MAX(cursor_column) in the DO.
- *   3. Flip backfill_complete so the cron-driven incremental path
- *      unlocks.
- *
- * Skipped cursor_column → skip the watermark step but still clear
- * cursor + mark complete.
+ * Complete a full drain with one fenced storage transaction: clear the
+ * cursor and drain marker, advance the watermark, and mark backfill complete.
+ * A cursor must never survive with a different incremental filter watermark.
+ * Without a cursor_column, preserve the prior watermark while completing.
  */
 async function setWatermarkAndComplete(stub: LocationDOStub, entity: EntityManifest): Promise<void> {
+  let watermark: string | undefined;
   if (entity.incremental.cursor_column) {
     const result = await stub.executeQuery(`SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`);
     if (result.truncated) throw new Error("Watermark query truncated");
-    const watermark = result.rows[0]?.w;
-    if (watermark != null && String(watermark)) await stub.setSyncWatermark(entity.table, String(watermark));
+    const value = result.rows[0]?.w;
+    if (value != null && String(value)) watermark = String(value);
   }
-  await stub.clearSyncCursor(entity.table);
-  await stub.markBackfillComplete(entity.table);
+  await stub.completeSyncEntity(entity.table, watermark);
 }
 
 /**
@@ -1165,7 +1158,6 @@ async function backfillPollFull(
       rowCountAfter = Math.max(0, rowCountAfter - prunedStale);
     }
     await setWatermarkAndComplete(stub, entity);
-    await stub.clearDrainMarker(entity.table);
   }
 
   return {
@@ -1533,10 +1525,8 @@ async function incrementalEntityUnleased(
     const watermark = result.rows[0]?.w;
     if (watermark != null && String(watermark)) {
       watermarkAfter = String(watermark);
-      await stub.setSyncWatermark(entity.table, watermarkAfter);
     }
-    await stub.clearSyncCursor(entity.table);
-    await stub.clearDrainMarker(entity.table);
+    await stub.completeSyncEntity(entity.table, watermarkAfter);
   }
 
   return {

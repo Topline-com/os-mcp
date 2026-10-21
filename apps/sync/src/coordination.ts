@@ -95,7 +95,7 @@ export async function renewCurrentLease(): Promise<void> {
 
 // Positional arity preserves optional legacy arguments before the new fence.
 const mutationArity: Readonly<Record<string, number>> = {
-  upsertRows: 2, setSyncCursor: 2, clearSyncCursor: 1,
+  upsertRows: 2, setSyncCursor: 2, clearSyncCursor: 1, completeSyncEntity: 2,
   setSyncWatermark: 2, markBackfillComplete: 1, resetBackfill: 1,
   startDrainIfUnset: 1, setUpstreamTotal: 2, pruneStaleRows: 2,
   clearDrainMarker: 1, setParentSyncCursor: 3, ensureParentDrainMarker: 2,

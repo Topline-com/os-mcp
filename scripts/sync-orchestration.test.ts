@@ -3,7 +3,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import test, { type TestContext } from "node:test";
 
 import { encryptPit, type StoredConnection } from "@topline/shared-auth";
-import { ENTITY_BY_TABLE } from "@topline/shared-schema";
+import { ENTITY_BY_TABLE, renderCreateTable } from "@topline/shared-schema";
 import {
   backfillEntity,
   incrementalEntity,
@@ -11,6 +11,7 @@ import {
 } from "../apps/sync/src/backfill.js";
 import { mapRow } from "../apps/sync/src/mapping.js";
 import { LocationDO } from "../packages/shared-do/src/location-do.js";
+import { SYNC_LEASE_TTL_MS } from "../packages/shared-do/src/sync-storage.js";
 
 const LOCATION = "sync-test-location";
 const CONNECTION = "sync-test-connection";
@@ -137,20 +138,20 @@ async function fixture(t: TestContext, appointments = [appointment()]) {
     else process.env.TOPLINE_API_BASE_URL = previousBaseUrl;
   });
   const requests: URL[] = [];
-  let respond: (url: URL) => Response | Promise<Response> = () => {
+  let respond: (url: URL, init?: RequestInit) => Response | Promise<Response> = () => {
     throw new Error("Unexpected request; network access is disabled in this fixture");
   };
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     requests.push(url);
     assert.equal(url.origin, "https://crm.example.test");
-    assert.equal(init?.method, "GET");
+    assert.equal(init?.method, url.pathname === "/contacts/search" ? "POST" : "GET");
     assert.ok(new Headers(init?.headers).get("Authorization") === `Bearer ${pit}`);
-    return respond(url);
+    return respond(url, init);
   });
   t.mock.timers.setTime(START);
   return {
-    env, location, storage, requests,
+    env, location, storage, requests, db,
     at: (now: number) => t.mock.timers.setTime(now),
     respond: (handler: typeof respond) => { respond = handler; },
     rows: () => db.prepare("SELECT * FROM appointments ORDER BY id").all(),
@@ -391,3 +392,209 @@ test("overlapping backfill and incremental invocations share the tenant lease", 
   assert.equal(h.requests.length, 1);
   assert.equal((await h.incremental()).skipped, "not_due");
 });
+
+function contact(id: string, updatedAt: string) {
+  return { id, locationId: LOCATION, firstName: id, dateUpdated: updatedAt };
+}
+
+test("contacts completion rolls back watermark and cursor together after a post-SQL failure", OPTIONS, async (t) => {
+  const h = await fixture(t);
+  const watermark = "2026-10-20T10:00:00.000Z";
+  const intermediate = contact("contact-intermediate", "2026-10-20T11:00:00.000Z");
+  const latest = contact("contact-latest", "2026-10-20T12:00:00.000Z");
+  const originalCursor = { searchAfter: [Date.parse(watermark), "contact-before-crash"] };
+  await h.location.upsertRows("contacts", [mapRow(ENTITY_BY_TABLE.get("contacts")!, contact("contact-existing", watermark))]);
+  await h.location.markBackfillComplete("contacts");
+  await h.location.setSyncWatermark("contacts", watermark);
+  await h.location.setSyncCursor("contacts", JSON.stringify(originalCursor));
+  const drain = await h.location.startDrainIfUnset("contacts");
+
+  const bodies: Array<Record<string, unknown>> = [];
+  h.respond((url, init) => {
+    assert.equal(url.pathname, "/contacts/search");
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return Response.json({ contacts: bodies.length === 1 ? [latest] : [intermediate, latest] });
+  });
+  const fault = new Error("Injected failure after completion SQL executed");
+  const exec = h.storage.sql.exec.bind(h.storage.sql);
+  let injected = false;
+  t.mock.method(h.storage.sql, "exec", (query: string, ...bindings: SQLInputValue[]) => {
+    const cursor = exec(query, ...bindings);
+    if (!injected && /^\s*(?:INSERT|UPDATE)\b/i.test(query)
+      && /\b_sync_state\b/i.test(query) && /\bwatermark\b/i.test(query)) {
+      assert.equal(h.db.prepare("SELECT watermark FROM _sync_state WHERE entity = 'contacts'").get()?.watermark, latest.dateUpdated);
+      injected = true;
+      throw fault;
+    }
+    return cursor;
+  });
+
+  await assert.rejects(h.incremental("contacts"), (error) => error === fault);
+  assert.equal(injected, true, "the fault must occur after the real SQL changed the watermark");
+  const interrupted = (await h.location.getSyncState()).contacts;
+  assert.equal(interrupted.watermark, watermark, "failed completion must roll back the new watermark");
+  assert.equal(interrupted.cursor, JSON.stringify(originalCursor));
+  assert.equal(interrupted.drain_started_at, drain);
+  assert.equal(interrupted.last_success_at, null);
+
+  const retried = await h.incremental("contacts");
+  assert.equal(retried.stopped_reason, "empty_page");
+  assert.equal(bodies.length, 2);
+  for (const body of bodies) {
+    assert.deepEqual(body.searchAfter, originalCursor.searchAfter);
+    assert.deepEqual(body.filters, [{ field: "dateUpdated", operator: "range", value: { gte: watermark } }]);
+  }
+  assert.deepEqual(h.db.prepare("SELECT id FROM contacts ORDER BY id").all().map((row) => row.id),
+    ["contact-existing", "contact-intermediate", "contact-latest"]);
+  const completed = (await h.location.getSyncState()).contacts;
+  assert.equal(completed.watermark, latest.dateUpdated);
+  assert.equal(completed.cursor, null);
+  assert.equal(completed.drain_started_at, null);
+  assert.equal(completed.row_count, 3);
+  assert.equal(completed.backfill_complete, true);
+});
+
+test("a lost contacts completion reply retries with the new filter and no stale cursor", OPTIONS, async (t) => {
+  const h = await fixture(t);
+  const watermark = "2026-10-20T10:00:00.000Z";
+  const latest = contact("contact-latest", "2026-10-20T12:00:00.000Z");
+  const next = contact("contact-next", "2026-10-20T13:00:00.000Z");
+  const originalCursor = { searchAfter: [Date.parse(watermark), "contact-before-crash"] };
+  await h.location.upsertRows("contacts", [mapRow(ENTITY_BY_TABLE.get("contacts")!, contact("contact-existing", watermark))]);
+  await h.location.markBackfillComplete("contacts");
+  await h.location.setSyncWatermark("contacts", watermark);
+  await h.location.setSyncCursor("contacts", JSON.stringify(originalCursor));
+  await h.location.startDrainIfUnset("contacts");
+
+  const bodies: Array<Record<string, unknown>> = [];
+  h.respond((url, init) => {
+    assert.equal(url.pathname, "/contacts/search");
+    bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+    return Response.json({ contacts: bodies.length === 1 ? [latest] : [latest, next] });
+  });
+  const fault = new Error("Injected lost completion reply");
+  const complete = h.location.completeSyncEntity.bind(h.location);
+  let lostReply = false;
+  t.mock.method(h.location, "completeSyncEntity", async (...args: Parameters<LocationDO["completeSyncEntity"]>) => {
+    await complete(...args);
+    if (!lostReply) {
+      lostReply = true;
+      throw fault;
+    }
+  });
+
+  await assert.rejects(h.incremental("contacts"), (error) => error === fault);
+  assert.equal(lostReply, true);
+  const committed = (await h.location.getSyncState()).contacts;
+  assert.equal(committed.watermark, latest.dateUpdated);
+  assert.equal(committed.cursor, null);
+  assert.equal(committed.drain_started_at, null);
+  assert.equal(committed.last_success_at, null);
+
+  assert.equal((await h.incremental("contacts")).stopped_reason, "empty_page");
+  assert.equal(bodies.length, 2);
+  assert.deepEqual(bodies[0].searchAfter, originalCursor.searchAfter);
+  assert.deepEqual(bodies[0].filters, [{ field: "dateUpdated", operator: "range", value: { gte: watermark } }]);
+  assert.equal(bodies[1].searchAfter, undefined);
+  assert.deepEqual(bodies[1].filters, [{ field: "dateUpdated", operator: "range", value: { gte: latest.dateUpdated } }]);
+  assert.deepEqual(h.db.prepare("SELECT id FROM contacts ORDER BY id").all().map((row) => row.id),
+    ["contact-existing", "contact-latest", "contact-next"]);
+  const state = (await h.location.getSyncState()).contacts;
+  assert.equal(state.watermark, next.dateUpdated);
+  assert.equal(state.cursor, null);
+  assert.equal(state.row_count, 3);
+});
+
+test("completion rejects foreign, expired and superseded leases without mutating progress", OPTIONS, async (t) => {
+  const h = await fixture(t);
+  const watermark = "2026-10-20T10:00:00.000Z";
+  const nextWatermark = "2026-10-20T12:00:00.000Z";
+  await h.location.setSyncWatermark("contacts", watermark);
+  await h.location.setSyncCursor("contacts", "unfinished-page");
+  await h.location.startDrainIfUnset("contacts");
+  const before = await h.location.getSyncState();
+  const token = await h.location.acquireSyncLease(LOCATION, "contacts");
+  assert.ok(token);
+
+  const otherDb = new DatabaseSync(":memory:");
+  t.after(() => otherDb.close());
+  const other = new LocationDO({
+    id: { toString: () => "other-tenant-object" }, storage: sqliteStorage(otherDb),
+  } as unknown as ConstructorParameters<typeof LocationDO>[0], {});
+  const foreignToken = await other.acquireSyncLease("other-location", "contacts");
+  assert.ok(foreignToken);
+  await assert.rejects(h.location.completeSyncEntity("contacts", nextWatermark, foreignToken), { name: "SyncLeaseError" });
+  await assert.rejects(h.location.completeSyncEntity("tags", nextWatermark, token), /entity mismatch/);
+  assert.deepEqual(await h.location.getSyncState(), before);
+
+  h.at(START + SYNC_LEASE_TTL_MS);
+  await assert.rejects(h.location.completeSyncEntity("contacts", nextWatermark, token), { name: "SyncLeaseError" });
+  const replacement = await h.location.acquireSyncLease(LOCATION, "contacts");
+  assert.ok(replacement);
+  assert.notEqual(replacement, token);
+  await assert.rejects(h.location.completeSyncEntity("contacts", nextWatermark, token), { name: "SyncLeaseError" });
+  assert.deepEqual(await h.location.getSyncState(), before);
+
+  await h.location.completeSyncEntity("contacts", undefined, replacement);
+  const completed = (await h.location.getSyncState()).contacts;
+  assert.equal(completed.watermark, watermark, "omitting a watermark preserves the existing filter");
+  assert.equal(completed.cursor, null);
+  assert.equal(completed.drain_started_at, null);
+  assert.equal(completed.backfill_complete, true);
+  assert.equal(h.requests.length, 0);
+});
+
+for (const firstCall of ["getSyncState", "upsertRows"] as const) {
+  test(`legacy row counts are repaired once when ${firstCall} initializes the real object`, OPTIONS, async (t) => {
+    t.mock.timers.enable({ apis: ["Date"], now: START });
+    const db = new DatabaseSync(":memory:");
+    t.after(() => db.close());
+    // The pre-upgrade cache has no verification column. Simulate a partial
+    // legacy batch whose committed data outgrew its cached bookkeeping.
+    db.exec(`CREATE TABLE _sync_state (
+      entity TEXT PRIMARY KEY, cursor TEXT, watermark TEXT,
+      backfill_complete INTEGER NOT NULL DEFAULT 0, last_sync_at TEXT,
+      row_count INTEGER NOT NULL DEFAULT 0
+    )`);
+    for (const [entity, staleCount] of [["contacts", 1], ["tags", 0]] as const) {
+      db.exec(renderCreateTable(ENTITY_BY_TABLE.get(entity)!));
+      const insert = db.prepare(`INSERT INTO ${entity}(id, location_id, _synced_at) VALUES (?, ?, ?)`);
+      insert.run(`${entity}-a`, LOCATION, new Date(START - POLL).toISOString());
+      insert.run(`${entity}-b`, LOCATION, new Date(START - POLL).toISOString());
+      db.prepare("INSERT INTO _sync_state(entity, row_count, backfill_complete, cursor) VALUES (?, ?, 1, 'legacy-cursor')").run(entity, staleCount);
+    }
+    const storage = sqliteStorage(db);
+    const countQueries: string[] = [];
+    const exec = storage.sql.exec.bind(storage.sql);
+    t.mock.method(storage.sql, "exec", (query: string, ...bindings: SQLInputValue[]) => {
+      if (/^\s*SELECT\b/i.test(query) && /\bCOUNT\s*\(/i.test(query)) countQueries.push(query);
+      return exec(query, ...bindings);
+    });
+    const ctx = { id: { toString: () => "legacy-count-test-object" }, storage } as unknown as ConstructorParameters<typeof LocationDO>[0];
+    let location = new LocationDO(ctx, {});
+    if (firstCall === "upsertRows") {
+      assert.equal((await location.upsertRows("contacts", [{ id: "contacts-a", location_id: LOCATION }])).row_count_after, 2);
+    }
+    const repaired = await location.getSyncState();
+    assert.equal(repaired.contacts.row_count, 2);
+    assert.equal(repaired.tags.row_count, 2);
+    assert.equal(repaired.contacts.cursor, "legacy-cursor");
+    assert.equal(repaired.tags.cursor, "legacy-cursor");
+    assert.equal(db.prepare("SELECT row_count_verified FROM _sync_state WHERE entity = 'contacts'").get()?.row_count_verified, 1);
+    assert.equal(db.prepare("SELECT row_count_verified FROM _sync_state WHERE entity = 'tags'").get()?.row_count_verified, 1);
+    for (const entity of ["contacts", "tags"]) {
+      assert.equal(countQueries.filter((query) => new RegExp(`\\bFROM\\s+"?${entity}\\b`, "i").test(query)).length, 1);
+    }
+    const initialCountQueries = countQueries.length;
+
+    assert.equal((await location.upsertRows("contacts", [{ id: "contacts-c", location_id: LOCATION }])).row_count_after, 3);
+    assert.equal((await location.getSyncState()).contacts.row_count, 3);
+    location = new LocationDO(ctx, {});
+    const restarted = await location.getSyncState();
+    assert.equal(restarted.contacts.row_count, 3);
+    assert.equal(restarted.tags.row_count, 2);
+    assert.equal((await location.upsertRows("contacts", [{ id: "contacts-c", location_id: LOCATION }])).row_count_after, 3);
+    assert.equal(countQueries.length, initialCountQueries, "verified counts must survive upserts and a cold restart without recounting tables");
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM contacts").get()?.n, 3);
+  });
+}
