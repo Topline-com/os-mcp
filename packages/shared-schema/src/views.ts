@@ -494,7 +494,7 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
   {
     name: "warehouse_freshness",
     description:
-      "Per-table sync freshness snapshot for the activity-critical tables that drive pipeline audits: row_count, last_synced_at (MAX of _synced_at), and lag_seconds vs. now. Use this as a deterministic readiness probe — e.g. WHERE lag_seconds > 1800 flags tables more than 30 min behind. Scoped to the 4 activity tables on purpose: Workers DO SQLite enforces a tight SQLITE_LIMIT_COMPOUND_SELECT (CREATE VIEW with > 4 UNION ALL terms fails at warmup with 'too many terms in compound SELECT' and rolls back the entire ANALYTICS_VIEWS batch). For freshness of contacts / pipeline_stages / etc., query MAX(_synced_at) on those tables directly.",
+      "Per-table sync freshness for the activity-critical tables: row_count, last_synced_at, and lag_seconds. Appointments use the last successfully completed calendar sweep once coordinated sync is active; unchanged records do not need rewriting to remain fresh. Other tables and legacy appointment stores use MAX(_synced_at). A NULL last_synced_at means no completed check is available. Use WHERE lag_seconds > 1800 OR last_synced_at IS NULL to find stale or unverified data. Scoped to four activity tables because Workers SQLite limits compound SELECT terms.",
     base_tables: [
       "opportunities",
       "messages",
@@ -517,9 +517,16 @@ export const ANALYTICS_VIEWS: readonly AnalyticsView[] = [
              CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
         FROM call_events
       UNION ALL
-      SELECT 'appointments', COUNT(*), MAX(_synced_at),
-             CAST((julianday('now') - julianday(MAX(_synced_at))) * 86400 AS INTEGER)
-        FROM appointments
+      SELECT 'appointments', row_count, last_synced_at,
+             CAST((julianday('now') - julianday(last_synced_at)) * 86400 AS INTEGER)
+        FROM (
+          SELECT COUNT(*) AS row_count,
+                 CASE WHEN EXISTS (SELECT 1 FROM _sync_lease WHERE singleton = 1)
+                      THEN (SELECT last_success_at FROM _sync_state WHERE entity = 'appointments')
+                      ELSE MAX(_synced_at)
+                 END AS last_synced_at
+            FROM appointments
+        )
     `,
   },
 ];

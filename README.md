@@ -336,7 +336,9 @@ npx wrangler dev    # serves at http://localhost:8787
 
 ## For operators (deploy + configure a new tenant)
 
-Deploys are automated: pushing to `main` triggers `.github/workflows/deploy.yml` which runs `npm test` + `npm run build` + `wrangler deploy` for both `apps/edge` and `apps/sync`. No manual step.
+Pull requests run `npm run check` and bundle both Workers without deploying. Merging to `main` triggers `.github/workflows/deploy.yml`, which repeats the checks and deploys `apps/edge` before `apps/sync`. The edge Worker owns the shared Durable Object implementation, so this order matters.
+
+For sync behavior, storage-write measurements, and rollout checks, see [Sync operations](docs/sync-operations.md).
 
 **Worker secrets** — set via `wrangler secret put` per Worker, never committed:
 

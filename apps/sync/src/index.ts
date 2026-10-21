@@ -18,6 +18,7 @@ import {
   DEFAULT_BACKFILL_ORDER,
   incrementalEntity,
   incrementalAll,
+  clearEntityCursor,
   type SyncEnv,
   type BackfillResult,
   type IncrementalResult,
@@ -168,9 +169,9 @@ async function handleClearCursor(request: Request, env: Env): Promise<Response> 
     return json(404, { error: "Connection is unavailable." });
   }
 
-  const doId = env.LOCATION_DO.idFromName(connection.location_id);
-  const stub = env.LOCATION_DO.get(doId);
-  await stub.clearSyncCursor(entity);
+  if (!await clearEntityCursor(env, connectionId, entity)) {
+    return json(409, { error: "Sync is already running." });
+  }
   return json(200, { cleared: entity, location_id: connection.location_id });
 }
 
@@ -223,6 +224,11 @@ async function runIncrementalForAllConnections(env: Env): Promise<void> {
         for (const [table, r] of Object.entries(results)) {
           safeLog("log", `sync_entity_${table}`, {
             rows_upserted: r.rows_upserted,
+            data_rows_written: r.data_rows_written ?? null,
+            unchanged_rows: r.unchanged_rows ?? null,
+            missing_retained: r.missing_retained ?? null,
+            pending_parents: r.pending_parents ?? 0,
+            skipped: Boolean(r.skipped),
             row_count: r.row_count_after,
             failed_parent_count: r.failed_parents?.length ?? 0,
             has_error: Boolean(r.error),

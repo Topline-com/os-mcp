@@ -24,6 +24,8 @@ export const credentialsContext = new AsyncLocalStorage<RequestCredentials>();
 export class ToplineApiError extends Error {
   statusCode: number;
   body: unknown;
+  /** Server-requested retry delay, available to durable background jobs. */
+  retryAfterMs?: number;
   constructor(statusCode: number, body: unknown, message: string) {
     super(message);
     this.statusCode = statusCode;
@@ -110,6 +112,16 @@ async function sleep(ms: number): Promise<void> {
 
 export interface ToplineFetchOptions extends FetchOptions {
   method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  /** Background sync persists retries instead of sleeping inside a lease. */
+  retryRateLimits?: boolean;
+}
+
+export function parseRetryAfter(value: string | null, now = Date.now()): number | undefined {
+  if (!value?.trim()) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - now) : undefined;
 }
 
 export async function toplineFetch<T = unknown>(
@@ -149,13 +161,15 @@ export async function toplineFetch<T = unknown>(
     if (res.ok) return parsed as T;
 
     // Retry 429 with backoff up to 3 attempts
-    if (res.status === 429 && attempt < 3) {
-      const retryAfter = Number(res.headers.get("retry-after") ?? "0");
-      const delay = retryAfter > 0 ? retryAfter * 1000 : 500 * 2 ** (attempt - 1);
+    if (res.status === 429 && attempt < 3 && opts.retryRateLimits !== false) {
+      const retryAfter = parseRetryAfter(res.headers.get("retry-after"));
+      const delay = retryAfter ?? 500 * 2 ** (attempt - 1);
       await sleep(delay);
       continue;
     }
 
-    throw shapeError(res.status, parsed);
+    const error = shapeError(res.status, parsed);
+    error.retryAfterMs = parseRetryAfter(res.headers.get("retry-after"));
+    throw error;
   }
 }

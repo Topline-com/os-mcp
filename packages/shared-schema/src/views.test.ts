@@ -14,6 +14,8 @@ function viewDDL(name: string): string {
 function initSchema(): void {
   db = new DatabaseSync(":memory:");
   db.exec(`
+    CREATE TABLE _sync_state (entity TEXT PRIMARY KEY, last_success_at TEXT);
+    CREATE TABLE _sync_lease (singleton INTEGER PRIMARY KEY);
     CREATE TABLE contacts (
       id TEXT PRIMARY KEY,
       location_id TEXT,
@@ -103,6 +105,39 @@ function initSchema(): void {
 beforeEach(initSchema);
 
 describe("analytics view DDL", () => {
+  it("appointment freshness advances after an unchanged successful sweep", () => {
+    db.exec(viewDDL("warehouse_freshness"));
+    db.prepare("INSERT INTO appointments(id, _synced_at) VALUES (?, ?)").run("a", "2020-01-01T00:00:00Z");
+    const before = db.prepare("SELECT last_synced_at FROM warehouse_freshness WHERE table_name = 'appointments'").get();
+    equal(before?.last_synced_at, "2020-01-01T00:00:00Z");
+    db.exec("INSERT INTO _sync_lease VALUES (1)");
+    db.prepare("INSERT INTO _sync_state VALUES ('appointments', ?)").run("2026-10-21T12:00:00Z");
+    const after = db.prepare("SELECT row_count, last_synced_at FROM warehouse_freshness WHERE table_name = 'appointments'").get();
+    equal(after?.row_count, 1);
+    equal(after?.last_synced_at, "2026-10-21T12:00:00Z");
+    equal(db.prepare("SELECT _synced_at FROM appointments").get()?._synced_at, "2020-01-01T00:00:00Z");
+  });
+
+  it("partial appointment writes do not masquerade as a completed sweep", () => {
+    db.exec(viewDDL("warehouse_freshness"));
+    db.exec("INSERT INTO _sync_lease VALUES (1)");
+    db.prepare("INSERT INTO appointments(id, _synced_at) VALUES (?, ?)").run("a", "2026-10-21T12:00:00Z");
+    const query = db.prepare("SELECT last_synced_at, lag_seconds FROM warehouse_freshness WHERE table_name = 'appointments'");
+    equal(query.get()?.last_synced_at, null);
+    equal(query.get()?.lag_seconds, null);
+    db.prepare("INSERT INTO _sync_state VALUES ('appointments', ?)").run("2026-10-20T12:00:00Z");
+    equal(query.get()?.last_synced_at, "2026-10-20T12:00:00Z");
+  });
+
+  it("an empty calendar warehouse can have a completed freshness check", () => {
+    db.exec(viewDDL("warehouse_freshness"));
+    db.exec("INSERT INTO _sync_lease VALUES (1)");
+    db.prepare("INSERT INTO _sync_state VALUES ('appointments', ?)").run("2026-10-21T12:00:00Z");
+    const row = db.prepare("SELECT row_count, last_synced_at FROM warehouse_freshness WHERE table_name = 'appointments'").get();
+    equal(row?.row_count, 0);
+    equal(row?.last_synced_at, "2026-10-21T12:00:00Z");
+  });
+
   it("creates every view against the expected base-table columns", () => {
     for (const view of ANALYTICS_VIEWS) {
       db.exec(view.ddl);

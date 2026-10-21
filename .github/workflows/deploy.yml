@@ -14,8 +14,11 @@ permissions:
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "9013139d3c5200efb4c73c5ecb36d8be"
     steps:
       - uses: actions/checkout@v4
 
@@ -24,11 +27,9 @@ jobs:
           node-version: 22
           cache: npm
 
-      - run: npm ci
+      - run: npm ci --ignore-scripts
 
-      - run: npm test
-
-      - run: npm run build
+      - run: npm run check
 
       # Deploy the edge worker first — it owns the LocationDO class that
       # the sync worker binds to via script_name in apps/sync/wrangler.toml.
