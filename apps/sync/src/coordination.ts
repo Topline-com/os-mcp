@@ -110,7 +110,9 @@ export function fencedStub<T extends object>(stub: T, locationId: string): T {
       const method = Reflect.get(target, property);
       if (typeof method !== "function") return method;
       const arity = typeof property === "string" ? mutationArity[property] : undefined;
-      if (arity === undefined) return method.bind(target);
+      // RPC function properties are remote paths: method.bind would call a
+      // remote method named "bind". Invoke through a local forwarding closure.
+      if (arity === undefined) return (...args: unknown[]) => Reflect.apply(method, target, args);
       return async (...args: unknown[]) => {
         const context = syncContext.getStore();
         if (!context || context.locationId !== locationId) throw new Error("Sync lease tenant mismatch");

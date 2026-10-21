@@ -30,6 +30,8 @@ jobs:
       - run: npm run check
       - name: Verify appointment writes in local workerd
         run: node scripts/measure-sync-writes.mjs
+      - name: Verify sync coordination across real RPC
+        run: node scripts/probe-sync-rpc.mjs
       - name: Bundle both Workers without deploying
         run: |
           npm run worker:deploy -w @topline-ai/edge -- --dry-run
