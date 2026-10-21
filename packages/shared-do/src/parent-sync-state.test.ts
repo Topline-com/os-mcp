@@ -18,7 +18,7 @@
 // don't exercise the DO's sync bookkeeping at all. This suite covers
 // exactly the invariants the P1 fix rests on.
 
-import { describe, it, beforeEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import { strictEqual, deepStrictEqual, ok } from "node:assert";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -31,7 +31,10 @@ import {
   nextParentsForChildSql,
   sweepParentsForChildSql,
   refreshRowCountSql,
+  recordParentFailure,
+  pendingParentsCountSql,
 } from "./parent-sync-sql.js";
+import type { ParentFailureSqlAdapter } from "./parent-sync-sql.js";
 
 // ---------------------------------------------------------------------------
 // Test harness: an in-memory SQLite that mimics the LocationDO schema
@@ -40,6 +43,15 @@ import {
 // ---------------------------------------------------------------------------
 
 let db: DatabaseSync;
+const TEST_NOW = "2026-04-24T12:00:00.000Z";
+const TEST_NOW_MS = Date.parse(TEST_NOW);
+
+// Production helper, with only the synchronous storage API adapted to SQLite.
+const sql: ParentFailureSqlAdapter = {
+  exec(query, ...bindings) {
+    return db.prepare(query).all(...bindings);
+  },
+};
 
 function initSchema(): void {
   db = new DatabaseSync(":memory:");
@@ -60,6 +72,13 @@ function initSchema(): void {
       id TEXT PRIMARY KEY,
       contact_id TEXT,
       title TEXT,
+      _synced_at TEXT
+    );
+  `);
+  db.exec(`
+    CREATE TABLE appointments (
+      id TEXT PRIMARY KEY,
+      calendar_id TEXT,
       _synced_at TEXT
     );
   `);
@@ -137,10 +156,11 @@ function getNextParentsForChild(
   parentTable: string,
   limit: number,
   freshnessColumns: readonly string[],
+  now = TEST_NOW,
 ): string[] {
   const rows = db
     .prepare(nextParentsForChildSql(parentTable, freshnessColumns))
-    .all(childEntity, limit) as Array<{ id: string }>;
+    .all(childEntity, now, limit) as Array<{ id: string }>;
   return rows.map((r) => r.id);
 }
 
@@ -148,17 +168,27 @@ function getSweepParentsForChild(
   childEntity: string,
   parentTable: string,
   limit: number,
+  now = TEST_NOW,
+  checkedBefore?: string,
 ): string[] {
+  const bindings = checkedBefore === undefined
+    ? [childEntity, now, limit]
+    : [childEntity, now, checkedBefore, limit];
   const rows = db
-    .prepare(sweepParentsForChildSql(parentTable))
-    .all(childEntity, limit) as Array<{ id: string }>;
+    .prepare(sweepParentsForChildSql(parentTable, checkedBefore !== undefined))
+    .all(...bindings) as Array<{ id: string }>;
   return rows.map((r) => r.id);
+}
+
+function getPendingParentsCount(childEntity: string, parentTable = "contacts"): number {
+  return (db.prepare(pendingParentsCountSql(parentTable)).get(childEntity) as { n: number }).n;
 }
 
 function getState(entity: string, parentId: string) {
   return db
     .prepare(
-      `SELECT cursor, backfill_complete, last_sync_at, drain_started_at
+      `SELECT cursor, backfill_complete, last_sync_at, drain_started_at,
+              failure_count, retry_due_at, status
        FROM _parent_sync_state WHERE entity = ? AND parent_id = ?`,
     )
     .get(entity, parentId) as
@@ -167,6 +197,9 @@ function getState(entity: string, parentId: string) {
         backfill_complete: number;
         last_sync_at: string | null;
         drain_started_at: string | null;
+        failure_count: number;
+        retry_due_at: string | null;
+        status: string;
       }
     | undefined;
 }
@@ -177,6 +210,7 @@ function getState(entity: string, parentId: string) {
 
 describe("parent-sync state machine", () => {
   beforeEach(() => initSchema());
+  afterEach(() => db.close());
 
   describe("ensureParentDrainMarker — fresh parent (no row)", () => {
     it("creates a row with backfill_complete=0, drain_started_at=now, last_sync_at=NULL", () => {
@@ -186,6 +220,9 @@ describe("parent-sync state machine", () => {
       strictEqual(s?.drain_started_at, "2026-04-24T12:00:00.000Z");
       strictEqual(s?.last_sync_at, null, "last_sync_at must NOT be bumped on the INSERT path — it means 'last successful completion'");
       strictEqual(s?.cursor, null);
+      strictEqual(s?.failure_count, 0);
+      strictEqual(s?.retry_due_at, null);
+      strictEqual(s?.status, "pending");
     });
   });
 
@@ -195,6 +232,7 @@ describe("parent-sync state machine", () => {
       markParentBackfillComplete("tasks", "c2", "tasks", "contact_id", "2026-04-23T00:00:00.000Z");
       const before = getState("tasks", "c2");
       strictEqual(before?.backfill_complete, 1);
+      strictEqual(before?.status, "complete");
       strictEqual(before?.last_sync_at, "2026-04-23T00:00:00.000Z");
 
       // Cron re-selects this parent because its freshness column bumped.
@@ -213,6 +251,7 @@ describe("parent-sync state machine", () => {
         "P1: UPDATE must NOT bump last_sync_at — doing so would leave both getNextParentsForChild clauses false and permanently drop the activity signal after a transient fetch failure.",
       );
       ok(after?.drain_started_at, "drain_started_at must be set when starting the new drain");
+      strictEqual(after?.status, "pending");
     });
 
     it("preserves an existing drain_started_at across resumes (COALESCE)", () => {
@@ -343,7 +382,223 @@ describe("parent-sync state machine", () => {
     });
   });
 
+  describe("recordParentFailure — durable retries and recovery", () => {
+    it("creates a failed, incomplete parent with a first retry after 30 seconds", () => {
+      const result = recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      deepStrictEqual(result, { failureCount: 1, retryDueAt: "2026-04-24T12:00:30.000Z" });
+      const state = getState("tasks", "c1");
+      strictEqual(state?.backfill_complete, 0);
+      strictEqual(state?.status, "failed");
+      strictEqual(state?.failure_count, 1);
+      strictEqual(state?.retry_due_at, result.retryDueAt);
+      strictEqual(state?.cursor, null);
+      strictEqual(state?.last_sync_at, null);
+      strictEqual(state?.drain_started_at, null);
+    });
+
+    it("marks a previously complete parent incomplete without advancing its successful timestamp", () => {
+      const completedAt = "2026-04-23T00:00:00.000Z";
+      markParentBackfillComplete("tasks", "c1", "tasks", "contact_id", completedAt);
+      recordParentFailure(sql, "tasks", "c1", null, TEST_NOW_MS);
+      const state = getState("tasks", "c1");
+      strictEqual(state?.backfill_complete, 0);
+      strictEqual(state?.status, "failed");
+      strictEqual(state?.last_sync_at, completedAt);
+    });
+
+    it("doubles persisted failures from 30 seconds to a 6-hour cap", () => {
+      const expectedDelays = [30_000, 60_000, 120_000, 240_000, 480_000, 960_000,
+        1_920_000, 3_840_000, 7_680_000, 15_360_000, 21_600_000, 21_600_000];
+      for (const [index, delay] of expectedDelays.entries()) {
+        // A fresh adapter each time ensures the count comes from stored state.
+        const resumedSql: ParentFailureSqlAdapter = {
+          exec: (query, ...bindings) => db.prepare(query).all(...bindings),
+        };
+        const result = recordParentFailure(resumedSql, "tasks", "c1", 0, TEST_NOW_MS);
+        strictEqual(result.failureCount, index + 1);
+        strictEqual(Date.parse(result.retryDueAt) - TEST_NOW_MS, delay);
+        strictEqual(getState("tasks", "c1")?.failure_count, index + 1);
+        strictEqual(getState("tasks", "c1")?.retry_due_at, result.retryDueAt);
+      }
+    });
+
+    for (const [label, retryAfterMs, expectedDelay] of [
+      ["missing", undefined, 30_000],
+      ["null", null, 30_000],
+      ["zero", 0, 30_000],
+      ["negative", -1, 30_000],
+      ["NaN", NaN, 30_000],
+      ["positive infinity", Infinity, 30_000],
+      ["negative infinity", -Infinity, 30_000],
+      ["below backoff", 1, 30_000],
+      ["above backoff", 45_000, 45_000],
+      ["fractional minimum", 45_000.5, 45_001],
+      ["above the exponential cap", 86_400_000, 86_400_000],
+    ] as const) {
+      it(`handles ${label} Retry-After`, () => {
+        const result = recordParentFailure(sql, "tasks", "c1", retryAfterMs, TEST_NOW_MS);
+        strictEqual(Date.parse(result.retryDueAt) - TEST_NOW_MS, expectedDelay);
+      });
+    }
+
+    it("clamps giant delays to a valid ISO date that still sorts after now", () => {
+      db.prepare("INSERT INTO contacts(id, updated_at) VALUES ('c1', ?)").run(TEST_NOW);
+      const result = recordParentFailure(sql, "tasks", "c1", Number.MAX_VALUE, TEST_NOW_MS);
+      strictEqual(result.retryDueAt, "9999-12-31T23:59:59.999Z");
+      ok(Number.isFinite(Date.parse(result.retryDueAt)));
+      ok(Date.parse(result.retryDueAt) <= 8_640_000_000_000_000);
+      deepStrictEqual(getNextParentsForChild("tasks", "contacts", 10, ["updated_at"]), []);
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 10), []);
+      strictEqual(getPendingParentsCount("tasks"), 1);
+    });
+
+    it("keeps the exponential cap safe even for a large persisted failure count", () => {
+      ensureParentDrainMarker("tasks", "c1", TEST_NOW);
+      db.prepare("UPDATE _parent_sync_state SET failure_count = 1000000").run();
+      const result = recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      strictEqual(result.failureCount, 1_000_001);
+      strictEqual(Date.parse(result.retryDueAt) - TEST_NOW_MS, 21_600_000);
+    });
+
+    it("retains retry history through partial progress and resets it only on completion", () => {
+      ensureParentDrainMarker("tasks", "c1", TEST_NOW);
+      setParentSyncCursor("tasks", "c1", "page-2", TEST_NOW);
+      const failed = recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      ensureParentDrainMarker("tasks", "c1", "2026-04-24T12:00:30.000Z");
+      const resumed = getState("tasks", "c1");
+      strictEqual(resumed?.cursor, "page-2");
+      strictEqual(resumed?.drain_started_at, TEST_NOW);
+      strictEqual(resumed?.last_sync_at, TEST_NOW);
+      strictEqual(resumed?.retry_due_at, failed.retryDueAt);
+      strictEqual(resumed?.status, "failed");
+      strictEqual(resumed?.failure_count, 1);
+
+      setParentSyncCursor("tasks", "c1", "page-3", failed.retryDueAt);
+      const progress = getState("tasks", "c1");
+      strictEqual(progress?.retry_due_at, null);
+      strictEqual(progress?.status, "pending");
+      strictEqual(progress?.failure_count, 1);
+      strictEqual(progress?.backfill_complete, 0);
+      const failedAgain = recordParentFailure(sql, "tasks", "c1", undefined, Date.parse(failed.retryDueAt));
+      strictEqual(failedAgain.failureCount, 2);
+      strictEqual(failedAgain.retryDueAt, "2026-04-24T12:01:30.000Z");
+
+      markParentBackfillComplete("tasks", "c1", "tasks", "contact_id", failedAgain.retryDueAt);
+      const complete = getState("tasks", "c1");
+      strictEqual(complete?.failure_count, 0);
+      strictEqual(complete?.retry_due_at, null);
+      strictEqual(complete?.status, "complete");
+      strictEqual(complete?.backfill_complete, 1);
+      strictEqual(complete?.cursor, null);
+      strictEqual(complete?.drain_started_at, null);
+      strictEqual(recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS).failureCount, 1);
+    });
+
+    it("isolates failure history by child entity and parent ID", () => {
+      recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      strictEqual(recordParentFailure(sql, "notes", "c1", undefined, TEST_NOW_MS).failureCount, 1);
+      strictEqual(recordParentFailure(sql, "tasks", "c2", undefined, TEST_NOW_MS).failureCount, 1);
+      strictEqual(getState("tasks", "c1")?.failure_count, 2);
+    });
+  });
+
+  describe("retry-aware selectors and pending counts", () => {
+    it("excludes future retries even with a freshness bump, and includes them exactly when due", () => {
+      db.prepare("INSERT INTO contacts(id, updated_at) VALUES ('retry', ?), ('ready', ?)").run(TEST_NOW, TEST_NOW);
+      const { retryDueAt } = recordParentFailure(sql, "tasks", "retry", undefined, TEST_NOW_MS);
+      const justBefore = new Date(Date.parse(retryDueAt) - 1).toISOString();
+      for (const freshness of [[], ["updated_at"]]) {
+        deepStrictEqual(getNextParentsForChild("tasks", "contacts", 10, freshness, justBefore), ["ready"]);
+        deepStrictEqual(getNextParentsForChild("tasks", "contacts", 10, freshness, retryDueAt), ["ready", "retry"]);
+      }
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 10, justBefore), ["ready"]);
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 10, retryDueAt), ["ready", "retry"]);
+    });
+
+    it("counts unseen, incomplete and failed parents including delayed ones, scoped to existing parents and entity", () => {
+      db.prepare("INSERT INTO contacts(id) VALUES ('unseen'), ('partial'), ('delayed'), ('failed'), ('done')").run();
+      setParentSyncCursor("tasks", "partial", "page-2", TEST_NOW);
+      recordParentFailure(sql, "tasks", "delayed", 86_400_000, TEST_NOW_MS);
+      markParentBackfillComplete("tasks", "failed", "tasks", "contact_id", TEST_NOW);
+      // Failed status is independently unfinished, even if the old flag says 1.
+      db.prepare("UPDATE _parent_sync_state SET status = 'failed' WHERE parent_id = 'failed'").run();
+      markParentBackfillComplete("tasks", "done", "tasks", "contact_id", TEST_NOW);
+      recordParentFailure(sql, "tasks", "removed-parent", undefined, TEST_NOW_MS);
+      markParentBackfillComplete("notes", "unseen", "tasks", "contact_id", TEST_NOW);
+      recordParentFailure(sql, "notes", "done", undefined, TEST_NOW_MS);
+
+      strictEqual(getPendingParentsCount("tasks"), 4);
+      deepStrictEqual(getNextParentsForChild("tasks", "contacts", 10, []).sort(), ["failed", "partial", "unseen"]);
+      for (const id of ["unseen", "partial", "delayed", "failed"]) {
+        markParentBackfillComplete("tasks", id, "tasks", "contact_id", TEST_NOW);
+      }
+      strictEqual(getPendingParentsCount("tasks"), 0);
+    });
+  });
+
+  describe("appointment retention", () => {
+    it("retains appointments omitted by a successful windowed drain", () => {
+      db.prepare("INSERT INTO appointments(id, calendar_id, _synced_at) VALUES ('omitted', 'cal-1', '2020-01-01T00:00:00.000Z'), ('fresh', 'cal-1', ?), ('other', 'cal-2', '2020-01-01T00:00:00.000Z')").run(TEST_NOW);
+      db.prepare("INSERT INTO _sync_state(entity, row_count) VALUES ('appointments', 3)").run();
+      ensureParentDrainMarker("appointments", "cal-1", TEST_NOW);
+      const { pruned } = markParentBackfillComplete("appointments", "cal-1", "appointments", "calendar_id", TEST_NOW);
+      strictEqual(pruned, 0);
+      const rows = db.prepare("SELECT id FROM appointments ORDER BY id").all() as { id: string }[];
+      deepStrictEqual(rows.map((row) => row.id), ["fresh", "omitted", "other"]);
+      const cached = db.prepare("SELECT row_count FROM _sync_state WHERE entity = 'appointments'").get() as { row_count: number };
+      strictEqual(cached.row_count, 3);
+      strictEqual(getState("appointments", "cal-1")?.status, "complete");
+    });
+  });
+
   describe("getSweepParentsForChild — steady-state sweep selector", () => {
+    it("applies a strict completion cutoff but retains incomplete and failed work after the cutoff", () => {
+      db.prepare("INSERT INTO contacts(id) VALUES ('old'), ('equal'), ('new'), ('partial'), ('failed'), ('unseen'), ('delayed')").run();
+      markParentBackfillComplete("tasks", "old", "tasks", "contact_id", "2026-04-24T11:59:59.999Z");
+      markParentBackfillComplete("tasks", "equal", "tasks", "contact_id", TEST_NOW);
+      markParentBackfillComplete("tasks", "new", "tasks", "contact_id", "2026-04-24T12:00:01.000Z");
+      setParentSyncCursor("tasks", "partial", "page-2", "2026-04-24T12:00:01.000Z");
+      markParentBackfillComplete("tasks", "failed", "tasks", "contact_id", "2026-04-24T12:00:01.000Z");
+      db.prepare("UPDATE _parent_sync_state SET status = 'failed' WHERE parent_id = 'failed'").run();
+      recordParentFailure(sql, "tasks", "delayed", 86_400_000, TEST_NOW_MS);
+      const now = "2026-04-24T12:00:02.000Z";
+
+      deepStrictEqual(
+        getSweepParentsForChild("tasks", "contacts", 10, now, TEST_NOW).sort(),
+        ["failed", "old", "partial", "unseen"],
+      );
+      strictEqual(getPendingParentsCount("tasks"), 4, "delayed work remains unfinished even though it is not selectable");
+      deepStrictEqual(
+        getSweepParentsForChild("tasks", "contacts", 10, "2026-04-25T12:00:00.000Z", TEST_NOW).sort(),
+        ["delayed", "failed", "old", "partial", "unseen"],
+      );
+    });
+
+    it("never lets the cutoff bypass a retry deadline on an old completed parent", () => {
+      db.prepare("INSERT INTO contacts(id) VALUES ('c1')").run();
+      markParentBackfillComplete("tasks", "c1", "tasks", "contact_id", "2026-04-23T00:00:00.000Z");
+      const { retryDueAt } = recordParentFailure(sql, "tasks", "c1", undefined, TEST_NOW_MS);
+      db.prepare("UPDATE _parent_sync_state SET backfill_complete = 1 WHERE parent_id = 'c1'").run();
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 10, TEST_NOW, TEST_NOW), []);
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 10, retryDueAt, TEST_NOW), ["c1"]);
+    });
+
+    it("finishes a multi-invocation cycle and starts another with a new cutoff", () => {
+      db.prepare("INSERT INTO contacts(id) VALUES ('p1'), ('p2'), ('p3'), ('p4'), ('p5')").run();
+      for (const expected of [["p1", "p2"], ["p3", "p4"], ["p5"]]) {
+        const batch = getSweepParentsForChild("tasks", "contacts", 2, TEST_NOW, TEST_NOW);
+        deepStrictEqual(batch, expected);
+        for (const id of batch) {
+          markParentBackfillComplete("tasks", id, "tasks", "contact_id", TEST_NOW);
+        }
+      }
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 2, TEST_NOW, TEST_NOW), []);
+      strictEqual(getPendingParentsCount("tasks"), 0);
+      const nextCycle = "2026-04-24T12:00:01.000Z";
+      deepStrictEqual(getSweepParentsForChild("tasks", "contacts", 2, nextCycle, nextCycle), ["p1", "p2"]);
+    });
+
     it("returns all parents ordered by oldest last_sync_at, ignoring backfill_complete", () => {
       // Seed 3 parents in the surrogate "contacts" table.
       db.prepare(`INSERT INTO contacts(id, updated_at) VALUES ('A','2026-04-01'),('B','2026-04-01'),('C','2026-04-01')`).run();

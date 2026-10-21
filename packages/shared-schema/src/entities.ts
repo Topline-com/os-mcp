@@ -507,7 +507,7 @@ export const APPOINTMENTS: EntityManifest = {
     CREATED_AT,
     UPDATED_AT,
     RAW_PAYLOAD,
-    SYNCED_AT,
+    { ...SYNCED_AT, description: "ISO 8601 timestamp of the last material row write. Unchanged appointments retain this value; use topline_warehouse_freshness for completed sync freshness." },
   ],
   backfill: {
     // Per-parent fan-out over calendars. GET /calendars/events requires

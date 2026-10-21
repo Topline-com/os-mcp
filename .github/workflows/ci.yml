@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_ACCOUNT_ID: "9013139d3c5200efb4c73c5ecb36d8be"
+      WRANGLER_SEND_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Verify appointment writes in local workerd
+        run: node scripts/measure-sync-writes.mjs
+      - name: Bundle both Workers without deploying
+        run: |
+          npm run worker:deploy -w @topline-ai/edge -- --dry-run
+          npm run worker:deploy -w @topline-ai/sync -- --dry-run

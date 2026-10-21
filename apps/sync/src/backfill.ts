@@ -1,23 +1,9 @@
-// Backfill orchestrator — dispatches per entity-manifest incremental type:
-//
-//   updated_after → backfillStandardCursor  (contacts, opportunities,
-//                                             conversations, appointments)
-//   per_parent    → not yet (messages) — stubbed with clear error
-//   poll_full     → not yet (pipelines, pipeline_stages) — stubbed
-//
-// Appointments is additionally blocked because its manifest has
-// `pagination: "unknown"` — we haven't verified the CRM's list contract
-// yet. The dispatcher refuses to touch it.
-//
-// The sync worker holds no persistent state. Every call loads the
-// connection record from KV, decrypts the PIT, runs against the CRM.
-// Cursor progress is persisted in the LocationDO's `_sync_state`
-// table so retries and scheduled re-runs resume from the right
-// place.
+// Manifest-driven sync. Every public entry point claims a durable tenant lease;
+// data, cursor and reconciliation writes carry its fence through completion.
 
 import { type DecryptedConnection } from "@topline/shared-auth";
 import {
-  toplineFetch,
+  toplineFetch as upstreamFetch,
   credentialsContext,
   safeLog,
   ToplineApiError,
@@ -27,6 +13,14 @@ import { ENTITY_BY_TABLE, type EntityManifest } from "@topline/shared-schema";
 import type { LocationDO, UpsertResult, QueryResult, SyncState } from "@topline/shared-do";
 import { mapRow, getByPath } from "./mapping.js";
 import { loadAuthorizedSyncConnection } from "./connection-auth.js";
+import { coordinateSync, fencedStub, sweepDueCutoff, renewCurrentLease, type LeaseStore } from "./coordination.js";
+import { responseItems, validateSinglePage, mappedRows } from "./response-validation.js";
+import { nextCursorFrom } from "./cursor.js";
+
+async function toplineFetch<T>(path: string, options: ToplineFetchOptions): Promise<T> {
+  await renewCurrentLease();
+  return upstreamFetch<T>(path, { ...options, retryRateLimits: false });
+}
 
 /**
  * Minimal RPC surface of LocationDO that sync actually uses. Declaring it
@@ -35,7 +29,7 @@ import { loadAuthorizedSyncConnection } from "./connection-auth.js";
  * workers-types' generic projection collapses the method return types to
  * `never` in downstream consumers.
  */
-type LocationDOStub = {
+type LocationDOStub = Omit<LeaseStore, "getSyncState"> & {
   executeQuery(sql: string, params?: readonly unknown[], rowCap?: number): Promise<QueryResult>;
   upsertRows(
     table: string,
@@ -63,7 +57,11 @@ type LocationDOStub = {
     childEntity: string,
     parentTable: string,
     limit: number,
+    checkedBefore?: string,
   ): Promise<string[]>;
+  getPendingParentCount(entity: string, parentTable: string): Promise<number>;
+  recordParentFailure(entity: string, parentId: string, retryAfterMs?: number): Promise<void>;
+  reconcileAppointmentSnapshot(locationId: string, parentId: string, rows: ReadonlyArray<Record<string, unknown>>): Promise<UpsertResult & { unchanged: number; missing_retained: number }>;
   getParentSyncCursor(entity: string, parentId: string): Promise<string | null>;
   setParentSyncCursor(entity: string, parentId: string, cursor: string): Promise<void>;
   ensureParentDrainMarker(entity: string, parentId: string): Promise<string>;
@@ -80,7 +78,7 @@ function locationStub(
   ns: DurableObjectNamespace<LocationDO>,
   locationId: string,
 ): LocationDOStub {
-  return ns.get(ns.idFromName(locationId)) as unknown as LocationDOStub;
+  return fencedStub(ns.get(ns.idFromName(locationId)) as unknown as LocationDOStub, locationId);
 }
 
 export interface SyncEnv {
@@ -96,6 +94,11 @@ export interface BackfillResult {
   location_id: string;
   pages: number;
   rows_upserted: number;
+  /** Actual data/index writes from upsertRows and appointment snapshots; excludes pruning and bookkeeping. */
+  data_rows_written?: number;
+  unchanged_rows?: number;
+  missing_retained?: number;
+  pending_parents?: number;
   row_count_after: number;
   final_cursor: string | null;
   duration_ms: number;
@@ -104,7 +107,9 @@ export interface BackfillResult {
     | "cursor_stalled"
     | "page_cap_hit"
     | "error"
-    | "unsupported";
+    | "unsupported"
+    | "skipped";
+  skipped?: "not_complete" | "unsupported_mode" | "no_watermark_source" | "busy" | "not_due";
   error?: string;
   /**
    * Rows deleted by the end-of-drain snapshot-and-swap (i.e. rows that
@@ -129,20 +134,10 @@ export interface BackfillResult {
   failed_parents?: Array<{ parent_id: string; error: string }>;
 }
 
-// Upper bound on pages for a single invocation. Sync workers have a
-// ~30s CPU budget per request; 200 × 100 = 20k rows is well within
-// that. Large accounts resume on the next invocation.
-const MAX_PAGES_PER_INVOCATION = 200;
+// Leave room for lease renewals, parent state, derived writes and completion
+// under the upstream + DO subrequest budget. Large drains resume next tick.
+const MAX_PAGES_PER_INVOCATION = 100;
 const DEFAULT_PAGE_LIMIT = 100;
-
-// per_parent fan-out cap. Cloudflare Workers limit subrequests to 1000
-// per invocation (Paid tier) — conservatively budget for ~20 parents
-// per run. Each parent costs one CRM fetch + one DO upsert = 2
-// subrequests, plus per-page follow-ups. 20 × (say 3 pages + 3 upserts)
-// = ~120 subrequests leaves plenty of headroom. Re-declared as the
-// single source of truth in the per_parent backfill section below;
-// this legacy comment is retained so the rationale survives the
-// constant's move.
 
 // ---------------------------------------------------------------------------
 // Public: dispatcher
@@ -156,7 +151,7 @@ const DEFAULT_PAGE_LIMIT = 100;
  * and a descriptive error — they don't throw, so callers doing a
  * batch over many entities keep going.
  */
-export async function backfillEntity(
+async function backfillEntityUnleased(
   env: SyncEnv,
   connectionId: string,
   entityTable: string,
@@ -205,6 +200,68 @@ export async function backfillEntity(
   }
 }
 
+/** Both admin and cron entry points claim the same tenant-wide fenced lease. */
+async function runEntity(
+  env: SyncEnv,
+  connectionId: string,
+  entityTable: string,
+  mode: "backfill" | "incremental",
+): Promise<BackfillResult & { watermark_before?: string | null; watermark_after?: string | null }> {
+  const started = Date.now();
+  const entity = ENTITY_BY_TABLE.get(entityTable);
+  if (!entity) return unsupportedResult(started, entityTable, connectionId, "", "Unknown entity");
+  const connection = await loadAuthorizedSyncConnection(env, connectionId);
+  const stub = locationStub(env.LOCATION_DO, connection.location_id);
+  const result = await coordinateSync<BackfillResult | IncrementalResult>(stub, connection.location_id, entityTable, entity.incremental.poll_interval_minutes,
+    async () => {
+      if (mode === "backfill" && entity.incremental.type === "updated_after") {
+        const state = (await stub.getSyncState())[entityTable];
+        if (state?.backfill_complete) {
+          // Keep a partial incremental cursor paired with its original filter.
+          if (state.cursor || state.drain_started_at) return incrementalEntityUnleased(env, connectionId, entityTable);
+          // A new manual full drain must remain a full drain on the next cron.
+          await stub.resetBackfill(entityTable);
+        }
+      }
+      return mode === "backfill"
+        ? backfillEntityUnleased(env, connectionId, entityTable)
+        : incrementalEntityUnleased(env, connectionId, entityTable);
+    });
+  if (result.value) return {
+    ...result.value, final_cursor: "final_cursor" in result.value ? result.value.final_cursor : null,
+    data_rows_written: result.rows_written, unchanged_rows: result.unchanged_rows, missing_retained: result.missing_retained,
+  };
+  const state = (await stub.getSyncState())[entityTable];
+  return {
+    entity: entityTable, connection_id: connectionId, location_id: connection.location_id,
+    pages: 0, rows_upserted: 0, data_rows_written: 0, row_count_after: state?.row_count ?? 0,
+    final_cursor: null, duration_ms: Date.now() - started,
+    stopped_reason: "skipped", skipped: result.skipped,
+  };
+}
+
+export async function backfillEntity(env: SyncEnv, connectionId: string, entity: string): Promise<BackfillResult> {
+  return runEntity(env, connectionId, entity, "backfill");
+}
+
+export async function incrementalEntity(env: SyncEnv, connectionId: string, entity: string): Promise<IncrementalResult> {
+  const result = await runEntity(env, connectionId, entity, "incremental");
+  return { watermark_before: null, watermark_after: null, ...result,
+    stopped_reason: result.stopped_reason === "unsupported" ? "error" : result.stopped_reason };
+}
+
+/** Resetting a cursor is also a sync mutation and cannot race an active drain. */
+export async function clearEntityCursor(env: SyncEnv, connectionId: string, entity: string): Promise<boolean> {
+  if (!ENTITY_BY_TABLE.has(entity)) throw new Error("Unknown entity");
+  const connection = await loadAuthorizedSyncConnection(env, connectionId);
+  const stub = locationStub(env.LOCATION_DO, connection.location_id);
+  const result = await coordinateSync(stub, connection.location_id, entity, 0, async () => {
+    await stub.resetBackfill(entity);
+    return { stopped_reason: "skipped" };
+  }, true);
+  return !result.skipped;
+}
+
 // ---------------------------------------------------------------------------
 // Standard cursor backfill — GET or POST, cursor in query or body
 // ---------------------------------------------------------------------------
@@ -230,6 +287,7 @@ async function backfillStandardCursor(
   const priorCursor = priorState[entity.table]?.cursor ?? null;
   let cursorValue: unknown = priorCursor ? parseCursor(priorCursor) : null;
   let cursorSerialized: string | null = priorCursor;
+  const seenCursors = new Set<string>(priorCursor ? [priorCursor] : []);
 
   let pages = 0;
   let rowsUpserted = 0;
@@ -243,7 +301,7 @@ async function backfillStandardCursor(
   let errorMsg: string | undefined;
 
   // Drain marker: stamped on first page of a multi-tick drain and
-  // cleared when we reach empty_page/cursor_stalled. Rows that weren't
+  // cleared only when we reach a valid end-of-stream. Rows that weren't
   // re-observed during this drain get snapshot-and-swap-pruned at the
   // end. Survives across ticks via _sync_state.drain_started_at.
   let drainStartedAt: string | null = priorState[entity.table]?.drain_started_at ?? null;
@@ -261,16 +319,13 @@ async function backfillStandardCursor(
         // self-heal drift detection on subsequent runs.
         const upstreamTotal = extractUpstreamTotal(response);
         if (upstreamTotal !== null) {
-          try {
-            await stub.setUpstreamTotal(entity.table, upstreamTotal);
-          } catch {
-            // non-fatal
-          }
+          await stub.setUpstreamTotal(entity.table, upstreamTotal);
         }
 
         const itemsField = backfill.items_field ?? entity.table;
-        const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-        if (!Array.isArray(items) || items.length === 0) {
+        const items = responseItems(response, itemsField);
+        if (entity.backfill.pagination === "none") validateSinglePage(response, items.length);
+        if (items.length === 0) {
           stoppedReason = "empty_page";
           break;
         }
@@ -278,14 +333,10 @@ async function backfillStandardCursor(
         // First page of a fresh drain → stamp drain marker so the
         // end-of-drain prune can delete rows that disappeared upstream.
         if (pages === 0 && drainStartedAt === null) {
-          try {
-            drainStartedAt = await stub.startDrainIfUnset(entity.table);
-          } catch {
-            // non-fatal — no prune this drain; rows stay until next drain
-          }
+          drainStartedAt = await stub.startDrainIfUnset(entity.table);
         }
 
-        const rows = items.map((raw) => mapRow(entity, raw));
+        const rows = mappedRows(entity, items, connection.location_id);
         const result: UpsertResult = await stub.upsertRows(entity.table, rows);
         rowsUpserted += result.upserted;
         lastRowCount = result.row_count_after;
@@ -297,10 +348,11 @@ async function backfillStandardCursor(
           break;
         }
         const nextSerialized = serializeCursor(nextCursor);
-        if (nextSerialized === cursorSerialized) {
+        if (seenCursors.has(nextSerialized)) {
           stoppedReason = "cursor_stalled";
           break;
         }
+        seenCursors.add(nextSerialized);
         cursorValue = nextCursor;
         cursorSerialized = nextSerialized;
         await stub.setSyncCursor(entity.table, nextSerialized);
@@ -311,42 +363,21 @@ async function backfillStandardCursor(
     });
   } catch (err) {
     stoppedReason = "error";
-    errorMsg = err instanceof ToplineApiError
-      ? `CRM : ${err.message}`
-      : err instanceof Error
-      ? err.message
-      : String(err);
+    errorMsg = err instanceof ToplineApiError ? `Upstream request failed (${err.statusCode})` : "Sync failed; progress retained for retry.";
   }
 
-  // Post-run bookkeeping: if we walked to end-of-stream (empty_page OR
-  // cursor_stalled), we've seen every row upstream. Prune any that
-  // didn't get touched in this drain (deleted upstream), then capture
-  // the max cursor_column value as the watermark and flip
-  // backfill_complete so incremental polling can start. cursor_stalled
-  // is a legitimate EOF signal when the CRM echoes the last-row-id back on
-  // the final page.
-  if (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled") {
+  // Only verified end-of-stream completes a drain. A stalled cursor retains
+  // the drain and its rows for recovery; it must never authorize pruning.
+  if (stoppedReason === "empty_page") {
     if (drainStartedAt !== null) {
-      try {
-        prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
-        if (prunedStale > 0) {
-          console.log(
-            `[backfill:${entity.table}] pruned ${prunedStale} stale rows (deleted upstream)`,
-          );
-          lastRowCount = Math.max(0, lastRowCount - prunedStale);
-        }
-      } catch {
-        // non-fatal
+      prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
+      if (prunedStale > 0) {
+        console.log(`[backfill:${entity.table}] pruned ${prunedStale} stale rows (deleted upstream)`);
+        lastRowCount = Math.max(0, lastRowCount - prunedStale);
       }
     }
-    try {
-      await stub.clearDrainMarker(entity.table);
-    } catch {
-      // non-fatal
-    }
-    if (entity.incremental.cursor_column) {
-      await setWatermarkAndComplete(stub, entity);
-    }
+    await setWatermarkAndComplete(stub, entity);
+    await stub.clearDrainMarker(entity.table);
   }
 
   return {
@@ -377,37 +408,15 @@ async function backfillStandardCursor(
  * Skipped cursor_column → skip the watermark step but still clear
  * cursor + mark complete.
  */
-async function setWatermarkAndComplete(
-  stub: LocationDOStub,
-  entity: EntityManifest,
-): Promise<void> {
-  try {
-    await stub.clearSyncCursor(entity.table);
-  } catch {
-    // Non-fatal — worst case, a future resume reads a stale cursor
-    // and the CRM returns an empty page. We'd rather proceed than throw.
+async function setWatermarkAndComplete(stub: LocationDOStub, entity: EntityManifest): Promise<void> {
+  if (entity.incremental.cursor_column) {
+    const result = await stub.executeQuery(`SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`);
+    if (result.truncated) throw new Error("Watermark query truncated");
+    const watermark = result.rows[0]?.w;
+    if (watermark != null && String(watermark)) await stub.setSyncWatermark(entity.table, String(watermark));
   }
-
-  const col = entity.incremental.cursor_column;
-  if (col) {
-    try {
-      const result = await stub.executeQuery(
-        `SELECT MAX(${col}) AS w FROM ${entity.table}`,
-      );
-      const row = result.rows[0] as { w: string | null } | undefined;
-      if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
-        await stub.setSyncWatermark(entity.table, String(row.w));
-      }
-    } catch {
-      // Non-fatal — watermark will be retried on the next empty_page.
-    }
-  }
-
-  try {
-    await stub.markBackfillComplete(entity.table);
-  } catch {
-    // Non-fatal
-  }
+  await stub.clearSyncCursor(entity.table);
+  await stub.markBackfillComplete(entity.table);
 }
 
 /**
@@ -724,8 +733,8 @@ function parentFreshnessColumns(parent: EntityManifest): readonly string[] {
 //                         (from `meta` or from the last item of items[]).
 //                         Returns a map of { request_param → value } that
 //                         buildRequest will inject into the next request,
-//                         or null if any required field is missing (treat
-//                         as end-of-stream).
+//                         or null at a valid terminal page. Incomplete
+//                         cursor metadata throws and retains progress.
 //
 //   applyCursor        — inject that map into the outbound query / body,
 //                         respecting each field's encoding (scalar string
@@ -736,61 +745,6 @@ function parentFreshnessColumns(parent: EntityManifest): readonly string[] {
 // cursor_response_field) bypass these helpers and use the simpler scalar
 // code path in each loop.
 // ---------------------------------------------------------------------------
-
-function extractNextCursor(
-  response: unknown,
-  items: ReadonlyArray<Record<string, unknown>>,
-  cfg: NonNullable<EntityManifest["backfill"]["cursor"]>,
-): Record<string, unknown> | null {
-  let source: unknown;
-  if (cfg.source === "meta") {
-    source = (response as { meta?: unknown } | null | undefined)?.meta;
-  } else {
-    source = items[items.length - 1];
-  }
-  if (source === null || source === undefined || typeof source !== "object") {
-    return null;
-  }
-  const next: Record<string, unknown> = {};
-  for (const f of cfg.fields) {
-    const v = getByPath(source, f.response_path);
-    if (v === null || v === undefined) {
-      // Incomplete cursor → treat as end-of-stream. the CRM leaves the
-      // trailing cursor field off on the last page.
-      return null;
-    }
-    next[f.request_param] = v;
-  }
-  return next;
-}
-
-/**
- * Resolve the next cursor value for any of the 3 backfill-loop call
- * sites, dispatching on manifest shape:
- *
- *   backfill.cursor (structured, multi-field) → extractNextCursor
- *   backfill.cursor_response_field (legacy scalar) → getByPath
- *   neither                                         → null (single-page)
- *
- * Returned value is shaped for the cursor storage + `cursorValue`
- * threading each loop already uses — a compound cursor comes back as
- * a Record<string, unknown>, a legacy scalar comes back as the raw
- * value. Both round-trip through serializeCursor / parseCursor cleanly.
- */
-function nextCursorFrom(
-  response: unknown,
-  items: ReadonlyArray<Record<string, unknown>>,
-  backfill: EntityManifest["backfill"],
-): unknown | null {
-  if (backfill.cursor) {
-    return extractNextCursor(response, items, backfill.cursor);
-  }
-  if (backfill.cursor_response_field) {
-    const v = getByPath(response, backfill.cursor_response_field);
-    return v === undefined ? null : v;
-  }
-  return null;
-}
 
 function applyCursor(
   query: Record<string, string | number | boolean | undefined>,
@@ -841,37 +795,8 @@ function unsupportedResult(
 }
 
 // ---------------------------------------------------------------------------
-// per_parent — messages, call_events (derived), tasks, notes, and any
-// future entity whose upstream shape is "one endpoint per parent id".
-//
-// Progress lives in _parent_sync_state (entity, parent_id) — one row
-// per parent, not one row per entity. Each parent tracks its own
-// cursor + backfill_complete flag. That means:
-//
-//   - Mid-parent subrequest-cap errors don't lose progress; the next
-//     invocation resumes the same parent from the persisted cursor.
-//   - A re-activated parent (conversation with a new message, contact
-//     with a new task) gets revisited automatically because the
-//     `getNextParentsForChild` RPC prioritizes parents whose freshness
-//     column has advanced past last_sync_at.
-//   - Empty parents flip complete on their first pass instead of being
-//     re-probed forever.
-//
-// Supports two endpoint shapes via the manifest:
-//   (a) path template: endpoint "/contacts/{parent}/tasks"
-//   (b) query param:   endpoint "/forms/submissions",
-//                      per_parent.request_param "formId"
-//
-// Dual-write: when entity.table === "messages" we also extract
-// call-event rows via callEventFromMessage and upsert them into
-// call_events in the same cycle. This keeps the typed call_events
-// table always consistent with its source messages.
-// ---------------------------------------------------------------------------
-
-// Paid-plan-friendly sizing. Each parent typically costs 1–3 CRM
-// subrequests + 1 DO upsert RPC, so 200 parents × ~4 calls = ~800
-// under the 1000-subrequest Cloudflare cap.
-const MAX_PARENTS_PER_INVOCATION = 200;
+// per_parent — durable retry state and finite checked-parent sweeps.
+const MAX_PARENTS_PER_INVOCATION = 100;
 
 async function backfillPerParent(
   env: SyncEnv,
@@ -881,365 +806,125 @@ async function backfillPerParent(
   connectionId: string,
 ): Promise<BackfillResult> {
   const { backfill } = entity;
-  if (!backfill.per_parent) {
-    return unsupportedResult(
-      started,
-      entity.table,
-      connectionId,
-      connection.location_id,
-      `per_parent entity ${entity.table} has no per_parent descriptor.`,
-    );
+  const fanout = backfill.per_parent;
+  const parent = fanout && ENTITY_BY_TABLE.get(fanout.parent_entity);
+  if (!fanout || !parent) return unsupportedResult(started, entity.table, connectionId, connection.location_id, "Missing parent descriptor");
+  if (backfill.pagination === "cursor" && (!backfill.cursor_request_param || !backfill.cursor_response_field)) {
+    return unsupportedResult(started, entity.table, connectionId, connection.location_id, "Missing parent cursor descriptor");
   }
-  // Cursor metadata is only required for paginated children. Tasks /
-  // notes use pagination: "none" (one page per parent is all CRM
-  // gives you), so those don't need cursor_request_param.
-  if (
-    backfill.pagination === "cursor" &&
-    (!backfill.cursor_request_param || !backfill.cursor_response_field)
-  ) {
-    return unsupportedResult(
-      started,
-      entity.table,
-      connectionId,
-      connection.location_id,
-      `per_parent entity ${entity.table} with pagination=cursor is missing cursor metadata.`,
-    );
+  const usesPathTemplate = backfill.endpoint.includes("{parent}");
+  if (!usesPathTemplate && !fanout.request_param) {
+    return unsupportedResult(started, entity.table, connectionId, connection.location_id, "Missing parent request parameter");
   }
-
-  const parentEntity = ENTITY_BY_TABLE.get(backfill.per_parent.parent_entity);
-  if (!parentEntity) {
-    return unsupportedResult(
-      started,
-      entity.table,
-      connectionId,
-      connection.location_id,
-      `per_parent entity ${entity.table} references unknown parent ${backfill.per_parent.parent_entity}.`,
-    );
-  }
-
-  const endpointTemplate = backfill.endpoint;
-  const usesPathTemplate = endpointTemplate.includes("{parent}");
-  if (!usesPathTemplate && !backfill.per_parent.request_param) {
-    return unsupportedResult(
-      started,
-      entity.table,
-      connectionId,
-      connection.location_id,
-      `per_parent endpoint ${endpointTemplate} must contain {parent} or set per_parent.request_param.`,
-    );
-  }
-
   const stub = locationStub(env.LOCATION_DO, connection.location_id);
-  const fkColumn = backfill.per_parent.parent_fk_column;
-
-  // Pull the next batch of parents to process.
-  //
-  // Two selectors:
-  //
-  //   (A) Activity-driven [default]: prioritize incomplete parents,
-  //       then parents whose freshness column advanced since
-  //       last_sync_at. Efficient for entities whose parent table
-  //       genuinely tracks child mutations (messages →
-  //       conversations.last_message_date).
-  //
-  //   (B) Sweep [per_parent.steady_state_sweep=true]: once the
-  //       initial drain is done, rotate through every parent oldest-
-  //       sync-first regardless of freshness. Needed when the parent
-  //       freshness signal doesn't correlate with child mutations
-  //       (appointments → calendars.updated_at is orthogonal to new
-  //       bookings). Cost: O(parents) the CRM calls per tick.
-  //
-  // Before the entity-level backfill completes, mode (A) applies
-  // regardless — sweep only kicks in for the post-drain steady state.
-  const priorState = await stub.getSyncState();
-  const priorStateRow = priorState[entity.table];
-  const doneInitialDrain = priorStateRow?.backfill_complete === true;
-  const sweepMode =
-    doneInitialDrain && backfill.per_parent.steady_state_sweep === true;
-
-  const parentIds = sweepMode
-    ? await stub.getSweepParentsForChild(
-        entity.table,
-        parentEntity.table,
-        MAX_PARENTS_PER_INVOCATION,
-      )
-    : await stub.getNextParentsForChild(
-        entity.table,
-        parentEntity.table,
-        MAX_PARENTS_PER_INVOCATION,
-        parentFreshnessColumns(parentEntity),
-      );
-
-  if (parentIds.length === 0) {
-    // No remaining parents needing work this tick. Flip the entity-
-    // level backfill_complete so the cron's freshness signals know
-    // every parent has been visited at least once.
-    try {
-      await stub.markBackfillComplete(entity.table);
-    } catch {
-      // non-fatal
-    }
-    return {
-      entity: entity.table,
-      connection_id: connectionId,
-      location_id: connection.location_id,
-      pages: 0,
-      rows_upserted: 0,
-      row_count_after: 0,
-      final_cursor: null,
-      duration_ms: Date.now() - started,
-      stopped_reason: "empty_page",
-    };
-  }
-
-  let totalPages = 0;
+  const prior = (await stub.getSyncState())[entity.table];
+  // A durable cycle boundary lets a sweep larger than the invocation budget
+  // resume without revisiting already checked parents or starting its interval.
+  const cycleStart = await stub.startDrainIfUnset(entity.table);
+  const sweep = fanout.steady_state_sweep === true;
+  // A delayed failure keeps cycleStart alive, but must not freeze parents
+  // already checked in an earlier cadence bucket. Oldest-first selection
+  // still prioritizes never-checked parents when a sweep spans invocations.
+  const dueCutoff = sweepDueCutoff(cycleStart, entity.incremental.poll_interval_minutes);
+  const select = (limit: number, cutoff = dueCutoff) => sweep
+    ? stub.getSweepParentsForChild(entity.table, parent.table, limit, cutoff)
+    : stub.getNextParentsForChild(entity.table, parent.table, limit, parentFreshnessColumns(parent));
+  const parentIds = await select(MAX_PARENTS_PER_INVOCATION);
+  let pages = 0;
   let rowsUpserted = 0;
-  let callEventsUpserted = 0; // diagnostic only; logged on completion
-  let childrenPruned = 0; // deleted-upstream children caught by per-parent snapshot-and-swap
-  let lastRowCount = 0;
-  let stoppedReason = "empty_page" as BackfillResult["stopped_reason"];
-  let errorMsg: string | undefined;
-  let parentsAttempted = 0;
-  let parentsSucceeded = 0;
-  const failedParents: Array<{ parent_id: string; error: string }> = [];
+  let pruned = 0;
+  let rowCount = prior?.row_count ?? 0;
+  let stop: BackfillResult["stopped_reason"] = "empty_page";
+  const failedParents: NonNullable<BackfillResult["failed_parents"]> = [];
 
-  try {
-    await runInContext(connection, async () => {
-      parentLoop: for (const parentId of parentIds) {
-        parentsAttempted += 1;
-        // Per-parent try/catch: a single bad calendar (or contact, or
-        // conversation) used to throw out of runInContext and halt the
-        // entire tick. Now we isolate the failure, record it on
-        // failedParents, and keep walking the remaining parents.
-        // stopped_reason still flips to "error" — but only when *every*
-        // attempted parent failed; partial success keeps the original
-        // reason so cron freshness signals don't regress.
-        try {
-        const priorParentCursor = await stub.getParentSyncCursor(entity.table, parentId);
-        let cursorValue: unknown = priorParentCursor
-          ? parseCursor(priorParentCursor)
-          : null;
-        let cursorSerialized: string | null = priorParentCursor;
-        let pagesForParent = 0;
-        let parentCompleted = false;
-        // Stamp the per-parent drain marker. For parents resumed from
-        // a prior tick (priorParentCursor present) drain_started_at is
-        // already set and COALESCE preserves it. For fresh parents
-        // this sets it to now(). Needed so markParentBackfillComplete
-        // below can snapshot-and-swap-prune children deleted upstream.
-        if (priorParentCursor === null) {
-          try {
-            await stub.ensureParentDrainMarker(entity.table, parentId);
-          } catch {
-            // non-fatal — missing marker means no prune this drain;
-            // data is still correct, just carries stale deletions
-          }
-        }
-
-        while (pagesForParent < MAX_PAGES_PER_INVOCATION) {
-          if (totalPages >= MAX_PAGES_PER_INVOCATION) {
-            stoppedReason = "page_cap_hit";
-            break parentLoop;
-          }
-
-          const query: Record<string, string | number | boolean | undefined> = {};
-          // Only set `limit` on cursor-paginated endpoints. Some
-          // single-page per-parent endpoints (/contacts/{id}/notes)
-          // 422 on any `limit` param at all.
-          if (backfill.pagination === "cursor") {
-            query.limit = DEFAULT_PAGE_LIMIT;
-          }
-          // locationId injection for query-param fan-out endpoints.
-          // Two shapes of per-parent endpoints:
-          //   (a) path template: /conversations/{parent}/messages,
-          //       /contacts/{parent}/tasks — tenancy is implicit in
-          //       the parent id; passing locationId is a no-op at
-          //       best and a 422 at worst (notes rejected `limit`).
-          //   (b) query fan-out: /calendars/events?calendarId=X —
-          //       tenancy is NOT in the path, so locationId must be
-          //       supplied as a query param (or the endpoint 401s).
-          // Inject only on shape (b), inferred from !usesPathTemplate.
+  await runInContext(connection, async () => {
+    for (const parentId of parentIds) {
+      if (pages >= MAX_PAGES_PER_INVOCATION) { stop = "page_cap_hit"; break; }
+      try {
+        const priorCursor = backfill.pagination === "cursor" ? await stub.getParentSyncCursor(entity.table, parentId) : null;
+        let cursor: unknown = priorCursor ? parseCursor(priorCursor) : null;
+        const seenCursors = new Set<string>(priorCursor ? [priorCursor] : []);
+        if (entity.table !== "appointments") await stub.ensureParentDrainMarker(entity.table, parentId);
+        let complete = false;
+        while (pages < MAX_PAGES_PER_INVOCATION) {
+          const query: NonNullable<ToplineFetchOptions["query"]> = { ...backfill.query_extras };
+          if (backfill.pagination === "cursor") query.limit = DEFAULT_PAGE_LIMIT;
           if (!usesPathTemplate && !backfill.endpoint.includes("{locationId}")) {
-            const locParamName = backfill.location_param_name ?? "locationId";
-            query[locParamName] = connection.location_id;
+            query[backfill.location_param_name ?? "locationId"] = connection.location_id;
           }
-          if (backfill.query_extras) {
-            for (const [k, v] of Object.entries(backfill.query_extras)) {
-              query[k] = v;
-            }
-          }
-          if (
-            backfill.cursor_request_param &&
-            cursorValue !== null &&
-            cursorValue !== undefined
-          ) {
-            query[backfill.cursor_request_param] = String(cursorValue);
-          }
-          if (backfill.per_parent!.request_param) {
-            query[backfill.per_parent!.request_param!] = parentId;
-          }
-          const endpoint = resolveEndpoint(
-            usesPathTemplate ? endpointTemplate.replace("{parent}", parentId) : endpointTemplate,
-            connection.location_id,
-          );
-
-          const response = await toplineFetch<Record<string, unknown>>(endpoint, {
-            method: backfill.method,
-            query,
-          });
-
-          const itemsField = backfill.items_field ?? entity.table;
-          const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-          if (!Array.isArray(items) || items.length === 0) {
-            parentCompleted = true;
+          if (cursor != null && backfill.cursor_request_param) query[backfill.cursor_request_param] = String(cursor);
+          if (fanout.request_param) query[fanout.request_param] = parentId;
+          const endpoint = resolveEndpoint(backfill.endpoint.replace("{parent}", encodeURIComponent(parentId)), connection.location_id);
+          const response = await toplineFetch<Record<string, unknown>>(endpoint, { method: backfill.method, query });
+          const items = responseItems(response, backfill.items_field ?? entity.table);
+          if (backfill.pagination === "none") validateSinglePage(response, items.length);
+          const rows = mappedRows(entity, items, connection.location_id, { column: fanout.parent_fk_column, id: parentId });
+          pages += 1;
+          if (entity.table === "appointments") {
+            // List omission is not proof of deletion. This atomic RPC retains
+            // missing history and leaves identical appointment rows untouched.
+            const result = await stub.reconcileAppointmentSnapshot(connection.location_id, parentId, rows);
+            rowsUpserted += result.upserted;
+            rowCount = result.row_count_after;
+            complete = true;
             break;
           }
-
-          const rows = items.map((raw) => {
-            const row = mapRow(entity, raw);
-            if (row[fkColumn] === null || row[fkColumn] === undefined) {
-              row[fkColumn] = parentId;
-            }
-            if (row.location_id === null || row.location_id === undefined) {
-              row.location_id = connection.location_id;
-            }
-            return row;
-          });
-          const result: UpsertResult = await stub.upsertRows(entity.table, rows);
-          rowsUpserted += result.upserted;
-          lastRowCount = result.row_count_after;
-
-          // Dual-write call_events from messages. Each TYPE_CALL /
-          // TYPE_IVR_CALL / TYPE_CUSTOM_CALL / TYPE_CAMPAIGN_CALL
-          // message becomes a call_events row with duration + status
-          // + voicemail/missed flags normalized across the CRM's varied
-          // shapes.
-          if (entity.table === "messages") {
-            const callRows: Record<string, unknown>[] = [];
-            for (const raw of items) {
-              const ce = callEventFromMessage(raw, connection.location_id, parentId);
-              if (ce) callRows.push(ce);
-            }
-            if (callRows.length > 0) {
-              const ceResult = await stub.upsertRows("call_events", callRows);
-              callEventsUpserted += ceResult.upserted;
+          if (rows.length) {
+            const result = await stub.upsertRows(entity.table, rows);
+            rowsUpserted += result.upserted;
+            rowCount = result.row_count_after;
+            if (entity.table === "messages") {
+              const calls = items.map((raw) => callEventFromMessage(raw, connection.location_id, parentId)).filter((row): row is Record<string, unknown> => row !== null);
+              if (calls.length) await stub.upsertRows("call_events", calls);
             }
           }
-
-          totalPages += 1;
-          pagesForParent += 1;
-
-          // Non-cursor pagination (tasks, notes): first page is all we
-          // get. Mark parent complete.
-          if (backfill.pagination !== "cursor") {
-            parentCompleted = true;
-            break;
-          }
-          const nextCursor = getByPath(response, backfill.cursor_response_field!);
-          if (nextCursor === null || nextCursor === undefined) {
-            parentCompleted = true;
-            break;
-          }
-          const nextSerialized = serializeCursor(nextCursor);
-          if (nextSerialized === cursorSerialized) {
-            parentCompleted = true;
-            break;
-          }
-          cursorValue = nextCursor;
-          cursorSerialized = nextSerialized;
-          // Persist mid-parent cursor so a subrequest-cap failure on
-          // the next page can resume from here.
-          await stub.setParentSyncCursor(entity.table, parentId, nextSerialized);
+          if (!items.length || backfill.pagination !== "cursor") { complete = true; break; }
+          const next = nextCursorFrom(response, items, backfill);
+          if (next == null) { complete = true; break; }
+          const serialized = serializeCursor(next);
+          if (seenCursors.has(serialized)) throw new Error("Upstream cursor stalled");
+          seenCursors.add(serialized);
+          cursor = next;
+          await stub.setParentSyncCursor(entity.table, parentId, serialized);
         }
-
-        if (parentCompleted) {
-          // Derived tables that also need a parent-scoped prune.
-          // Messages dual-writes call_events keyed by conversation_id,
-          // so when a message gets deleted upstream its call_event
-          // should go too — otherwise callback metrics stay wrong.
-          const derivedTables =
-            entity.table === "messages"
-              ? [{ table: "call_events", fk: "conversation_id" }]
-              : [];
-          const pruned = await stub.markParentBackfillComplete(
-            entity.table,
-            parentId,
-            entity.table,
-            fkColumn,
-            derivedTables,
-          );
-          childrenPruned += pruned;
+        if (complete && entity.table !== "appointments") {
+          pruned += await stub.markParentBackfillComplete(entity.table, parentId, entity.table, fanout.parent_fk_column,
+            entity.table === "messages" ? [{ table: "call_events", fk: "conversation_id" }] : []);
         }
-        parentsSucceeded += 1;
-        } catch (parentErr) {
-          const parentMsg = parentErr instanceof ToplineApiError
-            ? `CRM ${parentErr.statusCode}: ${parentErr.message}`
-            : parentErr instanceof Error
-            ? parentErr.message
-            : String(parentErr);
-          failedParents.push({ parent_id: parentId, error: parentMsg });
-          // Continue to the next parent — partial progress beats halting
-          // the whole tick on the first bad calendar / conversation.
-        }
+        if (!complete) { stop = "page_cap_hit"; break; }
+      } catch (error) {
+        // Invalid credentials belong to this connection, not to shared parent
+        // state. Stop immediately so another authorized connection can retry.
+        if (error instanceof ToplineApiError && error.statusCode === 401) throw error;
+        // Store only retry metadata. Payloads, credentials and upstream error
+        // bodies never enter logs or durable state. A 403 can be parent scoped;
+        // it follows the same bounded backoff as other parent request failures.
+        await stub.recordParentFailure(entity.table, parentId, error instanceof ToplineApiError ? error.retryAfterMs : undefined);
+        failedParents.push({ parent_id: parentId, error: error instanceof ToplineApiError ? `Upstream request failed (${error.statusCode})` : "Parent sync failed; retained for retry." });
       }
-    });
-  } catch (err) {
-    // Catastrophic failure outside any parent's try/catch (e.g. the
-    // runInContext setup itself blew up). Preserve the legacy behavior.
-    stoppedReason = "error";
-    errorMsg = err instanceof ToplineApiError
-      ? `CRM : ${err.message}`
-      : err instanceof Error
-      ? err.message
-      : String(err);
-  }
+    }
+  });
 
-  // If every attempted parent failed and none succeeded, surface that
-  // as stopped_reason="error" so cron treats this tick as a failure.
-  // Partial success leaves the reason intact (empty_page / page_cap_hit)
-  // so freshness signals still advance for the parents that worked.
-  if (
-    stoppedReason !== "error" &&
-    stoppedReason !== "page_cap_hit" &&
-    parentsAttempted > 0 &&
-    parentsSucceeded === 0 &&
-    failedParents.length > 0
-  ) {
-    stoppedReason = "error";
-    errorMsg = `all ${failedParents.length} attempted parents failed; first: ${failedParents[0]!.error}`;
+  const pending = await stub.getPendingParentCount(entity.table, parent.table);
+  // Completion is about the original cycle, independently of additional
+  // healthy-parent refreshes that became due while a retry was delayed.
+  const remaining = (await select(1, cycleStart)).length;
+  if (failedParents.length) stop = "error";
+  else if (pending || remaining) stop = "page_cap_hit";
+  else {
+    stop = "empty_page";
+    await stub.markBackfillComplete(entity.table);
+    await stub.clearDrainMarker(entity.table);
   }
-
-  if (callEventsUpserted > 0) {
-    console.log(
-      `[per_parent:${entity.table}] dual-wrote ${callEventsUpserted} call_events rows`,
-    );
-  }
-  if (childrenPruned > 0) {
-    console.log(
-      `[per_parent:${entity.table}] snapshot-and-swap pruned ${childrenPruned} stale children (deleted upstream)`,
-    );
-  }
-  if (failedParents.length > 0) {
-    // Full diagnostics remain in the admin-gated response. Logs keep only
-    // aggregate counts so parent IDs and upstream response data stay private.
-    safeLog("warn", "per_parent_sync_failures", {
-      failed_parent_count: failedParents.length,
-      parents_attempted: parentsAttempted,
-    });
-  }
-
+  rowCount = (await stub.getSyncState())[entity.table]?.row_count ?? rowCount;
+  if (failedParents.length) safeLog("warn", "per_parent_sync_failures", { failed_parent_count: failedParents.length, parents_attempted: parentIds.length });
   return {
-    entity: entity.table,
-    connection_id: connectionId,
-    location_id: connection.location_id,
-    pages: totalPages,
-    rows_upserted: rowsUpserted,
-    row_count_after: lastRowCount,
-    final_cursor: null,
-    duration_ms: Date.now() - started,
-    stopped_reason: stoppedReason,
-    ...(errorMsg ? { error: errorMsg } : {}),
-    ...(failedParents.length > 0 ? { failed_parents: failedParents } : {}),
+    entity: entity.table, connection_id: connectionId, location_id: connection.location_id,
+    pages, rows_upserted: rowsUpserted, row_count_after: rowCount,
+    final_cursor: null, duration_ms: Date.now() - started, stopped_reason: stop,
+    pending_parents: pending,
+    ...(pruned ? { pruned_stale_rows: pruned } : {}),
+    ...(failedParents.length ? { failed_parents: failedParents, error: "Parent retries pending." } : {}),
   };
 }
 
@@ -1297,6 +982,7 @@ async function backfillPollFull(
   const DRIFT_THRESHOLD = 0.9; // row_count < 90% of upstream → reassume broken
   const priorState = await stub.getSyncState();
   const priorStateRow = priorState[entity.table];
+  rowCountAfter = priorStateRow?.row_count ?? 0;
   let isFresh = !priorStateRow?.backfill_complete;
 
   // Self-heal: detect a stale `backfill_complete=1` alongside data that's
@@ -1312,16 +998,12 @@ async function backfillPollFull(
         `< ${DRIFT_THRESHOLD * 100}% of upstream_total=${priorStateRow.upstream_total}; ` +
         `resetting backfill_complete`,
     );
-    try {
-      await stub.resetBackfill(entity.table);
-    } catch {
-      // non-fatal — if the reset fails we'll stay in steady-state but
-      // correctness is eventually consistent once upstream_total re-compares
-    }
+    await stub.resetBackfill(entity.table);
+    priorStateRow.cursor = null;
     isFresh = true;
   }
 
-  const resumeCursor = isFresh && priorStateRow?.cursor ? parseCursor(priorStateRow.cursor) : null;
+  const resumeCursor = priorStateRow?.cursor ? parseCursor(priorStateRow.cursor) : null;
   const maxPagesThisRun = isFresh
     ? MAX_PAGES_PER_INVOCATION
     : backfill.pagination === "cursor"
@@ -1331,8 +1013,8 @@ async function backfillPollFull(
   // Steady-state watermark: lets the page loop stop the moment it's
   // caught up to what we already have. Resolved once per invocation so
   // concurrent upserts during the drain don't move the goalpost.
-  let steadyWatermark: string | null = null;
-  if (!isFresh && entity.incremental.cursor_column && backfill.pagination === "cursor") {
+  let steadyWatermark: string | null = priorStateRow?.watermark ?? null;
+  if (!isFresh && steadyWatermark === null && entity.incremental.cursor_column && backfill.pagination === "cursor") {
     try {
       const wm = await stub.executeQuery(
         `SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`,
@@ -1343,18 +1025,18 @@ async function backfillPollFull(
     } catch {
       steadyWatermark = null;
     }
+    if (steadyWatermark !== null) await stub.setSyncWatermark(entity.table, steadyWatermark);
   }
 
   // Stamp a drain marker on the first page of a fresh drain. The return
   // value survives across multi-tick drains so snapshot-and-swap at the
   // end knows exactly which rows were refreshed during THIS drain.
-  let drainStartedAt: string | null =
-    isFresh ? priorStateRow?.drain_started_at ?? null : null;
-
+  const drainStartedAt = await stub.startDrainIfUnset(entity.table);
   try {
     await runInContext(connection, async () => {
       let cursorValue: unknown = resumeCursor;
       let cursorSerialized: string | null = resumeCursor ? serializeCursor(resumeCursor) : null;
+      const seenCursors = new Set<string>(cursorSerialized ? [cursorSerialized] : []);
       let caughtUpToWatermark = false;
 
       while (pagesProcessed < maxPagesThisRun) {
@@ -1369,11 +1051,7 @@ async function backfillPollFull(
         // something to compare against.
         const upstreamTotal = extractUpstreamTotal(response);
         if (upstreamTotal !== null) {
-          try {
-            await stub.setUpstreamTotal(entity.table, upstreamTotal);
-          } catch {
-            // non-fatal
-          }
+          await stub.setUpstreamTotal(entity.table, upstreamTotal);
         }
 
         // Primary table: resolve items_field (or default to entity.table).
@@ -1381,21 +1059,11 @@ async function backfillPollFull(
         // items are denormalized from pipelines[].stages[] (see below).
         const itemsField =
           entity.table === "pipeline_stages" ? "pipelines" : backfill.items_field ?? entity.table;
-        const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-        if (!Array.isArray(items) || items.length === 0) {
+        const items = responseItems(response, itemsField);
+        if (entity.backfill.pagination === "none") validateSinglePage(response, items.length);
+        if (items.length === 0) {
           stoppedReason = "empty_page";
           break;
-        }
-
-        // First page of a fresh drain → stamp the drain marker so
-        // snapshot-and-swap at the end can identify stale rows.
-        if (isFresh && pagesProcessed === 0 && drainStartedAt === null) {
-          try {
-            drainStartedAt = await stub.startDrainIfUnset(entity.table);
-          } catch {
-            // non-fatal — missing marker means we can't prune, but the
-            // drain itself still completes correctly
-          }
         }
 
         if (entity.table === "pipeline_stages") {
@@ -1403,7 +1071,7 @@ async function backfillPollFull(
           const stageRows: Array<Record<string, unknown>> = [];
           for (const pipeline of items) {
             const pipelineId = pipeline.id;
-            const stages = (pipeline.stages ?? []) as Array<Record<string, unknown>>;
+            const stages = responseItems(pipeline, "stages");
             for (const stage of stages) {
               const row = mapRow(entity, stage);
               if (row.pipeline_id === null || row.pipeline_id === undefined) {
@@ -1422,13 +1090,7 @@ async function backfillPollFull(
             denormalizedStageRows += stageRows.length;
           }
         } else {
-          const rows = items.map((raw) => {
-            const row = mapRow(entity, raw);
-            if (row.location_id === null || row.location_id === undefined) {
-              row.location_id = connection.location_id;
-            }
-            return row;
-          });
+          const rows = mappedRows(entity, items, connection.location_id);
           const result = await stub.upsertRows(entity.table, rows);
           rowsUpserted += result.upserted;
           rowCountAfter = result.row_count_after;
@@ -1474,73 +1136,36 @@ async function backfillPollFull(
           break;
         }
         const nextSerialized = serializeCursor(nextCursor);
-        if (nextSerialized === cursorSerialized) {
-          // the CRM echoed the same cursor back — common on the last page
-          // (returns final row's id as startAfterId). Treat as done.
+        if (seenCursors.has(nextSerialized)) {
+          // A repeated cursor cannot prove completion; retain the drain.
           stoppedReason = "cursor_stalled";
           break;
         }
+        seenCursors.add(nextSerialized);
         cursorValue = nextCursor;
         cursorSerialized = nextSerialized;
         // Persist resume cursor on every page so a subrequest-cap error
         // leaves the next invocation in a usable resume position.
-        if (isFresh) {
-          await stub.setSyncCursor(entity.table, nextSerialized);
-        }
+        await stub.setSyncCursor(entity.table, nextSerialized);
       }
-      if (isFresh && pagesProcessed >= maxPagesThisRun) {
+      if (pagesProcessed >= maxPagesThisRun && backfill.pagination === "cursor" && !caughtUpToWatermark) {
         stoppedReason = "page_cap_hit";
       }
     });
   } catch (err) {
     stoppedReason = "error";
-    errorMsg = err instanceof ToplineApiError
-      ? `CRM : ${err.message}`
-      : err instanceof Error
-      ? err.message
-      : String(err);
+    errorMsg = err instanceof ToplineApiError ? `Upstream request failed (${err.statusCode})` : "Sync failed; progress retained for retry.";
   }
 
-  // End-of-stream bookkeeping. A fresh drain that reached empty_page /
-  // cursor_stalled has observed every upstream row — this is where we:
-  //   1. snapshot-and-swap prune stale rows (deleted upstream)
-  //   2. clear the resume cursor
-  //   3. mark backfill_complete = 1
-  //   4. clear the drain marker
-  // Steady-state runs skip all of this — they don't change the
-  // complete flag and their row-level refresh is idempotent.
-  if (isFresh && (stoppedReason === "empty_page" || stoppedReason === "cursor_stalled")) {
-    if (drainStartedAt !== null) {
-      try {
-        prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
-        if (prunedStale > 0) {
-          console.log(
-            `[poll_full:${entity.table}] pruned ${prunedStale} stale rows (deleted upstream)`,
-          );
-          // Post-prune: the reported row_count_after should match the
-          // real table, not the pre-prune upsert high-water mark.
-          rowCountAfter = Math.max(0, rowCountAfter - prunedStale);
-        }
-      } catch {
-        // non-fatal — leaving stale rows is better than failing the
-        // whole drain. Next drain will retry the prune.
-      }
+  // A steady refresh uses the same durable cursor but never prunes history.
+  // Advance its watermark only after the entire refresh completes.
+  if (stoppedReason === "empty_page") {
+    if (isFresh && drainStartedAt !== null) {
+      prunedStale = await stub.pruneStaleRows(entity.table, drainStartedAt);
+      rowCountAfter = Math.max(0, rowCountAfter - prunedStale);
     }
-    try {
-      await stub.clearSyncCursor(entity.table);
-    } catch {
-      // non-fatal
-    }
-    try {
-      await stub.markBackfillComplete(entity.table);
-    } catch {
-      // non-fatal
-    }
-    try {
-      await stub.clearDrainMarker(entity.table);
-    } catch {
-      // non-fatal
-    }
+    await setWatermarkAndComplete(stub, entity);
+    await stub.clearDrainMarker(entity.table);
   }
 
   return {
@@ -1572,18 +1197,21 @@ async function backfillPollFull(
 //   Just re-run the poll_full backfill. It refreshes everything in one
 //   shot; idempotent on unchanged rows.
 //
-// For per_parent entities:
-//   Not supported in this commit. Webhooks (phase 1 step 5) are the
-//   primary freshness mechanism for messages.
+// Per-parent entities use the same bounded, resumable drain as initial sync.
 // ---------------------------------------------------------------------------
 
 export interface IncrementalResult {
   entity: string;
   connection_id: string;
   location_id: string;
-  skipped?: "not_complete" | "unsupported_mode" | "no_watermark_source";
+  skipped?: "not_complete" | "unsupported_mode" | "no_watermark_source" | "busy" | "not_due";
   pages: number;
   rows_upserted: number;
+  /** Actual data/index writes from upsertRows and appointment snapshots; excludes pruning and bookkeeping. */
+  data_rows_written?: number;
+  unchanged_rows?: number;
+  missing_retained?: number;
+  pending_parents?: number;
   row_count_after: number;
   watermark_before: string | null;
   watermark_after: string | null;
@@ -1604,7 +1232,7 @@ export interface IncrementalResult {
   failed_parents?: Array<{ parent_id: string; error: string }>;
 }
 
-export async function incrementalEntity(
+async function incrementalEntityUnleased(
   env: SyncEnv,
   connectionId: string,
   entityTable: string,
@@ -1667,6 +1295,7 @@ export async function incrementalEntity(
       watermark_before: null,
       watermark_after: null,
       duration_ms: res.duration_ms,
+      pending_parents: res.pending_parents,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
       ...(res.pruned_stale_rows != null && res.pruned_stale_rows > 0
@@ -1681,7 +1310,7 @@ export async function incrementalEntity(
   // whose cursor_column has advanced. Same function handles both,
   // which keeps the state-machine transitions in one place.
   if (entity.incremental.type === "per_parent") {
-    const res = await backfillEntity(env, connectionId, entityTable);
+    const res = await backfillEntityUnleased(env, connectionId, entityTable);
     const stopped: IncrementalResult["stopped_reason"] =
       res.stopped_reason === "unsupported" ? "error" : res.stopped_reason;
     return {
@@ -1694,6 +1323,7 @@ export async function incrementalEntity(
       watermark_before: stateRow?.watermark ?? null,
       watermark_after: null,
       duration_ms: res.duration_ms,
+      pending_parents: res.pending_parents,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
       ...(res.failed_parents && res.failed_parents.length > 0
@@ -1731,7 +1361,7 @@ export async function incrementalEntity(
   // empty_page the post-run hook flips backfill_complete and the NEXT
   // tick naturally switches to the real incremental watermark filter.
   if (!stateRow?.backfill_complete) {
-    const res = await backfillEntity(env, connectionId, entityTable);
+    const res = await backfillEntityUnleased(env, connectionId, entityTable);
     const stopped: IncrementalResult["stopped_reason"] =
       res.stopped_reason === "unsupported" ? "error" : res.stopped_reason;
     return {
@@ -1744,6 +1374,7 @@ export async function incrementalEntity(
       watermark_before: null,
       watermark_after: null,
       duration_ms: res.duration_ms,
+      pending_parents: res.pending_parents,
       stopped_reason: stopped,
       ...(res.error ? { error: res.error } : {}),
       ...(res.pruned_stale_rows != null && res.pruned_stale_rows > 0
@@ -1817,8 +1448,10 @@ export async function incrementalEntity(
   let lastRowCount = stateRow.row_count;
   let stoppedReason: IncrementalResult["stopped_reason"] = "empty_page";
   let errorMsg: string | undefined;
-  let paginationCursor: unknown = null;
-  let paginationCursorSerialized: string | null = null;
+  let paginationCursor: unknown = stateRow.cursor ? parseCursor(stateRow.cursor) : null;
+  let paginationCursorSerialized: string | null = stateRow.cursor;
+  await stub.startDrainIfUnset(entity.table);
+  const seenCursors = new Set<string>(paginationCursorSerialized ? [paginationCursorSerialized] : []);
 
   try {
     await runInContext(connection, async () => {
@@ -1856,13 +1489,14 @@ export async function incrementalEntity(
         );
 
         const itemsField = entity.backfill.items_field ?? entity.table;
-        const items = (getByPath(response, itemsField) ?? []) as Array<Record<string, unknown>>;
-        if (!Array.isArray(items) || items.length === 0) {
+        const items = responseItems(response, itemsField);
+        if (entity.backfill.pagination === "none") validateSinglePage(response, items.length);
+        if (items.length === 0) {
           stoppedReason = "empty_page";
           break;
         }
 
-        const rows = items.map((raw) => mapRow(entity, raw));
+        const rows = mappedRows(entity, items, connection.location_id);
         const result: UpsertResult = await stub.upsertRows(entity.table, rows);
         rowsUpserted += result.upserted;
         lastRowCount = result.row_count_after;
@@ -1874,12 +1508,14 @@ export async function incrementalEntity(
           break;
         }
         const nextSerialized = serializeCursor(nextCursor);
-        if (nextSerialized === paginationCursorSerialized) {
+        if (seenCursors.has(nextSerialized)) {
           stoppedReason = "cursor_stalled";
           break;
         }
+        seenCursors.add(nextSerialized);
         paginationCursor = nextCursor;
         paginationCursorSerialized = nextSerialized;
+        await stub.setSyncCursor(entity.table, nextSerialized);
       }
       if (pages >= MAX_PAGES_PER_INVOCATION) {
         stoppedReason = "page_cap_hit";
@@ -1887,30 +1523,20 @@ export async function incrementalEntity(
     });
   } catch (err) {
     stoppedReason = "error";
-    errorMsg = err instanceof ToplineApiError
-      ? `CRM : ${err.message}`
-      : err instanceof Error
-      ? err.message
-      : String(err);
+    errorMsg = err instanceof ToplineApiError ? `Upstream request failed (${err.statusCode})` : "Sync failed; progress retained for retry.";
   }
 
-  // Advance the watermark from whatever the DO now reports as MAX.
-  let watermarkAfter: string | null = watermarkBefore;
-  if (rowsUpserted > 0) {
-    try {
-      const result = await stub.executeQuery(
-        `SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`,
-      );
-      const row = result.rows[0] as { w: string | null } | undefined;
-      if (row && row.w !== null && row.w !== undefined && String(row.w).length > 0) {
-        watermarkAfter = String(row.w);
-        if (watermarkAfter !== watermarkBefore) {
-          await stub.setSyncWatermark(entity.table, watermarkAfter);
-        }
-      }
-    } catch {
-      // non-fatal
+  let watermarkAfter = watermarkBefore;
+  if (stoppedReason === "empty_page") {
+    const result = await stub.executeQuery(`SELECT MAX(${entity.incremental.cursor_column}) AS w FROM ${entity.table}`);
+    if (result.truncated) throw new Error("Watermark query truncated");
+    const watermark = result.rows[0]?.w;
+    if (watermark != null && String(watermark)) {
+      watermarkAfter = String(watermark);
+      await stub.setSyncWatermark(entity.table, watermarkAfter);
     }
+    await stub.clearSyncCursor(entity.table);
+    await stub.clearDrainMarker(entity.table);
   }
 
   return {
@@ -1967,7 +1593,11 @@ export async function incrementalAll(
 ): Promise<Record<string, IncrementalResult>> {
   const out: Record<string, IncrementalResult> = {};
   for (const table of order) {
-    out[table] = await incrementalEntity(env, connectionId, table);
+    try {
+      out[table] = await incrementalEntity(env, connectionId, table);
+    } catch {
+      out[table] = { ...failedEntity(table, connectionId), watermark_before: null, watermark_after: null };
+    }
   }
   return out;
 }
@@ -2023,7 +1653,17 @@ export async function backfillAll(
 ): Promise<Record<string, BackfillResult>> {
   const out: Record<string, BackfillResult> = {};
   for (const table of order) {
-    out[table] = await backfillEntity(env, connectionId, table);
+    try {
+      out[table] = await backfillEntity(env, connectionId, table);
+    } catch {
+      out[table] = failedEntity(table, connectionId);
+    }
   }
   return out;
+}
+
+function failedEntity(entity: string, connectionId: string): BackfillResult & { stopped_reason: "error" } {
+  return { entity, connection_id: connectionId, location_id: "", pages: 0, rows_upserted: 0,
+    row_count_after: 0, final_cursor: null, duration_ms: 0,
+    stopped_reason: "error", error: "Entity sync failed; progress retained for retry." };
 }

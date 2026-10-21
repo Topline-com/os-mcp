@@ -18,7 +18,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node --no-warnings --experimental-sqlite --import tsx --test src/parent-sync-state.test.ts"
+    "test": "node --no-warnings --experimental-sqlite --import tsx --test src/*.test.ts"
   },
   "dependencies": {
     "@topline/shared-schema": "*"

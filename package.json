@@ -21,6 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "check": "npm run build && npm run worker:typecheck -w @topline-ai/edge -w @topline-ai/sync && npm test && bash scripts/check-white-label.sh && bash scripts/check-white-label.sh --self-test",
     "build": "npm run build -w @topline/shared && npm run build -w @topline/shared-auth && npm run build -w @topline/shared-schema && npm run build -w @topline/shared-do && npm run build -w @topline-ai/edge && npm run build -w @topline-ai/sync",
     "dev": "npm run dev -w @topline-ai/edge",
     "start": "npm run start -w @topline-ai/edge",
@@ -30,7 +31,8 @@
     "worker:deploy": "npm run worker:deploy -w @topline-ai/edge",
     "worker:typecheck": "npm run worker:typecheck -w @topline-ai/edge",
     "pretest": "npm run build -w @topline/shared -w @topline/shared-auth -w @topline/shared-schema -w @topline/shared-do",
-    "test": "npm run test -w @topline/shared-schema && npm run test -w @topline-ai/edge && npm run test -w @topline-ai/sync && npm run test -w @topline/shared-do && npm run test:docs",
+    "test": "npm run test -w @topline/shared-schema && npm run test -w @topline-ai/edge && npm run test -w @topline-ai/sync && npm run test -w @topline/shared-do && npm run test:sync-integration && npm run test:docs",
+    "test:sync-integration": "node --import ./apps/edge/src/oauth/test-register.mjs --import tsx --test scripts/sync-orchestration.test.ts",
     "test:docs": "node --import tsx --test scripts/gen-docs.test.ts"
   },
   "engines": {

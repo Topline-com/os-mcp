@@ -49,14 +49,28 @@ import {
   PARENT_SYNC_STATE_DDL,
   PARENT_ENSURE_DRAIN_MARKER,
   PARENT_SET_SYNC_CURSOR,
-  PARENT_MARK_COMPLETE,
   PARENT_GET_SYNC_CURSOR,
-  PARENT_GET_DRAIN_START,
-  parentPruneChildrenSql,
   nextParentsForChildSql,
   sweepParentsForChildSql,
-  refreshRowCountSql,
+  pendingParentsCountSql,
 } from "./parent-sync-sql.js";
+
+import {
+  SYNC_LEASE_DDL,
+  acquireSyncLease as acquireLease,
+  renewSyncLease as renewLease,
+  finishSyncLease as finishLease,
+  assertSyncFence,
+  assertParentAssociation,
+  upsertRows as storeRows,
+  reconcileAppointmentSnapshot as reconcileSnapshot,
+  pruneStaleRows as pruneRows,
+  markParentBackfillComplete as completeParent,
+  recordParentFailure as failParent,
+  type UpsertResult,
+  type AppointmentSnapshotResult,
+} from "./sync-storage.js";
+export type { UpsertResult, AppointmentSnapshotResult } from "./sync-storage.js";
 
 // ---------------------------------------------------------------------------
 // RPC response shapes — kept serializable (no class instances, no functions)
@@ -77,6 +91,7 @@ export interface SyncState {
     /** 1 once backfill has walked the last page; 0 during partial backfill. */
     backfill_complete: boolean;
     last_sync_at: string | null;
+    last_success_at: string | null;
     row_count: number;
     /**
      * ISO 8601 stamp when the current drain started. NULL once the
@@ -93,11 +108,6 @@ export interface SyncState {
      */
     upstream_total: number | null;
   };
-}
-
-export interface UpsertResult {
-  upserted: number;
-  row_count_after: number;
 }
 
 export interface SchemaOverview {
@@ -236,6 +246,11 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     // gets picked back up on the next tick without re-walking the whole
     // parent table.
     sql.exec(PARENT_SYNC_STATE_DDL);
+    sql.exec(SYNC_LEASE_DDL);
+    this.ensurePerParentStateColumn("failure_count", "INTEGER NOT NULL DEFAULT 0");
+    this.ensurePerParentStateColumn("retry_due_at", "TEXT");
+    this.ensurePerParentStateColumn("status", "TEXT NOT NULL DEFAULT 'pending'");
+    this.ensureSyncStateColumn("last_success_at", "TEXT");
     // drain_started_at on _parent_sync_state: stamped when a parent
     // first starts syncing (pre-existing rows: NULL via additive
     // migration). Used by the per-parent snapshot-and-swap at
@@ -485,6 +500,22 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   // RPC: sync-side writes
   // -------------------------------------------------------------------------
 
+  /** Acquire the global tenant sync lease and permanently enable fencing. */
+  async acquireSyncLease(locationId: string, entity: string): Promise<string | null> {
+    this.ensureInitialized();
+    return acquireLease(this.ctx.storage, this.ctx.id.toString(), locationId, entity);
+  }
+
+  async renewSyncLease(token: string): Promise<void> {
+    this.ensureInitialized();
+    renewLease(this.ctx.storage, token);
+  }
+
+  async finishSyncLease(token: string, entity: string, success: boolean): Promise<void> {
+    this.ensureInitialized();
+    finishLease(this.ctx.storage, token, entity, success);
+  }
+
   /**
    * Upsert rows into an entity's table.
    *
@@ -495,56 +526,26 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * Columns not present on a row are written as NULL. Extra keys on a row
    * (not in the column schema) are silently ignored.
    */
-  async upsertRows(table: string, rows: ReadonlyArray<Record<string, unknown>>): Promise<UpsertResult> {
+  async upsertRows(table: string, rows: ReadonlyArray<Record<string, unknown>>, token?: string): Promise<UpsertResult> {
     this.ensureInitialized();
-    const entity = ENTITY_BY_TABLE.get(table);
-    if (!entity) throw new Error(`Unknown table: ${table}`);
-    if (rows.length === 0) {
-      const n = countRows(this.ctx.storage.sql, entity.table);
-      return { upserted: 0, row_count_after: n };
-    }
+    return storeRows(this.ctx.storage, table, rows, token);
+  }
 
-    const columnNames = entity.columns.map((c) => c.name);
-    const pk = entity.primary_key;
-    const placeholders = columnNames.map(() => "?").join(", ");
-    const columnList = columnNames.map(quoteIdent).join(", ");
-    const updateSet = columnNames
-      .filter((c) => c !== pk)
-      .map((c) => `${quoteIdent(c)} = excluded.${quoteIdent(c)}`)
-      .join(", ");
-
-    const now = new Date().toISOString();
-    const sql = this.ctx.storage.sql;
-    let upserted = 0;
-
-    // Stamp _synced_at on every write.
-    const stmt = `INSERT INTO ${quoteIdent(entity.table)} (${columnList}) VALUES (${placeholders}) ON CONFLICT(${quoteIdent(pk)}) DO UPDATE SET ${updateSet}`;
-
-    for (const row of rows) {
-      const values: SqlStorageValue[] = entity.columns.map((col) => {
-        if (col.name === "_synced_at") return now;
-        return coerceForSqlite(col, row[col.name]);
-      });
-      sql.exec(stmt, ...values);
-      upserted++;
-    }
-
-    const rowCount = countRows(sql, entity.table);
-    sql.exec(
-      `INSERT INTO _sync_state(entity, last_sync_at, row_count) VALUES (?, ?, ?)
-       ON CONFLICT(entity) DO UPDATE SET last_sync_at = excluded.last_sync_at, row_count = excluded.row_count`,
-      entity.table,
-      now,
-      rowCount,
-    );
-
-    return { upserted, row_count_after: rowCount };
+  async reconcileAppointmentSnapshot(
+    locationId: string,
+    parentId: string,
+    rows: ReadonlyArray<Record<string, unknown>>,
+    token: string,
+  ): Promise<AppointmentSnapshotResult> {
+    this.ensureInitialized();
+    return reconcileSnapshot(this.ctx.storage, locationId, parentId, rows, token);
   }
 
   /** Advance the incremental-sync cursor for an entity. */
-  async setSyncCursor(entity: string, cursor: string): Promise<void> {
+  async setSyncCursor(entity: string, cursor: string, token?: string): Promise<void> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `INSERT INTO _sync_state(entity, cursor, last_sync_at) VALUES (?, ?, ?)
        ON CONFLICT(entity) DO UPDATE SET cursor = excluded.cursor, last_sync_at = excluded.last_sync_at`,
@@ -559,8 +560,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * from the beginning. Does not touch the table's data — only the
    * resume pointer in _sync_state.
    */
-  async clearSyncCursor(entity: string): Promise<void> {
+  async clearSyncCursor(entity: string, token?: string): Promise<void> {
     this.ensureInitialized();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `UPDATE _sync_state SET cursor = NULL WHERE entity = ?`,
       entity,
@@ -577,11 +579,12 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         watermark: string | null;
         backfill_complete: number;
         last_sync_at: string | null;
+        last_success_at: string | null;
         row_count: number;
         drain_started_at: string | null;
         upstream_total: number | null;
       }>(
-        "SELECT entity, cursor, watermark, backfill_complete, last_sync_at, row_count, drain_started_at, upstream_total FROM _sync_state",
+        "SELECT entity, cursor, watermark, backfill_complete, last_sync_at, last_success_at, row_count, drain_started_at, upstream_total FROM _sync_state",
       )
       .toArray();
     const out: SyncState = {};
@@ -591,6 +594,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
         watermark: r.watermark,
         backfill_complete: r.backfill_complete === 1,
         last_sync_at: r.last_sync_at,
+        last_success_at: r.last_success_at,
         row_count: r.row_count,
         drain_started_at: r.drain_started_at,
         upstream_total: r.upstream_total,
@@ -605,9 +609,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * this entity — the next incremental poll uses it to filter the CRM to only
    * newly-updated rows.
    */
-  async setSyncWatermark(entity: string, watermark: string): Promise<void> {
+  async setSyncWatermark(entity: string, watermark: string, token?: string): Promise<void> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `INSERT INTO _sync_state(entity, watermark, last_sync_at) VALUES (?, ?, ?)
        ON CONFLICT(entity) DO UPDATE SET watermark = excluded.watermark, last_sync_at = excluded.last_sync_at`,
@@ -623,9 +628,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * refuses to incremental-sync (we'd miss rows with updated_at values
    * earlier than the partial-backfill watermark).
    */
-  async markBackfillComplete(entity: string): Promise<void> {
+  async markBackfillComplete(entity: string, token?: string): Promise<void> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `INSERT INTO _sync_state(entity, backfill_complete, last_sync_at) VALUES (?, 1, ?)
        ON CONFLICT(entity) DO UPDATE SET backfill_complete = 1, last_sync_at = excluded.last_sync_at`,
@@ -639,12 +645,12 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * scratch. Used by the self-heal path when we detect row_count drift
    * vs. upstream total — typically a sign an older broken-cursor run
    * left us with `backfill_complete = 1` alongside partial data.
-   * Does NOT delete existing rows; the re-drain will refresh them in
-   * place and the post-drain snapshot-and-swap will prune any that
-   * disappeared upstream.
+   * Does not delete data. Complete drains may prune omitted rows for
+   * non-appointment entities; appointment history is always retained.
    */
-  async resetBackfill(entity: string): Promise<void> {
+  async resetBackfill(entity: string, token?: string): Promise<void> {
     this.ensureInitialized();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `UPDATE _sync_state
          SET backfill_complete = 0, cursor = NULL, drain_started_at = NULL
@@ -656,15 +662,16 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   /**
    * Stamp the start of a fresh drain on an entity's sync state. Called
    * by the backfill loops the first time they run with cursor=null AND
-   * backfill_complete=0. Every row upserted from this point forward
-   * carries a `_synced_at >= drain_started_at`; rows that were never
-   * touched keep their stale `_synced_at` from a previous drain.
+   * backfill_complete=0, or at the beginning of a parent sweep cycle.
+   * Non-appointment upserts refresh `_synced_at` for drain pruning;
+   * appointment snapshots leave unchanged observation stamps intact.
    * Idempotent — only sets when currently NULL, so a multi-tick drain
    * doesn't keep bumping the marker forward.
    */
-  async startDrainIfUnset(entity: string): Promise<string> {
+  async startDrainIfUnset(entity: string, token?: string): Promise<string> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `INSERT INTO _sync_state(entity, drain_started_at, last_sync_at) VALUES (?, ?, ?)
        ON CONFLICT(entity) DO UPDATE
@@ -688,9 +695,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * by the self-heal path to compare against row_count and detect stale
    * backfill_complete flags left over from older broken-cursor runs.
    */
-  async setUpstreamTotal(entity: string, total: number): Promise<void> {
+  async setUpstreamTotal(entity: string, total: number, token?: string): Promise<void> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `INSERT INTO _sync_state(entity, upstream_total, last_sync_at) VALUES (?, ?, ?)
        ON CONFLICT(entity) DO UPDATE SET upstream_total = excluded.upstream_total, last_sync_at = excluded.last_sync_at`,
@@ -701,52 +709,13 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   }
 
   /**
-   * Snapshot-and-swap: delete rows whose _synced_at predates the
-   * provided drain_started_at. Called at the end of a full drain to
-   * prune rows that were not re-observed — i.e. upstream deleted them.
-   * Returns the number of rows removed so the caller can log / meter.
-   *
-   * Safe because:
-   *   - upsertRows stamps _synced_at = now() on every write;
-   *   - drain_started_at is captured once at drain start and doesn't
-   *     advance across the multi-tick drain (see startDrainIfUnset);
-   *   - any row not touched during the drain keeps its old _synced_at.
-   *
-   * Caller is responsible for only invoking this when a drain has
-   * actually walked the entire upstream (stopped_reason = empty_page
-   * or cursor_stalled) — calling it on a page_cap_hit / error run
-   * would delete legitimately-pending rows.
+   * Prune unobserved rows after a complete drain of a non-appointment entity.
+   * Appointment history is retained, including through legacy callers.
+   * Returns logical rows removed; index write counts are not row counts.
    */
-  async pruneStaleRows(table: string, drainStartedAt: string): Promise<number> {
+  async pruneStaleRows(table: string, drainStartedAt: string, token?: string): Promise<number> {
     this.ensureInitialized();
-    // Validate the table name before interpolating it into SQL. Every
-    // caller today is the sync worker passing entity.table from the
-    // manifest, but the identifier still gets a defense-in-depth check.
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) {
-      throw new Error(`Invalid table identifier: ${table}`);
-    }
-    const cursor = this.ctx.storage.sql.exec(
-      `DELETE FROM ${table} WHERE _synced_at < ?`,
-      drainStartedAt,
-    );
-    for (const _ of cursor) {
-      // discarded — DELETE returns no rows, but iterating forces execution
-    }
-    const removed = cursor.rowsWritten ?? 0;
-    if (removed > 0) {
-      // Row count cache in _sync_state drifts after a prune; refresh it
-      // so getSyncState and describe_schema reflect reality immediately
-      // instead of waiting for the next upsert.
-      const fresh = this.ctx.storage.sql
-        .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`)
-        .one().n;
-      this.ctx.storage.sql.exec(
-        `UPDATE _sync_state SET row_count = ? WHERE entity = ?`,
-        fresh,
-        table,
-      );
-    }
-    return removed;
+    return pruneRows(this.ctx.storage, table, drainStartedAt, token);
   }
 
   /**
@@ -754,8 +723,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * markBackfillComplete + pruneStaleRows so the NEXT fresh drain
    * (if resetBackfill is ever called) starts its own generation.
    */
-  async clearDrainMarker(entity: string): Promise<void> {
+  async clearDrainMarker(entity: string, token?: string): Promise<void> {
     this.ensureInitialized();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       `UPDATE _sync_state SET drain_started_at = NULL WHERE entity = ?`,
       entity,
@@ -791,11 +761,9 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     freshnessColumns: readonly string[] = [],
   ): Promise<string[]> {
     this.ensureInitialized();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(parentTable)) {
-      throw new Error(`Invalid parent table identifier: ${parentTable}`);
-    }
+    assertParentAssociation(childEntity, parentTable);
     for (const col of freshnessColumns) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(col)) {
+      if (!ENTITY_BY_TABLE.get(parentTable)!.columns.some((column) => column.name === col)) {
         throw new Error(`Invalid freshness column identifier: ${col}`);
       }
     }
@@ -804,6 +772,7 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
       .exec<{ id: string }>(
         nextParentsForChildSql(parentTable, freshnessColumns),
         childEntity,
+        new Date().toISOString(),
         capped,
       )
       .toArray();
@@ -819,9 +788,8 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
    * appointments fan out over calendars, but calendars.updated_at
    * doesn't bump on new bookings, so the activity-driven selector
    * never re-visits. Sweep mode rotates through every parent so new
-   * children land eventually, and snapshot-and-swap inside
-   * markParentBackfillComplete prunes children that disappeared
-   * upstream.
+   * children land eventually. checkedBefore bounds a durable sweep cycle
+   * to parents not completed since that cutoff. Future retries are excluded.
    *
    * Only safe for small parent tables (91 calendars is fine; 16k
    * contacts would cost 16k the CRM calls per full rotation). Opt-in
@@ -833,20 +801,35 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     childEntity: string,
     parentTable: string,
     limit: number,
+    checkedBefore?: string,
   ): Promise<string[]> {
     this.ensureInitialized();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(parentTable)) {
-      throw new Error(`Invalid parent table identifier: ${parentTable}`);
+    assertParentAssociation(childEntity, parentTable);
+    if (checkedBefore !== undefined && !Number.isFinite(Date.parse(checkedBefore))) {
+      throw new Error("Invalid sweep cutoff");
     }
     const capped = Math.max(1, Math.min(500, Math.floor(limit)));
     const rows = this.ctx.storage.sql
       .exec<{ id: string }>(
-        sweepParentsForChildSql(parentTable),
+        sweepParentsForChildSql(parentTable, checkedBefore !== undefined),
         childEntity,
+        new Date().toISOString(),
+        ...(checkedBefore === undefined ? [] : [checkedBefore]),
         capped,
       )
       .toArray();
     return rows.map((r) => String(r.id));
+  }
+
+  async getPendingParentCount(entity: string, parentTable: string): Promise<number> {
+    this.ensureInitialized();
+    assertParentAssociation(entity, parentTable);
+    return this.ctx.storage.sql.exec<{ n: number }>(pendingParentsCountSql(parentTable), entity).one().n;
+  }
+
+  async recordParentFailure(entity: string, parentId: string, retryAfterMs: number | undefined, token: string): Promise<void> {
+    this.ensureInitialized();
+    failParent(this.ctx.storage, entity, parentId, retryAfterMs, token);
   }
 
   /** Read the persisted cursor for one parent's child sync. */
@@ -877,9 +860,11 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     entity: string,
     parentId: string,
     cursor: string,
+    token?: string,
   ): Promise<void> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       PARENT_SET_SYNC_CURSOR,
       entity,
@@ -920,9 +905,11 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   async ensureParentDrainMarker(
     entity: string,
     parentId: string,
+    token?: string,
   ): Promise<string> {
     this.ensureInitialized();
     const now = new Date().toISOString();
+    assertSyncFence(this.ctx.storage.sql, token);
     this.ctx.storage.sql.exec(
       PARENT_ENSURE_DRAIN_MARKER,
       entity,
@@ -942,8 +929,8 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
   /**
    * Flip the parent's child sync to complete AND snapshot-and-swap
    * prune any children whose _synced_at predates the drain marker
-   * (i.e. rows present in this DO from a previous drain that the CRM did
-   * not return this time — upstream deleted them).
+   * for entities whose complete drain establishes absence. Appointments
+   * never prune omissions: a windowed snapshot cannot establish deletion.
    *
    * For entities with a derived dual-write (messages → call_events),
    * the caller passes `derivedTables` so the same parent-scoped prune
@@ -959,87 +946,10 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
     childTable: string,
     fkColumn: string,
     derivedTables: ReadonlyArray<{ table: string; fk: string }> = [],
+    token?: string,
   ): Promise<number> {
     this.ensureInitialized();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(childTable)) {
-      throw new Error(`Invalid child table identifier: ${childTable}`);
-    }
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(fkColumn)) {
-      throw new Error(`Invalid fk column identifier: ${fkColumn}`);
-    }
-    for (const { table, fk } of derivedTables) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(fk)) {
-        throw new Error(`Invalid derived table descriptor: ${table}.${fk}`);
-      }
-    }
-
-    const now = new Date().toISOString();
-    const drainStart = this.ctx.storage.sql
-      .exec<{ drain_started_at: string | null }>(
-        PARENT_GET_DRAIN_START,
-        entity,
-        parentId,
-      )
-      .toArray()[0]?.drain_started_at ?? null;
-
-    let totalPruned = 0;
-    // Tables whose row_count cache in _sync_state may need refresh
-    // after the prune. Collect as we go; refresh in one pass at the
-    // end so we don't touch _sync_state multiple times.
-    const tablesPruned: string[] = [];
-    if (drainStart) {
-      // Prune stale children for the primary entity.
-      const pruneCursor = this.ctx.storage.sql.exec(
-        parentPruneChildrenSql(childTable, fkColumn),
-        parentId,
-        drainStart,
-      );
-      for (const _ of pruneCursor) {
-        // iterate to force execution
-      }
-      const childPruned = pruneCursor.rowsWritten ?? 0;
-      totalPruned += childPruned;
-      if (childPruned > 0) tablesPruned.push(childTable);
-
-      // Prune stale derived rows for the same parent (e.g. call_events
-      // where conversation_id = parentId, for a messages parent).
-      for (const { table, fk } of derivedTables) {
-        const c = this.ctx.storage.sql.exec(
-          parentPruneChildrenSql(table, fk),
-          parentId,
-          drainStart,
-        );
-        for (const _ of c) {
-          // force execution
-        }
-        const n = c.rowsWritten ?? 0;
-        totalPruned += n;
-        if (n > 0) tablesPruned.push(table);
-      }
-    }
-
-    // Refresh cached row_counts for every table we deleted from.
-    // pruneStaleRows (the entity-level full-drain prune) does the same
-    // — without this, describe_schema/getSyncState would keep
-    // reporting pre-prune counts until the next successful upsert on
-    // that table bumped the cache by a different code path. For
-    // tables that rarely change (notes, tasks on stale contacts) the
-    // drift could persist indefinitely.
-    for (const table of new Set(tablesPruned)) {
-      const { select, update } = refreshRowCountSql(table);
-      const fresh = this.ctx.storage.sql.exec<{ n: number }>(select).one().n;
-      this.ctx.storage.sql.exec(update, fresh, table);
-    }
-
-    // Now mark complete + clear drain marker + cursor.
-    this.ctx.storage.sql.exec(
-      PARENT_MARK_COMPLETE,
-      entity,
-      parentId,
-      now,
-    );
-
-    return totalPruned;
+    return completeParent(this.ctx.storage, entity, parentId, childTable, fkColumn, derivedTables, token);
   }
 
   // -------------------------------------------------------------------------
@@ -1223,12 +1133,6 @@ export class LocationDO extends DurableObject<LocationDOEnv> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function countRows(sql: SqlStorage, table: string): number {
-  return sql
-    .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`)
-    .one().n;
-}
-
 function explainOne(entity: EntityManifest, rowCount: number): TableDetails {
   return {
     table: entity.table,
@@ -1255,36 +1159,5 @@ function quoteIdent(name: string): string {
     throw new Error(`Invalid SQL identifier: ${name}`);
   }
   return `"${name}"`;
-}
-
-/**
- * Coerce an upstream value to a SqlStorageValue.
- *   - JSON columns: stringify non-strings (pass strings through unchanged)
- *   - booleans: 0 or 1 (SQLite has no native bool)
- *   - null/undefined: null
- *   - numbers into TEXT columns: explicitly String()-ify to avoid CF's
- *     SQL binding layer formatting the JS float as "28.0" instead of "28"
- *     (JavaScript has one Number type; the binding can't tell the
- *     caller's intent without the column type as context)
- *   - anything else non-primitive: String()
- * The sync worker SHOULD pass clean values; this is defensive coercion so
- * a the CRM payload shape change can't crash the upsert.
- */
-function coerceForSqlite(col: ColumnDef, value: unknown): SqlStorageValue {
-  if (value === null || value === undefined) return null;
-  if (col.json) {
-    return typeof value === "string" ? value : JSON.stringify(value);
-  }
-  if (typeof value === "boolean") return value ? 1 : 0;
-  if (typeof value === "number") {
-    // Number → TEXT: stringify explicitly so integers stay integers
-    // (String(28) === "28", not "28.0"). For INTEGER / REAL columns
-    // let the binding layer handle it natively.
-    if (col.sqlite_type === "TEXT") return String(value);
-    return value;
-  }
-  if (typeof value === "string") return value;
-  if (value instanceof ArrayBuffer) return value;
-  return String(value);
 }
 
