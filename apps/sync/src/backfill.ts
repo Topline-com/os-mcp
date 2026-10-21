@@ -14,7 +14,7 @@ import type { LocationDO, UpsertResult, QueryResult, SyncState } from "@topline/
 import { mapRow, getByPath } from "./mapping.js";
 import { loadAuthorizedSyncConnection } from "./connection-auth.js";
 import { coordinateSync, fencedStub, sweepDueCutoff, renewCurrentLease, type LeaseStore } from "./coordination.js";
-import { responseItems, validateSinglePage, mappedRows } from "./response-validation.js";
+import { responseItems, validateSinglePage, validateTerminalPage, mappedRows } from "./response-validation.js";
 import { nextCursorFrom } from "./cursor.js";
 
 async function toplineFetch<T>(path: string, options: ToplineFetchOptions): Promise<T> {
@@ -1130,8 +1130,14 @@ async function backfillPollFull(
         }
         const nextSerialized = serializeCursor(nextCursor);
         if (seenCursors.has(nextSerialized)) {
-          // A repeated cursor cannot prove completion; retain the drain.
-          stoppedReason = "cursor_stalled";
+          // This endpoint's live-tested EOF echoes the current compound cursor.
+          // An earlier cursor in a cycle, or an advertised next page, is not EOF.
+          if (entity.table === "opportunities" && backfill.endpoint === "/opportunities/search" && nextSerialized === cursorSerialized) {
+            validateTerminalPage(response);
+            stoppedReason = "empty_page";
+          } else {
+            stoppedReason = "cursor_stalled";
+          }
           break;
         }
         seenCursors.add(nextSerialized);

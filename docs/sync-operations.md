@@ -30,7 +30,10 @@ This intentionally favors retaining history over silently deleting valid records
 Returned cancellation/status changes still update normally. Verified deletion
 reconciliation requires a separate upstream contract; this release does not infer
 deletion from a list omission. Malformed item arrays, duplicate IDs, scope
-mismatches, advertised truncation, and stalled cursors cannot authorize cleanup.
+mismatches, advertised truncation, and unexpected cursor stalls cannot authorize
+cleanup. The opportunities endpoint's documented echo of its current compound
+cursor is an end-of-results signal only when no further page is advertised;
+cycles through earlier cursors remain incomplete.
 
 Manual triggers and scheduled runs share a durable location lease. Each mutation
 checks the lease token, so a run that resumes after expiry cannot overwrite a

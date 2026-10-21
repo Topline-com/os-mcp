@@ -397,6 +397,172 @@ function contact(id: string, updatedAt: string) {
   return { id, locationId: LOCATION, firstName: id, dateUpdated: updatedAt };
 }
 
+function opportunity(id: string, updatedAt = "2026-10-20T12:00:00.000Z") {
+  return { id, locationId: LOCATION, name: id, status: "open", updatedAt };
+}
+
+async function opportunityFixture(t: TestContext) {
+  const h = await fixture(t, []);
+  h.at(START - POLL);
+  await h.location.upsertRows("opportunities", [mapRow(
+    ENTITY_BY_TABLE.get("opportunities")!, opportunity("opportunity-stale"),
+  )]);
+  h.at(START);
+  return {
+    ...h,
+    rows: () => h.db.prepare("SELECT * FROM opportunities ORDER BY id").all(),
+  };
+}
+
+for (const resumed of [false, true]) {
+  test(`opportunities ${resumed ? "resumed" : "fresh"} drain completes on its current compound cursor echo`, OPTIONS, async (t) => {
+    const h = await opportunityFixture(t);
+    const first = opportunity("opportunity-a");
+    const last = opportunity("opportunity-b", "2026-10-20T11:00:00.000Z");
+    const cursor = { startAfter: Date.parse(first.updatedAt), startAfterId: first.id };
+    h.respond((url) => {
+      assert.equal(url.pathname, "/opportunities/search");
+      assert.equal(url.searchParams.get("location_id"), LOCATION);
+      assert.ok(h.requests.length <= (resumed ? 3 : 2), "the EOF echo must stop fetching");
+      if (h.requests.length === 1) {
+        assert.equal(url.searchParams.get("startAfter"), null);
+        assert.equal(url.searchParams.get("startAfterId"), null);
+        return Response.json({ opportunities: [first], meta: cursor });
+      }
+      assert.equal(url.searchParams.get("startAfter"), String(cursor.startAfter));
+      assert.equal(url.searchParams.get("startAfterId"), cursor.startAfterId);
+      if (resumed && h.requests.length === 2) {
+        return Response.json({ message: "Retry this page" }, { status: 429 });
+      }
+      return Response.json({ opportunities: [last], meta: cursor });
+    });
+
+    let result = await h.backfill("opportunities");
+    if (resumed) {
+      assert.equal(result.stopped_reason, "error");
+      assert.equal(result.pruned_stale_rows ?? 0, 0);
+      const interrupted = (await h.location.getSyncState()).opportunities;
+      assert.equal(interrupted.cursor, JSON.stringify(cursor));
+      assert.equal(interrupted.drain_started_at, new Date(START).toISOString());
+      assert.equal(interrupted.backfill_complete, false);
+      assert.equal(interrupted.last_success_at, null);
+      h.at(START + POLL);
+      result = await h.incremental("opportunities");
+    }
+
+    assert.equal(result.stopped_reason, "empty_page");
+    assert.equal(result.pages, resumed ? 1 : 2);
+    assert.equal(result.row_count_after, 2);
+    assert.equal(result.pruned_stale_rows, 1, "a completed full drain prunes only omitted old rows");
+    assert.deepEqual(h.rows().map((row) => JSON.parse(String(row.raw_payload))), [first, last],
+      "retain both the earlier page and the nonempty terminal page across cleanup");
+    const completed = (await h.location.getSyncState()).opportunities;
+    assert.equal(completed.cursor, null);
+    assert.equal(completed.drain_started_at, null);
+    assert.equal(completed.backfill_complete, true);
+    assert.equal(completed.row_count, 2);
+    assert.equal(completed.watermark, first.updatedAt);
+    assert.equal(completed.last_success_at, new Date(resumed ? START + POLL : START).toISOString());
+    assert.equal((await h.incremental("opportunities")).skipped, "not_due");
+    assert.equal(h.requests.length, resumed ? 3 : 2);
+  });
+}
+
+for (const [label, continuation] of [
+  ["hasMore", { hasMore: true }],
+  ["nextPage", { meta: { nextPage: 3 } }],
+  ["truncation", { truncated: true }],
+] as const) {
+  test(`opportunities current cursor echo with ${label} cannot complete or prune`, OPTIONS, async (t) => {
+    const h = await opportunityFixture(t);
+    const fetched = opportunity("opportunity-fetched");
+    const cursor = { startAfter: Date.parse(fetched.updatedAt), startAfterId: fetched.id };
+    h.respond((url) => {
+      assert.equal(url.pathname, "/opportunities/search");
+      assert.ok(h.requests.length <= 2);
+      if (h.requests.length === 1) return Response.json({ opportunities: [fetched], meta: cursor });
+      assert.equal(url.searchParams.get("startAfter"), String(cursor.startAfter));
+      assert.equal(url.searchParams.get("startAfterId"), cursor.startAfterId);
+      return Response.json({
+        opportunities: [fetched], ...continuation,
+        meta: { ...cursor, ...("meta" in continuation ? continuation.meta : {}) },
+      });
+    });
+
+    const result = await h.backfill("opportunities");
+    assert.equal(result.stopped_reason, "error");
+    assert.equal(h.requests.length, 2);
+    assert.equal(result.pruned_stale_rows ?? 0, 0);
+    assert.deepEqual(h.rows().map((row) => row.id), [fetched.id, "opportunity-stale"]);
+    const state = (await h.location.getSyncState()).opportunities;
+    assert.equal(state.cursor, JSON.stringify(cursor));
+    assert.equal(state.drain_started_at, new Date(START).toISOString());
+    assert.equal(state.backfill_complete, false);
+    assert.equal(state.last_success_at, null);
+    assert.equal(state.watermark, null);
+  });
+}
+
+test("opportunities non-immediate compound cursor cycle stays incomplete", OPTIONS, async (t) => {
+  const h = await opportunityFixture(t);
+  const first = opportunity("opportunity-a");
+  const second = opportunity("opportunity-b");
+  const cursorA = { startAfter: Date.parse(first.updatedAt), startAfterId: first.id };
+  const cursorB = { startAfter: Date.parse(second.updatedAt), startAfterId: second.id };
+  h.respond((url) => {
+    assert.equal(url.pathname, "/opportunities/search");
+    assert.ok(h.requests.length <= 3);
+    const current = h.requests.length === 1 ? null : h.requests.length === 2 ? cursorA : cursorB;
+    assert.equal(url.searchParams.get("startAfter"), current ? String(current.startAfter) : null);
+    assert.equal(url.searchParams.get("startAfterId"), current?.startAfterId ?? null);
+    return Response.json(h.requests.length === 2
+      ? { opportunities: [second], meta: cursorB }
+      : { opportunities: [first], meta: cursorA });
+  });
+
+  const result = await h.backfill("opportunities");
+  assert.equal(result.stopped_reason, "cursor_stalled");
+  assert.equal(h.requests.length, 3);
+  assert.equal(result.pruned_stale_rows ?? 0, 0);
+  assert.deepEqual(h.rows().map((row) => row.id), [first.id, second.id, "opportunity-stale"]);
+  const state = (await h.location.getSyncState()).opportunities;
+  assert.equal(state.cursor, JSON.stringify(cursorB));
+  assert.equal(state.drain_started_at, new Date(START).toISOString());
+  assert.equal(state.backfill_complete, false);
+  assert.equal(state.last_success_at, null);
+  assert.equal(state.watermark, null);
+});
+
+test("contacts current cursor repetition remains incomplete", OPTIONS, async (t) => {
+  const h = await fixture(t, []);
+  const old = contact("contact-stale", "2026-10-20T10:00:00.000Z");
+  h.at(START - POLL);
+  await h.location.upsertRows("contacts", [mapRow(ENTITY_BY_TABLE.get("contacts")!, old)]);
+  h.at(START);
+  const fetched = contact("contact-fetched", "2026-10-20T12:00:00.000Z");
+  const searchAfter = [Date.parse(fetched.dateUpdated), fetched.id];
+  h.respond((url, init) => {
+    assert.equal(url.pathname, "/contacts/search");
+    assert.ok(h.requests.length <= 2);
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    assert.deepEqual(body.searchAfter, h.requests.length === 1 ? undefined : searchAfter);
+    return Response.json({ contacts: [{ ...fetched, searchAfter }] });
+  });
+
+  const result = await h.backfill("contacts");
+  assert.equal(result.stopped_reason, "cursor_stalled");
+  assert.equal(h.requests.length, 2);
+  assert.equal(result.pruned_stale_rows ?? 0, 0);
+  assert.deepEqual(h.db.prepare("SELECT id FROM contacts ORDER BY id").all().map((row) => row.id),
+    [fetched.id, old.id]);
+  const state = (await h.location.getSyncState()).contacts;
+  assert.equal(state.cursor, JSON.stringify({ searchAfter }));
+  assert.equal(state.drain_started_at, new Date(START).toISOString());
+  assert.equal(state.backfill_complete, false);
+  assert.equal(state.last_success_at, null);
+  assert.equal(state.watermark, null);
+});
+
 test("contacts completion rolls back watermark and cursor together after a post-SQL failure", OPTIONS, async (t) => {
   const h = await fixture(t);
   const watermark = "2026-10-20T10:00:00.000Z";
