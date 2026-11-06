@@ -5,7 +5,24 @@ export interface SafeErrorFields {
   status?: number;
 }
 
-type SafeLogValue = number | boolean | null | undefined | SafeErrorFields;
+declare const safeIdBrand: unique symbol;
+/** An ID that `safeId` admitted: the only kind of string a safe log line takes. */
+export type SafeId = string & { readonly [safeIdBrand]: true };
+
+type SafeLogValue = number | boolean | null | undefined | SafeErrorFields | SafeId;
+
+const SAFE_ID = /^[A-Za-z0-9-]{1,64}$/;
+
+/**
+ * Admit a connection ID or a Location ID to a log line: letters, digits and
+ * hyphens only, at most 64 characters, and never anything that starts like a
+ * Private Integration Token, so a token pasted into the wrong field can't reach
+ * a log. Anything else comes back as null.
+ */
+export function safeId(value: string | null | undefined): SafeId | null {
+  if (!value || !SAFE_ID.test(value) || /^pit-/i.test(value)) return null;
+  return value as SafeId;
+}
 export type SafeLogFields = Record<string, SafeLogValue>;
 
 export function safeErrorFields(error: unknown): SafeErrorFields {

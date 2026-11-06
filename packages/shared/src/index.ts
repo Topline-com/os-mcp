@@ -1,5 +1,6 @@
 // Barrel export for @topline/shared — single import surface for edge + sync workers.
 export * from "./client.js";
+export * from "./credential-text.js";
 export * from "./safe-log.js";
 export * from "./branding.js";
 export * from "./schemas.js";

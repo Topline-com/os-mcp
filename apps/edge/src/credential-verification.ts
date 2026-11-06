@@ -1,3 +1,5 @@
+import { isPrintableAscii } from "@topline/shared";
+
 const PLACEHOLDER_API_BASE_URL = "https://api.example.com";
 
 export interface CredentialVerificationEnv {
@@ -17,6 +19,8 @@ export async function verifyCredentials(
 ): Promise<void> {
   const cleanPit = pit.trim();
   const cleanLocationId = locationId.trim();
+  // Refuse before the Authorization header is built, without echoing the value.
+  if (!isPrintableAscii(cleanPit)) throw new Error("credential_verification_invalid_pit");
   const base = apiBaseUrl(env);
   if (!base || base === PLACEHOLDER_API_BASE_URL) {
     throw new Error("topline_api_base_url_missing");

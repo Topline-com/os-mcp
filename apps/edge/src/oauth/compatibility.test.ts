@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   createConnection,
+  encryptPit,
   signToken,
   type AccessTokenPayload,
   type LegacyAccessTokenPayload,
@@ -41,6 +42,9 @@ class MemoryKv {
     return { keys, list_complete: true };
   }
 }
+
+// A made-up token, never a real one: "\u0430" is the Cyrillic letter that looks like a Latin "a".
+const CYRILLIC_PIT = "pit-00000000-0000-0000-0000-00000000000\u0430";
 
 const ctx = {
   waitUntil() {},
@@ -185,6 +189,130 @@ test("existing cid, legacy, and raw-PIT bearer shapes remain valid", async () =>
     ctx,
   );
   assert.equal(rawPitQuery.status, 401);
+});
+
+test("every bearer shape refuses a PIT with a non-ASCII character", async () => {
+  const kv = new MemoryKv();
+  const secret = "test-secret-that-is-long-enough-for-hmac-and-hkdf";
+  const env = {
+    TOKEN_SIGNING_SECRET: secret,
+    TOPLINE_BRAND_NAME: "Topline OS",
+    CONNECTIONS: kv as unknown as KVNamespace,
+    OAUTH_KV: kv as unknown as KVNamespace,
+    OAUTH_FLOW_DO: {},
+    CONNECTION_AUTH_DO: new MemoryConnectionAuthNamespace(),
+    LOCATION_DO: {},
+  } as never;
+  const exp = Math.floor(Date.now() / 1000) + 3600;
+  // A connection saved before the save paths checked characters, written
+  // straight to KV because createConnection now refuses one.
+  const cid = "6f1c2a9e-4b7d-4e2a-9c1f-0a1b2c3d4e5f";
+  const encrypted = await encryptPit(CYRILLIC_PIT, secret);
+  await kv.put(cid, JSON.stringify({
+    location_id: "location-123",
+    pit_ct: encrypted.ct,
+    pit_iv: encrypted.iv,
+    brand_name: "Topline OS",
+    created_at: "2026-08-11T00:00:00.000Z",
+    last_verified_at: "2026-08-11T00:00:00.000Z",
+    source: "self-serve",
+  }));
+  const cidToken = await signToken({ cid, exp } satisfies AccessTokenPayload, secret);
+  const legacyToken = await signToken({
+    pit: CYRILLIC_PIT,
+    locationId: "location-123",
+    exp,
+  } satisfies LegacyAccessTokenPayload, secret);
+  // A request header can't hold the Cyrillic letter itself: a client sends its
+  // UTF-8 bytes, and the runtime hands each byte over as one character.
+  const rawBearer = `pit-00000000-0000-0000-0000-00000000000${
+    String.fromCharCode(...new TextEncoder().encode("\u0430"))
+  }`;
+
+  for (const request of [
+    mcpRequest(cidToken),
+    mcpRequest(legacyToken),
+    mcpRequest(rawBearer, "location-123"),
+  ]) {
+    const response = await worker.fetch(request, env, ctx);
+    assert.equal(response.status, 401);
+    const body = await response.text();
+    assert.doesNotMatch(body, /pit-0|\u0430/);
+  }
+
+  const cidQuery = await worker.fetch(
+    new Request(`${AUTHORIZATION_SERVER_ORIGIN}/query/api/catalog`, {
+      headers: { Authorization: ["Bearer", cidToken].join(" ") },
+    }),
+    env,
+    ctx,
+  );
+  assert.equal(cidQuery.status, 401);
+});
+
+test("/connect refuses a PIT or Location ID with a non-ASCII character and stores nothing", async () => {
+  const kv = new MemoryKv();
+  const env = {
+    TOKEN_SIGNING_SECRET: "test-secret-that-is-long-enough-for-hmac-and-hkdf",
+    TOPLINE_BRAND_NAME: "Topline OS",
+    CONNECTIONS: kv as unknown as KVNamespace,
+    OAUTH_KV: kv as unknown as KVNamespace,
+    OAUTH_FLOW_DO: {},
+    CONNECTION_AUTH_DO: new MemoryConnectionAuthNamespace(),
+    LOCATION_DO: {},
+  } as never;
+  const cases = [
+    {
+      pit: CYRILLIC_PIT,
+      locationId: "location-123",
+      words: /Private Integration Token has a character that can&#39;t be part of a token\./,
+    },
+    {
+      pit: "pit-00000000-0000-0000-0000-000000000000",
+      locationId: "location-12\u0430",
+      words: /Location ID has a character that can&#39;t be part of a Location ID\./,
+    },
+  ];
+  for (const { pit, locationId, words } of cases) {
+    const response = await worker.fetch(
+      new Request(`${AUTHORIZATION_SERVER_ORIGIN}/connect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ pit, locationId }),
+      }),
+      env,
+      ctx,
+    );
+    assert.equal(response.status, 400);
+    const body = await response.text();
+    assert.match(body, words);
+    assert.doesNotMatch(body, /pit-0|\u0430/);
+  }
+  assert.equal(kv.values.size, 0);
+});
+
+test("createConnection refuses a PIT or Location ID with a non-ASCII character", async () => {
+  const kv = new MemoryKv();
+  const secret = "test-secret-that-is-long-enough-for-hmac-and-hkdf";
+  for (const input of [
+    { location_id: "location-123", pit: CYRILLIC_PIT },
+    { location_id: "location-12\u0430", pit: "pit-00000000-0000-0000-0000-000000000000" },
+  ]) {
+    await assert.rejects(
+      createConnection(
+        kv as unknown as KVNamespace,
+        { ...input, brand_name: "Topline OS", source: "self-serve" },
+        secret,
+      ),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /must be printable ASCII/);
+        assert.doesNotMatch(error.message, /pit-0|\u0430/);
+        return true;
+      },
+    );
+  }
+  assert.equal(kv.values.size, 0);
 });
 
 test("invalid bearer receives a canonical protected-resource challenge", async () => {
