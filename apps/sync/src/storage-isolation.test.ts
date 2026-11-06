@@ -1,10 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 
 const edgeConfigUrl = new URL("../../edge/wrangler.toml", import.meta.url);
 const syncConfigUrl = new URL("../wrangler.toml", import.meta.url);
-const syncSourceUrl = new URL("./index.ts", import.meta.url);
+const syncSourceDirUrl = new URL("./", import.meta.url);
+const syncCronUrl = new URL("./cron.ts", import.meta.url);
+
+async function syncSources(): Promise<string[]> {
+  const names = (await readdir(syncSourceDirUrl))
+    .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"));
+  return Promise.all(names.map((name) => readFile(new URL(name, syncSourceDirUrl), "utf8")));
+}
 
 function bindingId(config: string, binding: string): string {
   const blocks = config.split("[[kv_namespaces]]").slice(1);
@@ -27,10 +34,11 @@ function migrationBlock(config: string, tag: string): string {
 }
 
 test("OAuth storage is distinct from the connection directory scanned by sync", async () => {
-  const [edgeConfig, syncConfig, syncSource] = await Promise.all([
+  const [edgeConfig, syncConfig, syncCron, sources] = await Promise.all([
     readFile(edgeConfigUrl, "utf8"),
     readFile(syncConfigUrl, "utf8"),
-    readFile(syncSourceUrl, "utf8"),
+    readFile(syncCronUrl, "utf8"),
+    syncSources(),
   ]);
 
   const edgeConnections = bindingId(edgeConfig, "CONNECTIONS");
@@ -41,8 +49,9 @@ test("OAuth storage is distinct from the connection directory scanned by sync", 
   assert.notEqual(oauth, edgeConnections);
   assert.match(oauth, /^[0-9a-f]{32}$/);
   assert.notEqual(oauth, "00000000000000000000000000000000");
-  assert.match(syncSource, /env\.CONNECTIONS\.list\(/);
-  assert.doesNotMatch(syncSource, /OAUTH_KV/);
+  assert.match(syncCron, /env\.CONNECTIONS\.list\(/);
+  assert.ok(sources.length > 0);
+  for (const source of sources) assert.doesNotMatch(source, /OAUTH_KV/);
 });
 
 test("Durable Object migration history provisions every new class with SQLite", async () => {
