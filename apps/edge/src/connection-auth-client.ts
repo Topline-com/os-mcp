@@ -1,3 +1,4 @@
+import { isPrintableAscii } from "@topline/shared";
 import {
   loadAndDecryptConnection,
   loadConnection,
@@ -59,6 +60,9 @@ export async function loadActiveConnectionAuthorization(
     env.TOKEN_SIGNING_SECRET,
   );
   if (!connection) throw new ConnectionAuthorizationError();
+  // A PIT stored before save paths checked its characters can't become the
+  // CRM's Authorization header; treat its connection as unavailable.
+  if (!isPrintableAscii(connection.pit)) throw new ConnectionAuthorizationError();
   return { connection, authorization };
 }
 

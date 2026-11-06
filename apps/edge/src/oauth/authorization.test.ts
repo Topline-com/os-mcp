@@ -296,6 +296,68 @@ test("credential POST creates the connection without a CRM preflight and consume
   assert.equal(consentFlow?.consent?.backfillStatus, "pending");
 });
 
+test("credential POST refuses a PIT or Location ID with a non-ASCII character before creating a connection", async () => {
+  // A made-up token, never a real one: "\u0430" is the Cyrillic letter that looks like a Latin "a".
+  const cyrillicPit = "pit-00000000-0000-0000-0000-00000000000\u0430";
+  const redirectUri = "https://client.example/callback";
+  const env = {
+    OAUTH_KV: new MemoryKv() as unknown as KVNamespace,
+    OAUTH_FLOW_DO: new MemoryFlowNamespace(),
+  } as unknown as TestEnv;
+  let creates = 0;
+  const worker = createWorker(testDependencies({
+    async createConnection(...args: unknown[]) {
+      creates += 1;
+      return String(args[0]);
+    },
+  }));
+  const clientId = await registerClient(worker, env, redirectUri);
+  const url = authorizationUrl(clientId, redirectUri);
+  url.searchParams.set("code_challenge", "A".repeat(43));
+  url.searchParams.set("code_challenge_method", "S256");
+  const formResponse = await worker.fetch(new Request(url), env, executionContext);
+  const form = await formResponse.text();
+  const continuation = hiddenValue(form, "continuation");
+  const csrf = hiddenValue(form, "csrf");
+
+  const cases = [
+    {
+      pit: cyrillicPit,
+      locationId: "location-123",
+      words: "Private Integration Token has a character that can't be part of a token. Re-copy it from Topline OS → Settings → Private Integrations and paste only the token.",
+    },
+    {
+      pit: "pit-00000000-0000-0000-0000-000000000000",
+      locationId: "location-12\u0430",
+      words: "Location ID has a character that can't be part of a Location ID. Re-copy it from Topline OS → Settings → Business Info and paste only the ID.",
+    },
+  ];
+  for (const { pit, locationId, words } of cases) {
+    const response = await worker.fetch(
+      new Request(`${AUTHORIZATION_SERVER_ORIGIN}/authorize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "https://claude.ai",
+        },
+        body: new URLSearchParams({
+          continuation,
+          csrf,
+          pit,
+          locationId,
+          toolPreset: "analytics",
+          targetClient: "generic",
+        }),
+      }),
+      env,
+      executionContext,
+    );
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), words);
+  }
+  assert.equal(creates, 0);
+});
+
 test("connection creation failure terminalizes the continuation before cleanup", async () => {
   const redirectUri = "https://client.example/callback";
   const env = {

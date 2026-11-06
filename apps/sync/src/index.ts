@@ -24,7 +24,7 @@ import {
   type IncrementalResult,
 } from "./backfill.js";
 import { loadAuthorizedSyncConnection } from "./connection-auth.js";
-import { safeErrorFields, safeLog } from "@topline/shared";
+import { runIncrementalForAllConnections } from "./cron.js";
 
 interface Env extends SyncEnv {
   ADMIN_TOKEN?: string;
@@ -203,46 +203,6 @@ async function handleBackfill(request: Request, env: Env): Promise<Response> {
   // payload carries the error detail. A 500 is reserved for infra failures
   // (missing connection, DO binding broken, etc.) where retrying won't help.
   return json(200, result);
-}
-
-// ---------------------------------------------------------------------------
-// Scheduled entry — enumerates CONNECTIONS KV and runs incrementalAll for
-// each one. Sequential today because our customer count is small; when
-// it grows we'll fan out via Cloudflare Queues.
-// ---------------------------------------------------------------------------
-async function runIncrementalForAllConnections(env: Env): Promise<void> {
-  let cursor: string | undefined = undefined;
-  let totalConnections = 0;
-
-  while (true) {
-    const list: KVNamespaceListResult<unknown, string> = await env.CONNECTIONS.list({ cursor });
-    for (const entry of list.keys) {
-      totalConnections += 1;
-      try {
-        const results = await incrementalAll(env, entry.name);
-        // Log a compact one-line summary per entity for observability.
-        for (const [table, r] of Object.entries(results)) {
-          safeLog("log", `sync_entity_${table}`, {
-            rows_upserted: r.rows_upserted,
-            data_rows_written: r.data_rows_written ?? null,
-            unchanged_rows: r.unchanged_rows ?? null,
-            missing_retained: r.missing_retained ?? null,
-            pending_parents: r.pending_parents ?? 0,
-            skipped: Boolean(r.skipped),
-            row_count: r.row_count_after,
-            failed_parent_count: r.failed_parents?.length ?? 0,
-            has_error: Boolean(r.error),
-          });
-        }
-      } catch (err) {
-        safeLog("error", "sync_connection_failed", { error: safeErrorFields(err) });
-      }
-    }
-    if (list.list_complete) break;
-    cursor = list.cursor;
-  }
-
-  safeLog("log", "sync_cron_completed", { connection_count: totalConnections });
 }
 
 // ---------------------------------------------------------------------------

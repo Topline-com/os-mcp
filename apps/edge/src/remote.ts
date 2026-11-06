@@ -23,6 +23,7 @@
 import { ACTION_TOOLS, ALL_TOOLS } from "./registry.js";
 import {
   credentialsContext,
+  isPrintableAscii,
   safeErrorFields,
   safeLog,
 } from "@topline/shared";
@@ -40,6 +41,7 @@ import {
   connectFormHtml,
   connectResultHtml,
 } from "./remote-oauth.js";
+import { credentialCharacterError } from "./credential-input.js";
 import { LocationDO } from "@topline/shared-do";
 import type { OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { edgeContext } from "./request-context.js";
@@ -242,6 +244,10 @@ async function handleConnect(request: Request, env: Env, brand: string, ctx: Exe
   if (!locationId) {
     return html(400, connectFormHtml({ brand, origin: url.origin, toolSelection, error: "Location ID is required." }));
   }
+  const characterError = credentialCharacterError(pit, locationId, brand);
+  if (characterError) {
+    return html(400, connectFormHtml({ brand, origin: url.origin, toolSelection, error: characterError }));
+  }
 
   let selected;
   try {
@@ -355,6 +361,9 @@ async function resolveBearer(
   env: Env,
 ): Promise<ResolvedCredentials | { error: string }> {
   if (bearer.startsWith("pit-")) {
+    // A raw PIT becomes the CRM's Authorization header, which can't carry a
+    // character outside printable ASCII. Refuse it like any bad bearer.
+    if (!isPrintableAscii(bearer)) return { error: "Access token invalid or expired" };
     return { pit: bearer, rawPitBearer: true, authorization: null };
   }
 
@@ -380,6 +389,9 @@ async function resolveBearer(
 
   if (isLegacyAccess(payload)) {
     const p = payload as LegacyAccessTokenPayload;
+    // A legacy token carries a PIT that was signed before save paths checked
+    // its characters; it would become the CRM's Authorization header.
+    if (!isPrintableAscii(p.pit)) return { error: "Access token invalid or expired" };
     return {
       pit: p.pit,
       locationId: p.locationId,

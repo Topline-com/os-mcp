@@ -4,6 +4,7 @@
 // and compatibility-token forms; it does not validate clients or issue OAuth
 // authorization codes.
 
+import { PRINTABLE_ASCII_INPUT_PATTERN } from "./credential-input.js";
 import type { ToolSelectionView } from "./tool-selection-view.js";
 
 // --- HTML / responses ---
@@ -63,10 +64,10 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
   <input type="hidden" name="csrf" value="${escapeHtml(csrf)}">
 
   <label for="pit">Private Integration Token</label>
-  <input id="pit" name="pit" placeholder="pit-xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" required>
+  <input id="pit" name="pit" placeholder="pit-xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" required pattern="${PRINTABLE_ASCII_INPUT_PATTERN}" title="Paste only the token, with no other characters.">
 
   <label for="locationId">Location ID</label>
-  <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required>
+  <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required pattern="${PRINTABLE_ASCII_INPUT_PATTERN}" title="Paste only the Location ID, with no other characters.">
 
   ${toolSelectionControlsHtml(toolSelection, scriptNonce)}
 
@@ -221,10 +222,10 @@ ${error ? `<div class="err">${escapeHtml(error)}</div>` : ""}
 
 <form method="POST" action="/connect">
   <label for="pit">Private Integration Token</label>
-  <input id="pit" name="pit" placeholder="pit-xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" required>
+  <input id="pit" name="pit" placeholder="pit-xxxxxxxxxxxxxxxx" autocomplete="off" spellcheck="false" required pattern="${PRINTABLE_ASCII_INPUT_PATTERN}" title="Paste only the token, with no other characters.">
 
   <label for="locationId">Location ID</label>
-  <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required>
+  <input id="locationId" name="locationId" placeholder="abcDEF1234567" autocomplete="off" spellcheck="false" required pattern="${PRINTABLE_ASCII_INPUT_PATTERN}" title="Paste only the Location ID, with no other characters.">
 
   ${toolSelectionControlsHtml(toolSelection)}
 

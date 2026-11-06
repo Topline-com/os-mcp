@@ -6,6 +6,9 @@ process.env.TOPLINE_API_BASE_URL = "https://crm.example.test";
 const originalFetch = globalThis.fetch;
 const { verifyCredentials } = await import("./credential-verification.js");
 
+// A made-up token, never a real one: "\u0430" is the Cyrillic letter that looks like a Latin "a".
+const CYRILLIC_PIT = "pit-00000000-0000-0000-0000-00000000000\u0430";
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
   process.env.TOPLINE_API_BASE_URL = "https://crm.example.test";
@@ -82,6 +85,20 @@ test("credential verification fails closed when the API base is the placeholder"
   await assert.rejects(
     verifyCredentials("pit-test", "location-one"),
     new Error("topline_api_base_url_missing"),
+  );
+  assert.equal(fetched, false);
+});
+
+test("credential verification refuses a PIT with a non-ASCII character without calling fetch", async () => {
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    return new Response(null, { status: 200 });
+  };
+
+  await assert.rejects(
+    verifyCredentials(CYRILLIC_PIT, "location-one"),
+    new Error("credential_verification_invalid_pit"),
   );
   assert.equal(fetched, false);
 });

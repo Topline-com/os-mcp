@@ -51,6 +51,11 @@ export interface DecryptedConnection {
   source: string;
 }
 
+// The same check as @topline/shared's isPrintableAscii, kept here because this
+// package takes no dependencies. A PIT or Location ID with any other character
+// can't go in a header, and the runtime's warning about one prints the value.
+const PRINTABLE_ASCII = /^[\x20-\x7E]+$/;
+
 /** 60-second grace window for eventual consistency. */
 const GET_RETRY_DELAY_MS = 250;
 const GET_RETRY_ATTEMPTS = 3;
@@ -74,6 +79,9 @@ export async function createConnection(
   signingSecret: string,
   connectionId?: string,
 ): Promise<string> {
+  if (!PRINTABLE_ASCII.test(input.pit) || !PRINTABLE_ASCII.test(input.location_id)) {
+    throw new Error("A connection's token and Location ID must be printable ASCII.");
+  }
   const enc = await encryptPit(input.pit, signingSecret);
   const now = new Date().toISOString();
   const record: StoredConnection = {

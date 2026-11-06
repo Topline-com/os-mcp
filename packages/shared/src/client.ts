@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { BRAND_NAME } from "./branding.js";
+import { isPrintableAscii } from "./credential-text.js";
 
 const PLACEHOLDER_API_BASE_URL = "https://api.example.com";
 const API_VERSION = process.env.TOPLINE_API_VERSION || "2021-07-28";
@@ -56,7 +57,17 @@ export function peekLocationId(): string | null {
 
 function requirePit(): string {
   const pit = peekPit();
-  if (pit) return pit;
+  if (pit) {
+    // Refuse before the Authorization header is built: a header can't carry
+    // such a character, and the runtime's warning about it prints the value.
+    if (!isPrintableAscii(pit)) {
+      throw new Error(
+        `${BRAND_NAME} MCP can't use this Private Integration Token because it has a character ` +
+          `that can't be part of a token. Re-copy it from ${BRAND_NAME} → Settings → Private Integrations.`,
+      );
+    }
+    return pit;
+  }
   throw new Error(
     `${BRAND_NAME} MCP is missing the Private Integration Token. ` +
       `For local setup add TOPLINE_PIT to your Claude config env block. ` +

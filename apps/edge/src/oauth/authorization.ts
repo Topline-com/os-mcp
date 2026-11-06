@@ -4,6 +4,7 @@ import {
   type AuthRequest,
   type OAuthHelpers,
 } from "@cloudflare/workers-oauth-provider";
+import { credentialCharacterError } from "../credential-input.js";
 import { authorizeFormHtml } from "../remote-oauth.js";
 import { ALL_TOOLS } from "../registry.js";
 import {
@@ -182,6 +183,8 @@ async function handleAuthorizationPost<Env extends AuthorizationEnv>(
   ) {
     return localAuthorizationError("Invalid authorization submission");
   }
+  const characterError = credentialCharacterError(pit, locationId, brand);
+  if (characterError) return localAuthorizationError(characterError);
 
   let selected;
   try {
